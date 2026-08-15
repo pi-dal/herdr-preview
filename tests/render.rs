@@ -14,7 +14,9 @@ use herdr_reviewr::{handle_key, handle_mouse};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 
 fn dump(buffer: &Buffer) -> String {
@@ -303,6 +305,193 @@ fn the_file_list_renders_as_a_directory_tree() {
     assert!(files_pane.contains("app.rs") && files_pane.contains("ui.rs"), "files by basename");
     assert!(!files_pane.contains("src/app.rs"), "a grouped file is not shown by full path");
     assert!(files_pane.contains("Cargo.toml"), "the top-level file shows too");
+}
+
+#[test]
+fn navigator_type_tokens_are_scoped_dimmed_selected_and_yield_to_narrow_names() {
+    let r = Repo::init();
+    r.write(".gitignore", "ignored.rs\n");
+    r.write("src/lib.rs", "old\n");
+    r.write("src/ui.rs", "old\n");
+    r.write("app.rs", "old\n");
+    r.write("Cargo.toml", "[package]\n");
+    r.write("README.md", "old\n");
+    r.commit_all("init");
+    r.write("src/lib.rs", "old\nnew\n");
+    r.write("src/ui.rs", "old\nnew\n");
+    r.write("app.rs", "old\nnew\n");
+    r.write("Cargo.toml", "[package]\nname = 'icon-test'\n");
+    r.write("README.md", "new\n");
+    r.write("ignored.rs", "ignored\n");
+    r.write("mystery.unknown", "generic\n");
+    let mut app = app_on(&r);
+
+    let files = right_column(&render(&app), 70);
+    assert!(
+        files.contains("src/") && !files.contains("□ src/"),
+        "directory rows use disclosure plus slash only: {files}"
+    );
+    assert!(files.contains("s app.rs"), "source rows carry a one-cell code: {files}");
+    assert!(files.contains("s Cargo.toml"), "Cargo resolves through its exact Rust rule: {files}");
+    assert!(files.contains("d README.md"), "document rows carry a one-cell code: {files}");
+    assert!(files.contains(". mystery.unknown"), "unknown files receive a safe fallback: {files}");
+
+    let config_dir = tempfile::tempdir().unwrap();
+    std::fs::write(config_dir.path().join("config.toml"), "file_icons = \"plain\"\n").unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(config_dir.path()).unwrap());
+    let plain = right_column(&render(&app), 70);
+    assert!(plain.contains("s app.rs"), "plain mode keeps its one-cell code: {plain}");
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        "file_icons = \"plain\"\n[file_icon_overrides.names]\n\"app.rs\" = \"generic\"\n",
+    )
+    .unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(config_dir.path()).unwrap());
+    let overridden = right_column(&render(&app), 70);
+    assert!(overridden.contains(". app.rs"), "exact override wins lexically: {overridden}");
+    std::fs::write(config_dir.path().join("config.toml"), "file_icons = \"emoji\"\n").unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(config_dir.path()).unwrap());
+    let emoji = right_column(&render(&app), 70);
+    assert!(emoji.contains("🦀  app.rs"), "emoji mode uses standard Unicode: {emoji}");
+    std::fs::write(config_dir.path().join("config.toml"), "file_icons = \"nerd\"\n").unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(config_dir.path()).unwrap());
+    let nerd = right_column(&render(&app), 70);
+    assert!(nerd.contains(" app.rs"), "nerd mode uses the Rust glyph: {nerd}");
+    assert!(nerd.contains("󰍔 README.md"), "documents retain a distinct Nerd glyph: {nerd}");
+    std::fs::write(config_dir.path().join("config.toml"), "file_icons = \"none\"\n").unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(config_dir.path()).unwrap());
+    let none = right_column(&render(&app), 70);
+    assert!(none.contains("app.rs"), "none mode retains the file row: {none}");
+    assert!(!none.contains("s app.rs"), "none mode removes the kind slot: {none}");
+    app.set_plugin_config(herdr_reviewr::config::PluginConfig::default());
+
+    enter_tab(&mut app, Tab::AllFiles);
+    let ignored = app.file_rows.iter().position(|row| row.name == "ignored.rs").unwrap();
+    let normal = render_buffer(&app);
+    let ignored_icon = (0..normal.area.height)
+        .flat_map(|y| (0..normal.area.width).map(move |x| (x, y)))
+        .find_map(|point| {
+            normal
+                .cell(point)
+                .filter(|cell| cell.symbol() == "s" && cell.fg == app.palette().overlay0)
+                .map(|cell| cell.fg)
+        })
+        .expect("the ignored generic icon paints");
+    assert_eq!(ignored_icon, app.palette().overlay0, "ignored icon dims with its filename");
+    app.select_file(ignored).unwrap();
+    let selected = render_buffer(&app);
+    assert!(
+        (0..selected.area.height).flat_map(|y| (0..selected.area.width).map(move |x| (x, y))).any(
+            |point| selected
+                .cell(point)
+                .is_some_and(|cell| cell.symbol() == "s" && cell.bg == SELECTION_BG)
+        ),
+        "selected icon remains legible on the cursor fill"
+    );
+
+    let mut narrow = app_on(&r);
+    narrow.navigator_side_pct = 60;
+    let out = dump(&render_size(&narrow, 24, 20));
+    assert!(out.contains("app.rs"), "the narrow row keeps its filename: {out}");
+    assert!(out.contains('M') && out.contains('+'), "marker and stats stay visible: {out}");
+    assert!(
+        !out.contains("s app.rs"),
+        "the two-cell kind slot yields before filename, marker, or stats: {out}"
+    );
+
+    std::fs::write(config_dir.path().join("config.toml"), "file_icons = \"emoji\"\n").unwrap();
+    narrow.set_plugin_config(herdr_reviewr::config::plugin_config_in(config_dir.path()).unwrap());
+    let emoji_out = dump(&render_size(&narrow, 24, 20));
+    assert!(emoji_out.contains("app.rs"), "narrow emoji keeps its filename: {emoji_out}");
+    assert!(
+        emoji_out.contains('M') && emoji_out.contains('+'),
+        "narrow emoji keeps Git marker and stats: {emoji_out}"
+    );
+    assert!(
+        !emoji_out.contains("🦀"),
+        "the whole measured emoji slot yields before it can overwrite content or scrollbar: {emoji_out}"
+    );
+}
+
+#[test]
+fn files_only_plain_tokens_scroll_and_keep_stacked_mouse_targets_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+    std::fs::write(dir.path().join("docs/guide.md"), "guide\n").unwrap();
+    for i in 0..24 {
+        std::fs::write(dir.path().join(format!("file-{i:02}.rs")), "fn main() {}\n").unwrap();
+    }
+    let config_dir = tempfile::tempdir().unwrap();
+    std::fs::write(config_dir.path().join("config.toml"), "file_icons = \"plain\"\n").unwrap();
+    let mut app = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
+    app.reload().unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(config_dir.path()).unwrap());
+    app.navigator_position = NavigatorPosition::Bottom;
+    app.file_scroll = 10;
+    let area = Rect::new(0, 0, 100, 20);
+    let painted = dump(&render_size(&app, area.width, area.height));
+    assert!(painted.contains("s "), "Files-only keeps lexical kind codes: {painted}");
+    assert!(
+        painted.contains("█") || painted.contains("║"),
+        "long tree paints a scrollbar: {painted}"
+    );
+    assert!(
+        painted.contains("s file-10.rs"),
+        "the reserved track must not overwrite Files-only row content: {painted}"
+    );
+
+    let target = app.file_rows.iter().position(|row| row.name == "file-10.rs").unwrap();
+    let (column, row) = (0..area.height)
+        .flat_map(|row| (0..area.width).map(move |column| (column, row)))
+        .filter(|&(column, row)| {
+            ui::hit_file(area, &app, column, row, app.file_rows.len(), app.file_scroll)
+                == Some(target)
+        })
+        .max_by_key(|&(column, _)| column)
+        .expect("visible stacked file row has a full-width mouse target");
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &[],
+        &Keymap::default(),
+    )
+    .unwrap();
+    assert_eq!(app.diff_path.as_deref(), Some("file-10.rs"));
+    assert!(app.select_anchor.is_none(), "Files-only click never creates a comment selection");
+}
+
+#[test]
+fn navigator_scrollbar_reserves_the_stats_column_and_skips_tiny_interiors() {
+    let r = Repo::init();
+    for i in 0..24 {
+        r.write(&format!("src/file-{i:02}.rs"), "old\n");
+    }
+    r.commit_all("initial");
+    for i in 0..24 {
+        r.write(&format!("src/file-{i:02}.rs"), "old\nnew\n");
+    }
+    let mut app = app_on(&r);
+    app.file_scroll = 10;
+
+    let normal = dump(&render_size(&app, 100, 14));
+    assert!(normal.contains("+1"), "the scrollbar leaves changed-file stats intact: {normal}");
+    assert!(normal.contains('█'), "the overflowing navigator paints its reserved track: {normal}");
+
+    // These frame sizes can leave the navigator at zero or one inner column. Rendering must
+    // neither draw a track outside it nor panic; one content column is retained for the row.
+    for (width, height) in [(5, 8), (6, 8), (7, 8)] {
+        let tiny = dump(&render_size(&app, width, height));
+        assert!(
+            !tiny.contains('█'),
+            "a {width}×{height} frame has no usable reserved scrollbar track: {tiny}"
+        );
+    }
 }
 
 #[test]
@@ -747,8 +936,10 @@ fn the_expansion_aligns_row_one_into_the_labeled_grid() {
     );
     assert!(go_line.contains("scope"), "the go band lists the always-there keys:\n{go_line}");
     assert!(
-        move_line.contains("hunk") && move_line.contains("file"),
-        "the move band names the hunk and file steps:\n{move_line}"
+        move_line.contains("change")
+            && move_line.contains("line change")
+            && move_line.contains("file"),
+        "the move band names change-run, changed-line, and file steps:\n{move_line}"
     );
     // The three labels share one gutter column, and their content aligns in the next.
     let at = |l: &str, s: &str| l.find(s).expect("token present");
@@ -895,6 +1086,72 @@ fn pr_empty_states_are_calm() {
     let out = render(&app);
     assert!(out.contains("Git read failed"), "local failures stay factual:\n{out}");
     assert!(!out.contains("GitHub unavailable"), "a local failure is not blamed on GitHub:\n{out}");
+}
+
+#[test]
+fn hostile_pr_and_picker_fields_are_sanitized_at_paint_without_changing_raw_identity() {
+    use herdr_reviewr::forge::{Check, CheckStatus, PrSnapshot, PrView};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let hostile = "safe\u{1b}]52;c;payload\u{7f}\u{85}\u{202e}";
+    let mut app = app_on(&r);
+    app.set_tab(Tab::Pr).unwrap();
+
+    for view in [PrView::UnsupportedHost(hostile.into()), PrView::MalformedOrigin(hostile.into())] {
+        app.pr = view;
+        let out = render(&app);
+        for c in ['\u{1b}', '\u{7f}', '\u{85}', '\u{202e}'] {
+            assert!(!out.contains(c), "hostile PR empty-state character {c:?} reached paint");
+        }
+        assert!(out.contains("safe�]52;c;payload���"), "sanitized host remains explainable: {out}");
+    }
+
+    app.pr = PrView::Pr(Box::new(PrSnapshot {
+        title: format!("title-{hostile}"),
+        head_ref: format!("head-{hostile}"),
+        checks: vec![Check { name: format!("check-{hostile}"), status: CheckStatus::Success }],
+        comments: vec![herdr_reviewr::forge::Comment {
+            author: format!("author-{hostile}"),
+            body: format!("body-{hostile}"),
+            ..common::comment()
+        }],
+        ..common::pr_snapshot()
+    }));
+    let out = render(&app);
+    for c in ['\u{1b}', '\u{7f}', '\u{85}', '\u{202e}'] {
+        assert!(!out.contains(c), "hostile PR field character {c:?} reached paint");
+    }
+
+    app.picker_rows = vec![AgentChoice {
+        pane_id: "p".into(),
+        name: format!("agent-{hostile}"),
+        state: format!("state-{hostile}"),
+        tab: format!("tab-{hostile}"),
+    }];
+    app.picker_notice = Some(format!("notice-{hostile}"));
+    app.mode = Mode::Picker;
+    let out = render(&app);
+    for c in ['\u{1b}', '\u{7f}', '\u{85}', '\u{202e}'] {
+        assert!(!out.contains(c), "hostile picker character {c:?} reached paint");
+    }
+
+    app.base_picker = Some(BasePicker {
+        rows: vec![BaseChoice {
+            name: format!("base-{hostile}"),
+            starred: false,
+            is_default: false,
+        }],
+        cursor: 0,
+        query: String::new(),
+        caret: 0,
+    });
+    app.mode = Mode::BasePick;
+    let out = render(&app);
+    for c in ['\u{1b}', '\u{7f}', '\u{85}', '\u{202e}'] {
+        assert!(!out.contains(c), "hostile base-picker character {c:?} reached paint");
+    }
+    assert_eq!(app.base_picker.as_ref().unwrap().rows[0].name, format!("base-{hostile}"));
 }
 
 #[test]
@@ -1245,7 +1502,7 @@ fn the_comments_list_flags_a_stale_comment() {
     app.open_list();
 
     let out = render(&app);
-    assert!(out.contains("(stale)"), "stale comment flagged in the list:\n{out}");
+    assert!(out.contains("STALE"), "stale comment flagged in the list:\n{out}");
 }
 
 #[test]
@@ -2167,6 +2424,10 @@ mod search_screen_render {
         assert!(band.contains("files 4 │ code 2+"), "both chips carry a live count: {band}");
         assert!(!band.contains('⇥'), "the chips drop the flip glyph — the footer owns the key");
         assert!(out.contains("src/registry.rs"), "a path match renders as a file row");
+        assert!(
+            !out.contains("S src/registry.rs"),
+            "navigator-only semantic codes never leak into Search: {out}"
+        );
         assert!(out.contains("… more"), "a clipped list marks that there is more");
         assert!(out.contains("─ results"), "the results pane carries a titled rule");
         assert!(out.contains("─ preview"), "the divider row carries the preview title");
@@ -2323,6 +2584,45 @@ mod search_screen_render {
         let scrolled = app.search.as_ref().unwrap().preview.as_ref().unwrap().scroll.get();
         let _ = render_size(&app, 140, 40);
         assert!(scrolled > 0, "PageDown scrolls the preview");
+    }
+
+    #[test]
+    fn hostile_search_path_labels_are_sanitized_without_changing_preview_identity() {
+        let repo = Repo::init();
+        let raw = "safe\u{1b}]52;c;payload\u{7f}\u{85}\u{202e}.rs";
+        repo.write(raw, "needle\n");
+        repo.commit_all("c");
+        let mut app = open_on_all_files(&repo);
+        land(
+            &mut app,
+            SearchResults {
+                files: vec![FileHit { path: raw.into(), spans: vec![] }],
+                code: vec![CodeHit {
+                    path: raw.into(),
+                    line: 1,
+                    text: "needle".into(),
+                    spans: vec![(0, 6)],
+                }],
+                file_total: 1,
+                code_more: false,
+            },
+        );
+        app.build_search_preview();
+
+        let out = render(&app);
+        for hostile in ['\u{1b}', '\u{7f}', '\u{85}', '\u{202e}'] {
+            assert!(
+                !out.contains(hostile),
+                "raw hostile search character {hostile:?} reached paint"
+            );
+        }
+        assert!(out.contains("safe�]52;c;payload���.rs"));
+        assert!(out.contains("preview · safe�]52;c;payload���.rs"));
+        assert_eq!(
+            app.search.as_ref().unwrap().preview.as_ref().unwrap().path,
+            raw,
+            "paint sanitization must not change the raw path used to open the preview",
+        );
     }
 
     #[test]
@@ -3072,4 +3372,39 @@ fn an_overlong_skipped_tail_never_evicts_the_base_name() {
     assert!(line0.contains("· feature/x"), "the skipped tail paints in what remains: {line0}");
     assert!(line0.contains('…'), "the tail truncates with a trailing ellipsis: {line0}");
     assert!(line0.contains("1 changed"), "the right-aligned stats survive the long tail: {line0}");
+}
+
+#[test]
+fn hostile_diff_title_paths_are_sanitized_only_at_the_paint_boundary() {
+    let mut app = edited_app();
+    let raw_new = "new\u{1b}]52;c;payload\u{7f}\u{85}\u{202e}.rs";
+    let raw_old = "old\u{1b}]52;c;payload\u{7f}\u{85}\u{202e}.rs";
+    app.diff_path = Some(raw_new.to_string());
+    app.diff.previous_path = Some(raw_old.to_string());
+
+    let out = render(&app);
+    for hostile in ['\u{1b}', '\u{7f}', '\u{85}', '\u{202e}'] {
+        assert!(!out.contains(hostile), "raw hostile title character {hostile:?} reached paint");
+    }
+    assert!(out.contains("old�]52;c;payload���.rs → new�]52;c;payload���.rs"));
+    assert_eq!(
+        app.diff_path.as_deref(),
+        Some(raw_new),
+        "display sanitization must not alter identity"
+    );
+    assert_eq!(app.diff.previous_path.as_deref(), Some(raw_old));
+}
+
+#[test]
+fn hostile_files_only_status_text_is_sanitized_at_the_terminal_boundary() {
+    let r = Repo::init();
+    let mut app = app_on(&r);
+    app.status = "loading bad\u{1b}]52;c;payload\u{7f}\u{85}\u{202e}name".to_string();
+
+    let out = render(&app);
+    assert!(!out.contains('\u{1b}'));
+    assert!(!out.contains('\u{7f}'));
+    assert!(!out.contains('\u{85}'));
+    assert!(!out.contains('\u{202e}'));
+    assert!(out.contains("loading bad�]52;c;payload���name"), "sanitized status remains legible");
 }

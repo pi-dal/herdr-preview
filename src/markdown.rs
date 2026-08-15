@@ -776,7 +776,11 @@ pub(crate) fn hostile_char(c: char) -> bool {
 
 /// Neutralize text the terminal must never interpret: hostile characters render as a
 /// visible placeholder; tabs widen to spaces (`specs/markdown.md`).
-fn sanitize(text: &str) -> String {
+///
+/// This is also the display boundary for untrusted filesystem labels. It deliberately leaves
+/// newlines and tabs to their calling layout/markdown handling, while replacing every other C0,
+/// DEL, C1, and bidi-format control before Ratatui receives a span.
+pub(crate) fn sanitize_terminal_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -787,6 +791,10 @@ fn sanitize(text: &str) -> String {
         }
     }
     out
+}
+
+fn sanitize(text: &str) -> String {
+    sanitize_terminal_text(text)
 }
 
 /// One styled run entering the wrapper: text, style, and its link id when clickable.
@@ -1052,6 +1060,18 @@ mod tests {
         let lines = render_lines("see [the run](https://ci.example/1)", 80, &hl, &p);
         let link = lines[0].spans.iter().find(|s| s.content.contains("the run")).unwrap();
         assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn terminal_text_sanitizer_neutralizes_controls_and_bidi_without_changing_layout_controls() {
+        let hostile = "safe\u{1b}[2J\u{7f}\u{85}\u{202e}tail\tline\nnext";
+        let clean = super::sanitize_terminal_text(hostile);
+        assert!(clean.contains("safe�[2J���tail"), "{clean:?}");
+        assert!(clean.ends_with("tail    line\nnext"), "{clean:?}");
+        assert!(!clean.contains('\u{1b}'));
+        assert!(!clean.contains('\u{7f}'));
+        assert!(!clean.contains('\u{85}'));
+        assert!(!clean.contains('\u{202e}'));
     }
 
     #[test]

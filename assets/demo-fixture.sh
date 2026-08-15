@@ -5,7 +5,7 @@
 # lexer can't carry the quoting.
 set -euo pipefail
 
-D="${1:-/tmp/herdr-reviewr-demo}"
+D="${1:-/tmp/herdr-preview-demo}"
 rm -rf "$D"
 mkdir -p "$D"
 cd "$D"

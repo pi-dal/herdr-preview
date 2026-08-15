@@ -21,6 +21,11 @@ impl Repo {
     pub fn init() -> Self {
         let repo = Self { dir: TempDir::new().expect("tempdir") };
         repo.git(&["init", "-q", "-b", "main"]);
+        // Git may launch maintenance asynchronously after a commit, leaving a transient
+        // maintenance.lock unrelated to the behavior a test is asserting. Disable Git's
+        // own auto-maintenance in every fixture so worktree-purity snapshots are stable.
+        repo.git(&["config", "maintenance.auto", "false"]);
+        repo.git(&["config", "gc.auto", "0"]);
         repo
     }
 

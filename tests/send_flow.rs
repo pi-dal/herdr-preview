@@ -149,17 +149,20 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
     // One short sentence a reviewer can read. herdr's own wording is a JSON envelope around a
     // pane id, and the argv it came from carries the whole review in its last argument — both
     // would fill a 40-column footer without naming anything (`specs/herdr-host.md`).
-    assert_eq!(app.status, "agent not found");
+    assert_eq!(app.status, "Agent not found — 1 comments kept");
     assert_eq!(app.last_sent_pane, None, "a failed send arms nothing");
     fail_on_nothing(&fake_dir);
 
-    // One agent: `s` sends straight through, no picker frame in between — and the direct
-    // send arms its agent like a picker send.
+    // One agent still opens the confirmation sheet. Only its explicit Enter writes directly to
+    // Herdr's pane input and arms the agent.
     fs::write(fake_dir.join("agents.json"), ONE_AGENT).unwrap();
     press(&mut app, KeyCode::Char('s'), area, &keymap);
-    assert_eq!(app.mode, Mode::Normal, "one agent sends directly");
+    assert_eq!(app.mode, Mode::Picker, "one agent requires confirmation");
+    assert_eq!(app.store.len(), 1, "opening confirmation does not consume");
+    press(&mut app, KeyCode::Enter, area, &keymap);
+    assert_eq!(app.mode, Mode::Normal);
     assert!(app.store.is_empty(), "a successful send consumes the whole set");
-    assert_eq!(app.status, "added 1 comment to claude");
+    assert_eq!(app.status, "Added 1 comment to claude, not submitted");
     assert_eq!(app.last_sent_pane.as_deref(), Some("w8:p1"));
 
     // `enter` sends to the digit-selected agent and consumes the set.
@@ -170,7 +173,7 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
     press(&mut app, KeyCode::Enter, area, &keymap);
     assert_eq!(app.mode, Mode::Normal);
     assert!(app.store.is_empty(), "a successful send consumes the whole set");
-    assert_eq!(app.status, "added 1 comment to codex");
+    assert_eq!(app.status, "Added 1 comment to codex, not submitted");
     assert_eq!(app.last_sent_pane.as_deref(), Some("w8:p2"));
     assert!(log(&fake_dir).contains("pane send-text w8:p2"), "log: {}", log(&fake_dir));
     // The start marker opens the payload at the CLI boundary; `pasted()` owns the rationale.
@@ -221,20 +224,161 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
         log(&fake_dir)
     );
 
-    // No agent, and an enumeration herdr never answered, both refuse and name the clipboard —
-    // and neither opens a picker.
+    // No agent and unavailable Herdr both keep drafts in a cancellable confirmation sheet.
     fs::write(fake_dir.join("agents.json"), r#"{"result":{"agents":[]}}"#).unwrap();
     write_comment(&mut app, "four");
     press(&mut app, KeyCode::Char('s'), area, &keymap);
-    assert_eq!(app.mode, Mode::Normal, "an empty workspace opens no picker");
+    assert_eq!(app.mode, Mode::Picker, "an empty workspace explains retained drafts in the sheet");
     assert_eq!(app.store.len(), 1, "a refusal keeps every comment");
-    assert_eq!(app.status, "no agent here — copy to the clipboard instead");
+    assert_eq!(
+        app.picker_notice.as_deref(),
+        Some("No agent in this workspace — comments kept · y copy")
+    );
+    press(&mut app, KeyCode::Esc, area, &keymap);
 
     fail_on(&fake_dir, "agent list");
     press(&mut app, KeyCode::Char('s'), area, &keymap);
-    assert_eq!(app.mode, Mode::Normal, "a failed enumeration opens no picker");
+    assert_eq!(
+        app.mode,
+        Mode::Picker,
+        "a failed enumeration still opens the retained-drafts sheet"
+    );
     assert_eq!(app.store.len(), 1, "a refusal keeps every comment");
-    // A failed enumeration says so rather than claiming a count. The argv and herdr's stderr go
-    // to the log, so the sentence still fits a 40-column footer (`specs/input.md`).
-    assert_eq!(app.status, "herdr did not answer — copy to the clipboard instead");
+    assert_eq!(app.picker_notice.as_deref(), Some("Herdr unavailable — comments kept · y copy"));
+}
+
+/// An in-memory clipboard seam for picker-fallback dispatch tests. It never invokes a platform
+/// clipboard program, and records the payload only after the key reaches the fallback path.
+struct TestClipboard {
+    ok: bool,
+    captured: std::cell::RefCell<Vec<String>>,
+}
+
+impl TestClipboard {
+    fn succeeding() -> Self {
+        Self { ok: true, captured: std::cell::RefCell::new(Vec::new()) }
+    }
+
+    fn failing() -> Self {
+        Self { ok: false, captured: std::cell::RefCell::new(Vec::new()) }
+    }
+}
+
+impl herdr_reviewr::export::ExportTarget for TestClipboard {
+    fn label(&self) -> &'static str {
+        "clipboard"
+    }
+
+    fn success_message(&self, count: usize) -> String {
+        format!("copied {count} comment{}", if count == 1 { "" } else { "s" })
+    }
+
+    fn failure_message(&self) -> String {
+        "clipboard failed".to_string()
+    }
+
+    fn export(&self, text: &str) -> anyhow::Result<()> {
+        self.captured.borrow_mut().push(text.to_string());
+        if self.ok { Ok(()) } else { anyhow::bail!("test clipboard failure") }
+    }
+}
+
+#[test]
+fn no_target_and_unavailable_picker_copy_uses_only_the_clipboard_seam() {
+    if env::var("PICKER_COPY_CHILD").is_err() {
+        let staging = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fake_herdr(staging.path());
+        let out = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "no_target_and_unavailable_picker_copy_uses_only_the_clipboard_seam",
+                "--nocapture",
+            ])
+            .env("PICKER_COPY_CHILD", "1")
+            .env("FAKE_HERDR_DIR", staging.path())
+            .env("HERDR_BIN_PATH", &script)
+            .env("HERDR_WORKSPACE_ID", "w8")
+            .env("HERDR_PANE_ID", "w8:p9")
+            .output()
+            .expect("re-exec the test with the fake herdr env");
+        assert!(
+            out.status.success(),
+            "child run failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            !log(staging.path()).contains("pane send-text"),
+            "picker fallback must never address an agent: {}",
+            log(staging.path())
+        );
+        return;
+    }
+
+    let r = Repo::init();
+    r.write("a.rs", "alpha\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nbeta\n");
+    let fake_dir = PathBuf::from(env::var("FAKE_HERDR_DIR").expect("set by the parent run"));
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 80, 24);
+    let mut app = app_on(&r);
+
+    // No agent: y reaches only the injected clipboard, whose confirmed success consumes drafts.
+    fs::write(fake_dir.join("agents.json"), r#"{"result":{"agents":[]}}"#).unwrap();
+    write_comment(&mut app, "no-target success");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert_eq!(app.mode, Mode::Picker);
+    let copied = TestClipboard::succeeding();
+    herdr_reviewr::handle_key_with_clipboard(
+        &mut app,
+        KeyEvent::from(KeyCode::Char('y')),
+        area,
+        &keymap,
+        &copied,
+    )
+    .unwrap();
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.store.is_empty(), "only a confirmed clipboard success consumes drafts");
+    assert_eq!(copied.captured.borrow().len(), 1, "the fallback handed the review to clipboard");
+
+    // A clipboard error closes the notice but retains every draft for retry.
+    write_comment(&mut app, "no-target failure");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    let failed = TestClipboard::failing();
+    herdr_reviewr::handle_key_with_clipboard(
+        &mut app,
+        KeyEvent::from(KeyCode::Char('y')),
+        area,
+        &keymap,
+        &failed,
+    )
+    .unwrap();
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.store.len(), 1, "a failed clipboard export retains drafts");
+
+    // Cancel is equally non-destructive for the no-target notice.
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    press(&mut app, KeyCode::Esc, area, &keymap);
+    assert_eq!(app.store.len(), 1, "cancelling a no-target picker retains drafts");
+
+    // A failed Herdr enumeration has the same clipboard-only fallback behavior.
+    fail_on(&fake_dir, "agent list");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert_eq!(app.picker_notice.as_deref(), Some("Herdr unavailable — comments kept · y copy"));
+    let unavailable_copied = TestClipboard::succeeding();
+    herdr_reviewr::handle_key_with_clipboard(
+        &mut app,
+        KeyEvent::from(KeyCode::Char('y')),
+        area,
+        &keymap,
+        &unavailable_copied,
+    )
+    .unwrap();
+    assert!(app.store.is_empty(), "the unavailable fallback consumes only after clipboard success");
+
+    write_comment(&mut app, "unavailable cancel");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    press(&mut app, KeyCode::Esc, area, &keymap);
+    assert_eq!(app.store.len(), 1, "cancelling an unavailable picker retains drafts");
 }

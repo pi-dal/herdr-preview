@@ -1,47 +1,135 @@
-id = "persiyanov.reviewr"
-name = "reviewr"
-version = "0.30.4"
-# Turn tracking resolves each agent's `cwd` from `herdr agent list` to decide worktree
-# membership, and `cwd` is only verified present from 0.7.5 (docs/herdr-api-notes.md). On an
-# older herdr every agent would parse with no `cwd`, and `last turn` would never track.
-min_herdr_version = "0.7.5"
+id = "pi-dal.herdr-preview"
+name = "Herdr Preview"
+version = "0.1.0"
+# Pane process and live-cwd APIs used by the actions are supported by Herdr 0.8.0.
+min_herdr_version = "0.8.0"
 platforms = ["macos", "linux"]
-description = "Review agent-written diffs beside the chat and add line comments to the agent input."
+description = "A diff-first review pane for previewing agent changes and sending line comments back through Herdr."
 
-# On `herdr plugin install`, download the prebuilt `herdr-reviewr` binary for this platform from
-# the matching GitHub Release into $HERDR_PLUGIN_ROOT/bin (no Rust toolchain needed). Skipped by
-# `herdr plugin link` — for a local checkout, build it yourself with `cargo install --path .`.
+# Managed installs build this fork from its checked-out source. Local links skip build steps;
+# run `just install` before `herdr plugin link .`.
 [[build]]
-command = ["bash", "herdr/install.sh"]
+command = ["bash", "herdr/build.sh"]
 
-# The plugin pane runs the downloaded binary by absolute path under the plugin root, since the
-# pane's cwd is the repo under review (not the plugin root) and the binary isn't on PATH. The
-# toggle action's placement is configurable (default: right split); see herdr/pane.sh.
+# The installed binary has a Preview-only name, so foreground-process identity cannot
+# collide with the upstream herdr-reviewr plugin.
 [[panes]]
 id = "pane"
-title = "reviewr"
+title = "Herdr Preview"
 placement = "split"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-reviewr\""]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-preview\""]
 
 [[actions]]
 id = "toggle"
-title = "reviewr: toggle pane"
+title = "Herdr Preview: toggle preview"
 contexts = ["pane", "workspace"]
 command = ["bash", "herdr/pane.sh", "toggle"]
 
 [[actions]]
 id = "open"
-title = "reviewr: open pane"
+title = "Herdr Preview: open preview"
 contexts = ["pane", "workspace"]
 command = ["bash", "herdr/pane.sh", "open"]
 
 [[actions]]
 id = "close"
-title = "reviewr: close pane"
+title = "Herdr Preview: close preview"
 contexts = ["pane", "workspace"]
 command = ["bash", "herdr/pane.sh", "close"]
 
-# Auto-open a reviewr pane for a freshly created worktree (gated by auto_open; see herdr/pane.sh).
+[[actions]]
+id = "peek"
+title = "Herdr Preview: peek beside agent"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "peek"]
+
+# These host actions route canonical Herdr keys to Preview. They exist because Herdr owns
+# physical Option chords before a terminal pane receives them (specs/herdr-host.md).
+[[actions]]
+id = "changes"
+title = "Herdr Preview: show changes"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+d"]
+
+[[actions]]
+id = "files"
+title = "Herdr Preview: show files"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+f"]
+
+[[actions]]
+id = "review"
+title = "Herdr Preview: show review"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+r"]
+
+[[actions]]
+id = "comment"
+title = "Herdr Preview: comment"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+c"]
+
+[[actions]]
+id = "comments"
+title = "Herdr Preview: list comments"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+l"]
+
+[[actions]]
+id = "send"
+title = "Herdr Preview: send comments"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+s"]
+
+[[actions]]
+id = "refresh"
+title = "Herdr Preview: refresh"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+shift+r"]
+
+[[actions]]
+id = "hide-unchanged"
+title = "Herdr Preview: hide unchanged"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+u"]
+
+[[actions]]
+id = "previous-change"
+title = "Herdr Preview: previous change"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+up"]
+
+[[actions]]
+id = "next-change"
+title = "Herdr Preview: next change"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+down"]
+
+[[actions]]
+id = "previous-file"
+title = "Herdr Preview: previous file"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+shift+up"]
+
+[[actions]]
+id = "next-file"
+title = "Herdr Preview: next file"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+shift+down"]
+
+[[actions]]
+id = "previous-change-run"
+title = "Herdr Preview: previous change run"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+left"]
+
+[[actions]]
+id = "next-change-run"
+title = "Herdr Preview: next change run"
+contexts = ["pane", "workspace"]
+command = ["bash", "herdr/pane.sh", "forward", "alt+right"]
+
+# Auto-open Preview for a freshly created worktree, gated by auto_open.
 [[events]]
 on = "worktree.created"
 command = ["bash", "herdr/pane.sh", "auto-open"]

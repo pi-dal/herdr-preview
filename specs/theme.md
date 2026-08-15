@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-06-29
-Last edited: 2026-07-31
+Last edited: 2026-08-15
 ---
 
 # Theme
@@ -59,7 +59,8 @@ A herdr name outside this set (`kanagawa`, `kanagawa-lotus`, `vesper`, `terminal
 - Each theme declares its `appearance`, light or dark. Dark themes lighten `base` for surfaces, light themes darken it.
 - The cursor, selection, and fold fills step `surface2` > `surface1` > `surface0`. The cursor is the strongest contrast, a fold the faintest.
 - Every visible pane fills its cursor row. The focused pane fills with `surface2`, the other with `surface1`, so which pane holds focus reads at a glance. A hidden navigator leaves one pane, filled with `surface2` (`tui.md`).
-- Dim text on a filled row lifts from `overlay0` to `subtext0`, in every list that fills a row. The file list's indent, a search hit's line number, and a picker row's state and tab all stay readable under the fill.
+- Dim text on a filled row lifts from `overlay0` to `subtext0`, in every list that fills a row. The file list's indent and semantic code, a search hit's line number, and a picker row's state and tab all stay readable under the fill.
+- File navigator semantic codes use the existing secondary text slots. They add no palette anchor or derived slot (`file-list.md`).
 - `catppuccin` pins its whole palette as a literal and renders as faithful Catppuccin Mocha.
 
 ### Diff-fill legibility

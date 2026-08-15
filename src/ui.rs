@@ -21,10 +21,12 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{App, Band, Focus, FooterAction, Mode, Tab};
 use crate::config::NavigatorPosition;
 use crate::diff::{FileDiff, FileState, Row};
+use crate::file_icon::{FileIcon, FileIconMode, FileIconOverrides, file_icon};
 use crate::file_list::{Annotation, RowKind};
 use crate::forge;
 use crate::herdr::AgentChoice;
 use crate::keymap::Keymap;
+use crate::markdown::{hostile_char, sanitize_terminal_text};
 use crate::model::Comment;
 use crate::theme::Palette;
 
@@ -76,6 +78,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     // `body_popup`, so the footer just drawn stays uncovered and keeps advertising their keys.
     let popup: Option<fn(&mut Frame, &App, Rect)> = match app.mode {
         Mode::List => Some(render_comments_list),
+        Mode::ConfirmDelete { .. } => Some(render_delete_confirmation),
         Mode::Picker => Some(render_agent_picker),
         Mode::BasePick => Some(render_base_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
@@ -246,10 +249,81 @@ pub fn in_diff_pane(area: Rect, app: &App, col: u16, row: u16) -> bool {
     contains(panes(area, app).diff, col, row)
 }
 
-/// The logical diff-row index a click at `(col, row)` lands on, or `None` if outside the
-/// diff pane. `heights` (display rows per logical row) and `diff_scroll` reproduce the
-/// painted window, so a click on any display line of a wrapped row maps to that row.
+/// The exact saved-comment card at a pointer location. Cards share a logical source row, so this
+/// returns the store index rather than inferring one from the cursor.
 #[must_use]
+pub fn hit_comment_card(
+    area: Rect,
+    app: &App,
+    col: u16,
+    row: u16,
+    heights: &[usize],
+    diff_scroll: usize,
+) -> Option<crate::model::CommentId> {
+    let inner = inner_rect(panes(area, app).diff);
+    if !contains(inner, col, row) {
+        return None;
+    }
+    let target = (row - inner.y) as usize;
+    let gutter = gutter_for(&app.diff);
+    let cards = app.comment_cards();
+    let editing = editing_comment(app);
+    let mut acc = 0;
+    for (i, card_slots) in cards.iter().enumerate().skip(diff_scroll) {
+        let base = row_height(&app.visible[i], gutter, inner.width as usize, app.wrap);
+        let card_indices: Vec<_> =
+            card_slots.iter().copied().filter(|&ci| Some(ci) != editing).collect();
+        let card_height: usize = card_indices
+            .iter()
+            .filter_map(|&ci| app.store.get(ci).map(|comment| (ci, comment)))
+            .map(|(id, comment)| {
+                comment_card_lines(
+                    comment,
+                    inner.width as usize,
+                    app.palette(),
+                    app.comment_ordinal(id).unwrap_or(0),
+                    app.store.len(),
+                    app.stale_reason(comment),
+                )
+                .len()
+            })
+            .sum();
+        if target < acc + base {
+            return None;
+        }
+        // The selection strip paints between the endpoint's code and its cards. It belongs to
+        // neither target: clicking it must reach the Comment affordance below, while every
+        // card row starts after it.
+        let action_strip = selection_action_height(app, i);
+        if target < acc + base + action_strip {
+            return None;
+        }
+        if target < acc + base + action_strip + card_height {
+            let mut at = acc + base + action_strip;
+            for ci in card_indices {
+                let height = app.store.get(ci).map_or(0, |comment| {
+                    comment_card_lines(
+                        comment,
+                        inner.width as usize,
+                        app.palette(),
+                        app.comment_ordinal(ci).unwrap_or(0),
+                        app.store.len(),
+                        app.stale_reason(comment),
+                    )
+                    .len()
+                });
+                if target < at + height {
+                    return Some(ci);
+                }
+                at += height;
+            }
+            return None;
+        }
+        acc += heights.get(i).copied().unwrap_or(base + card_height);
+    }
+    None
+}
+
 pub fn hit_diff(
     area: Rect,
     app: &App,
@@ -271,6 +345,57 @@ pub fn hit_diff(
         }
     }
     None
+}
+
+/// The precise button in the selection action strip. The strip gets its own display row, so it
+/// never overwrites an endpoint's source text (`specs/input.md`).
+pub const COMMENT_AFFORDANCE: &str = "Comment";
+
+/// The painted rectangle of the `Comment` button in the dedicated action strip. Rendering and
+/// mouse dispatch share this geometry, including wrapped source rows and cards above it.
+#[must_use]
+pub fn comment_affordance_rect(
+    area: Rect,
+    app: &App,
+    heights: &[usize],
+    diff_scroll: usize,
+) -> Option<Rect> {
+    if app.focus != Focus::Diff || app.select_anchor.is_none() {
+        return None;
+    }
+    let endpoint = app.diff_cursor;
+    let row = app.visible.get(endpoint)?;
+    if !row.is_content() {
+        return None;
+    }
+    let inner = inner_rect(panes(area, app).diff);
+    let width = COMMENT_AFFORDANCE.width() as u16;
+    if inner.width < width || endpoint < diff_scroll {
+        return None;
+    }
+    let before: usize = heights.get(diff_scroll..endpoint)?.iter().sum();
+    let code_height = row_height(row, gutter_for(&app.diff), inner.width as usize, app.wrap);
+    // The strip is directly after the endpoint's final wrapped source row, before any saved cards.
+    let y = inner.y.checked_add(u16::try_from(before + code_height).ok()?)?;
+    let body_height =
+        if app.mode == Mode::Find { inner.height.saturating_sub(1) } else { inner.height };
+    (y < inner.y.saturating_add(body_height))
+        .then(|| Rect::new(inner.x + inner.width - width, y, width, 1))
+}
+
+/// Whether the pointer lands on the compact inline `Comment` control rather than merely on the
+/// selected endpoint's content row.
+#[must_use]
+pub fn hit_comment_affordance(
+    area: Rect,
+    app: &App,
+    col: u16,
+    row: u16,
+    heights: &[usize],
+    diff_scroll: usize,
+) -> bool {
+    comment_affordance_rect(area, app, heights, diff_scroll)
+        .is_some_and(|target| contains(target, col, row))
 }
 
 /// The number of diff rows visible in the diff pane, used to clamp the scroll.
@@ -298,20 +423,42 @@ pub fn diff_row_heights(app: &App, area: Rect) -> Vec<usize> {
         .enumerate()
         .map(|(i, r)| {
             let base = row_height(r, gutter_w, width, app.wrap);
+            let action_strip = selection_action_height(app, i);
             let card: usize = cards[i]
                 .iter()
                 .filter(|&&ci| Some(ci) != editing)
-                .filter_map(|&ci| app.store.get(ci))
-                .map(|c| comment_card_lines(c, width, p).len())
+                .filter_map(|&ci| app.store.get(ci).map(|c| (ci, c)))
+                .map(|(id, c)| {
+                    comment_card_lines(
+                        c,
+                        width,
+                        p,
+                        app.comment_ordinal(id).unwrap_or(0),
+                        app.store.len(),
+                        app.stale_reason(c),
+                    )
+                    .len()
+                })
                 .sum();
-            base + card
+            base + action_strip + card
         })
         .collect()
 }
 
+/// The rendered height of the selection action strip after logical row `i`. This is shared by
+/// measuring and card hit-testing so the strip can never be mistaken for a saved card.
+fn selection_action_height(app: &App, i: usize) -> usize {
+    usize::from(
+        app.focus == Focus::Diff
+            && app.select_anchor.is_some()
+            && i == app.diff_cursor
+            && app.visible.get(i).is_some_and(Row::is_content),
+    )
+}
+
 /// The store index of the comment currently being edited, whose inline card is hidden in
 /// favor of its edit box; `None` when not editing.
-fn editing_comment(app: &App) -> Option<usize> {
+fn editing_comment(app: &App) -> Option<crate::model::CommentId> {
     match app.mode {
         Mode::Composing { editing } => editing,
         _ => None,
@@ -358,7 +505,7 @@ fn composer_lines(
             if i == caret_row {
                 row_with_caret(text, caret_col, p)
             } else {
-                Line::from(text.clone())
+                Line::from(sanitize_terminal_text(text))
             }
         })
         .collect()
@@ -374,10 +521,12 @@ fn row_with_caret(text: &str, col: usize, p: &Palette) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
     let col = col.min(chars.len());
     let left: String = chars[..col].iter().collect();
-    let mut spans = vec![Span::raw(left)];
+    let mut spans = vec![Span::raw(sanitize_terminal_text(&left))];
     if col < chars.len() {
-        spans.push(Span::styled(chars[col].to_string(), caret_style(p)));
-        spans.push(Span::raw(chars[col + 1..].iter().collect::<String>()));
+        let shown = sanitize_terminal_text(&chars[col].to_string());
+        spans.push(Span::styled(shown, caret_style(p)));
+        let right: String = chars[col + 1..].iter().collect();
+        spans.push(Span::raw(sanitize_terminal_text(&right)));
     }
     Line::from(spans)
 }
@@ -642,11 +791,11 @@ fn base_label(app: &App) -> Option<(String, String, String)> {
         return None;
     }
     let tail = match &app.branch_base.skipped {
-        Some(missing) => format!(" · {missing} missing"),
+        Some(missing) => format!(" · {} missing", sanitize_terminal_text(missing)),
         None => String::new(),
     };
     Some(match &app.branch_base.winner {
-        Some(b) => ("vs ".to_string(), b.name.clone(), tail),
+        Some(b) => ("vs ".to_string(), sanitize_terminal_text(&b.name), tail),
         None => (String::new(), "no base".to_string(), tail),
     })
 }
@@ -714,6 +863,22 @@ fn tab_bar_spans(app: &App) -> Vec<Span<'static>> {
 }
 
 fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    if !app.is_git_review() {
+        let p = app.palette();
+        let bar = Style::default().bg(p.surface0);
+        let root = truncate_width(
+            &sanitize_terminal_text(&app.repo.display().to_string()),
+            area.width.saturating_sub(14) as usize,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" Files-only ", bar.fg(p.lavender).add_modifier(Modifier::BOLD)),
+                Span::styled(root, bar.fg(p.overlay0)),
+            ])),
+            area,
+        );
+        return;
+    }
     let chip = scope_chip(app);
     let base = base_parts(app, app.keymap(), area.width);
     let base_width = base.as_ref().map_or(0, |(lead, name, tail)| {
@@ -773,7 +938,23 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let width = inner.width as usize;
+    // Reserve the scrollbar track before sizing rows. A one-column navigator keeps its only
+    // column for content; a track appears only when at least one content column remains.
+    let show_scrollbar =
+        inner.width > 1 && inner.height > 0 && app.file_rows.len() > inner.height as usize;
+    let rows_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width.saturating_sub(u16::from(show_scrollbar)),
+        inner.height,
+    );
+    let width = rows_area.width as usize;
+    let default_icon_overrides = FileIconOverrides::default();
+    let icon_config = app.plugin_config();
+    let icon_mode =
+        icon_config.map_or(FileIconMode::Plain, crate::config::PluginConfig::file_icons);
+    let icon_overrides = icon_config
+        .map_or(&default_icon_overrides, crate::config::PluginConfig::file_icon_overrides);
     // Window the rows to the scrolled-to viewport; `file_scroll` keeps the cursor on screen.
     let items: Vec<ListItem> = app
         .file_rows
@@ -788,23 +969,29 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
             match &row.kind {
                 RowKind::Dir { expanded, .. } => {
                     let arrow = if *expanded { "▾ " } else { "▸ " };
+                    let name = format!("{}/", sanitize_terminal_text(&row.name));
+                    let fixed = indent.width() + arrow.width();
+                    let name_width = width.saturating_sub(fixed).max(1);
                     // A git-ignored directory recedes into a dim, unbolded row (file-list.md).
                     let name_style = if row.ignored {
                         Style::default().fg(p.overlay0)
                     } else {
                         Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
                     };
-                    let spans = vec![
-                        Span::styled(format!("{indent}{arrow}"), Style::default().fg(p.overlay0)),
-                        Span::styled(format!("{}/", row.name), name_style),
-                    ];
+                    let mut spans = vec![Span::styled(
+                        format!("{indent}{arrow}"),
+                        Style::default().fg(p.overlay0),
+                    )];
+                    spans.push(Span::styled(elide_head(&name, name_width), name_style));
                     selectable_row(p, spans, width, fill)
                 }
-                RowKind::File { annotation, .. } => file_row_item(
+                RowKind::File { index, annotation } => file_row_item(
                     &FileRowSpec {
                         indent: &indent,
                         annotation: annotation.as_ref(),
-                        name: &row.name,
+                        name: &sanitize_terminal_text(&row.name),
+                        icon: file_icon(&app.entries[*index].path, icon_mode, icon_overrides),
+                        icon_mode,
                         ignored: row.ignored,
                         emphasis: &[],
                     },
@@ -815,7 +1002,25 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
             }
         })
         .collect();
-    frame.render_widget(List::new(items), inner);
+    if rows_area.width > 0 && rows_area.height > 0 {
+        frame.render_widget(List::new(items), rows_area);
+    }
+    // The file cursor deliberately does not move with the wheel, so a visible thumb is the
+    // navigator's scroll-position affordance. Its reserved track never overwrites a filename or
+    // right-aligned stats, and a zero/one-column interior renders no track.
+    if show_scrollbar {
+        let height = inner.height as usize;
+        let max = app.file_rows.len().saturating_sub(height);
+        let thumb = (height.saturating_mul(height) / app.file_rows.len()).clamp(1, height);
+        let start =
+            app.file_scroll.min(max).saturating_mul(height.saturating_sub(thumb)) / max.max(1);
+        let track = (0..height)
+            .map(|row| if (start..start + thumb).contains(&row) { "█" } else { "░" })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rect = Rect::new(rows_area.x + rows_area.width, inner.y, 1, inner.height);
+        frame.render_widget(Paragraph::new(track).style(Style::default().fg(p.overlay1)), rect);
+    }
 }
 
 /// The fields [`file_row_item`] renders. `emphasis` byte ranges into `name` wear the match
@@ -826,35 +1031,53 @@ struct FileRowSpec<'a> {
     indent: &'a str,
     annotation: Option<&'a Annotation>,
     name: &'a str,
+    /// Navigator-only lexical type presentation. Search deliberately supplies `None`.
+    icon: Option<FileIcon>,
+    icon_mode: FileIconMode,
     ignored: bool,
     emphasis: &'a [(u32, u32)],
 }
 
-/// A file row: `<indent><marker> <name> <stats>` — the marker colored by kind, the basename
-/// bright with its parent directories dimmed, and the `+a −d` stats right-aligned against the
-/// pane edge. A name too wide for the row keeps its tail behind a leading `…/`. An unannotated
-/// row (an unchanged `All files` file) drops the marker and stats, showing just the name.
+/// A file row: `<indent><marker> <kind> <name> <stats>` — a Git marker followed by one fixed
+/// one-cell lexical kind code or an explicit best-effort Nerd Font glyph. The basename stays
+/// bright with parent directories dimmed, and `+a −d` stats remain right-aligned. A name too wide
+/// keeps its tail behind a leading `…/`. At narrow widths the two-cell kind slot yields before
+/// filename, marker, or stats. An unannotated `All files` file drops marker and stats.
 fn file_row_item(
     row: &FileRowSpec<'_>,
     width: usize,
     fill: Option<Color>,
     p: &Palette,
 ) -> ListItem<'static> {
-    let FileRowSpec { indent, annotation, name, ignored, emphasis } = *row;
+    let FileRowSpec { indent, annotation, name, icon, icon_mode, ignored, emphasis } = *row;
+    // `name` can originate from an untrusted navigator or search result. Keep raw paths in
+    // model state for identity/opening, but neutralize this paint-only copy before it reaches a
+    // Span. Search match byte offsets refer to raw bytes, so drop only their decoration when
+    // sanitization changed the display string rather than applying them to shifted text.
+    let safe_name = sanitize_terminal_text(name);
+    let emphasis = if safe_name == name { emphasis } else { &[] };
+    let name = safe_name.as_str();
     let marker = annotation.map_or(String::new(), |a| format!("{} ", a.change.marker()));
     let (additions, deletions) = annotation.map_or((0, 0), |a| (a.additions, a.deletions));
     let stats = stats_str(additions, deletions);
     let gap = if stats.is_empty() { 0 } else { 2 };
     let fixed = indent.width() + marker.width() + stats.width() + gap;
-    let shown = elide_head(name, width.saturating_sub(fixed).max(1));
+    let icon = icon_for_width(icon, icon_mode, width, fixed, name.width());
+    let icon_width = icon.map_or(0, |(_, width)| width);
+    let shown = elide_head(name, width.saturating_sub(fixed + icon_width).max(1));
 
     let mut spans = vec![Span::styled(indent.to_string(), text_style(p))];
     if let Some(a) = annotation {
         spans.push(Span::styled(marker, Style::default().fg(kind_color(p, a.change.marker()))));
     }
-    // A git-ignored file recedes into a dim basename; its change marker and stats keep their
-    // color so a kept ignored file still reads as a change (file-list.md).
+    // Ignored paths are unannotated by the review model. Their code and name recede together;
+    // markers and stats remain governed solely by an annotation (file-list.md).
     let base_style = if ignored { Style::default().fg(p.overlay0) } else { text_style(p) };
+    if let Some((icon, _)) = icon {
+        let icon_style =
+            if ignored { Style::default().fg(p.overlay0) } else { Style::default().fg(p.subtext0) };
+        spans.push(Span::styled(format!("{icon} "), icon_style));
+    }
     // The match highlight follows the engine's spans onto the shown text, remapped across any
     // head-elision so a matched, still-visible character is never left unmarked (search.md).
     let shown_spans = remap_emphasis(emphasis, name, &shown);
@@ -884,6 +1107,37 @@ fn file_row_item(
         spans.extend(stats_spans(additions, deletions, p));
     }
     selectable_row(p, spans, width, fill)
+}
+
+const MIN_NAVIGATOR_NAME_WIDTH: usize = 4;
+const ICON_NAME_PRIORITY_WIDTH: usize = 12;
+/// Preserve a useful filename budget before spending an optional kind slot on decoration.
+/// Plain and Nerd use one nominal glyph cell plus a separator. Emoji are standard Unicode strings
+/// (not PUA codepoints) and reserve their measured width plus a separator; terminal rendering may
+/// still differ, which cannot be probed safely at runtime.
+fn icon_for_width(
+    icon: Option<FileIcon>,
+    mode: FileIconMode,
+    width: usize,
+    fixed: usize,
+    name_width: usize,
+) -> Option<(&'static str, usize)> {
+    let icon = icon?;
+    let text = match mode {
+        FileIconMode::Plain => icon.plain,
+        FileIconMode::Emoji => icon.emoji,
+        FileIconMode::Nerd => icon.nerd,
+        FileIconMode::None => return None,
+    };
+    let glyph_width = UnicodeWidthStr::width(text);
+    // Width zero would not make a safe optional slot; the bundled presentations are vetted by
+    // tests and a future configuration value cannot provide arbitrary display strings.
+    if glyph_width == 0 {
+        return None;
+    }
+    let slot_width = glyph_width + 1;
+    let required_name_width = name_width.clamp(MIN_NAVIGATOR_NAME_WIDTH, ICON_NAME_PRIORITY_WIDTH);
+    (width.saturating_sub(fixed + slot_width) >= required_name_width).then_some((text, slot_width))
 }
 
 /// The `+a −d` stats text, dropping a side that is zero (`+210`, `−4`, or empty); used to
@@ -958,7 +1212,14 @@ fn elide_head(name: &str, max: usize) -> String {
 /// A saved comment as inline display lines: a quiet box titled with the comment's location
 /// (in the comment-yellow accent) holding its wrapped text. Spliced read-only under the
 /// commented line so a submitted comment stays visible while reviewing.
-fn comment_card_lines(c: &Comment, width: usize, p: &Palette) -> Vec<Line<'static>> {
+fn comment_card_lines(
+    c: &Comment,
+    width: usize,
+    p: &Palette,
+    ordinal: usize,
+    total: usize,
+    stale_reason: Option<&str>,
+) -> Vec<Line<'static>> {
     const INDENT: usize = 2;
     let box_w = width.saturating_sub(INDENT).max(10);
     let text_w = box_w.saturating_sub(4).max(1); // inside "│ " … " │"
@@ -967,7 +1228,15 @@ fn comment_card_lines(c: &Comment, width: usize, p: &Palette) -> Vec<Line<'stati
     let body_style = Style::default().fg(p.text);
     let pad = || Span::raw(" ".repeat(INDENT));
 
-    let label = truncate_width(&format!(" comment · {} ", c.location()), box_w.saturating_sub(3));
+    let stale_label = stale_reason
+        .map_or_else(String::new, |reason| format!(" · STALE: {}", sanitize_one_line(reason)));
+    let label = truncate_width(
+        &format!(
+            " ● {ordinal}/{total} comment · {}{stale_label} · click/e edit ",
+            sanitize_one_line(&c.location())
+        ),
+        box_w.saturating_sub(3),
+    );
     let fill = box_w.saturating_sub(3 + label.width());
     let mut lines = vec![Line::from(vec![
         pad(),
@@ -976,7 +1245,8 @@ fn comment_card_lines(c: &Comment, width: usize, p: &Palette) -> Vec<Line<'stati
         Span::styled(format!("{}╮", "─".repeat(fill)), border),
     ])];
 
-    for logical in c.text.split('\n') {
+    let safe_text = sanitize_terminal_text(&c.text);
+    for logical in safe_text.split('\n') {
         for piece in wrap_text(logical, text_w) {
             let gap = " ".repeat(text_w.saturating_sub(piece.width()));
             lines.push(Line::from(vec![
@@ -997,6 +1267,12 @@ fn comment_card_lines(c: &Comment, width: usize, p: &Palette) -> Vec<Line<'stati
 
 /// Truncate `s` to `max` display columns, marking a cut with a trailing `…`. Zero columns
 /// fit nothing, not a bare `…`.
+/// Safe terminal text for labels that must remain on one physical row. Raw values stay in the
+/// model for identity, editing, and export; only this painted copy is flattened.
+fn sanitize_one_line(text: &str) -> String {
+    sanitize_terminal_text(text).replace('\n', " ")
+}
+
 fn truncate_width(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_string();
@@ -1018,11 +1294,104 @@ fn truncate_width(s: &str, max: usize) -> String {
     out
 }
 
+/// One dedicated selection strip. It degrades its prose before it ever disappears at a narrow
+/// width; the `Comment` button remains a separate right-aligned hit target.
+fn selection_action_line(app: &App, width: usize) -> Line<'static> {
+    let p = app.palette();
+    let full = app.selection_summary().unwrap_or_else(|| "selection".to_string());
+    let compact = full
+        .replace(" lines", "L")
+        .replace(" line", "L")
+        .replace(" · mixed", " mixed")
+        .replace(" · new", " new")
+        .replace(" · old", " old");
+    if width < COMMENT_AFFORDANCE.width() + 2 {
+        return Line::from(Span::styled(" c", Style::default().fg(p.peach).bg(p.surface0)));
+    }
+    let button = COMMENT_AFFORDANCE;
+    let room = width.saturating_sub(button.width() + 2);
+    let prefix = if full.width() + " · c · esc clear".width() <= room {
+        format!(" {full} · c · esc clear")
+    } else {
+        truncate_width(&format!(" {compact} · c"), room)
+    };
+    let pad = " ".repeat(width.saturating_sub(prefix.width() + button.width()));
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(p.peach).bg(p.surface0)),
+        Span::styled(pad, Style::default().bg(p.surface0)),
+        Span::styled(
+            button,
+            Style::default().fg(p.peach).bg(p.surface0).add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+/// Paint a cached RGBA image through ordinary Ratatui cells. `▀` holds the top pixel in its
+/// foreground and the lower pixel in its background, so no terminal graphics protocol, escape
+/// stream, or external renderer is involved. The decoder has already bounded/downscaled this
+/// raster before it reaches UI (`image_preview.rs`).
+fn render_image_preview(
+    frame: &mut Frame,
+    image: &crate::image_preview::ImagePreview,
+    area: Rect,
+    p: &Palette,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let metadata =
+        format!("{} · {}×{}", image.kind.label(), image.source_width, image.source_height);
+    let rows = usize::from(area.height).saturating_sub(1);
+    let cols = usize::from(area.width);
+    let (source_width, source_height) = image.pixels.dimensions();
+    if rows == 0 || source_width == 0 || source_height == 0 {
+        frame.render_widget(dim_paragraph(&metadata, p), area);
+        return;
+    }
+    // One terminal row contains two source pixels. Fit, never upscale, and center horizontally.
+    let width = cols.min(source_width as usize);
+    let height = rows.min((source_height as usize).div_ceil(2));
+    let x_pad = cols.saturating_sub(width) / 2;
+    let y_pad = rows.saturating_sub(height) / 2;
+    let mut lines = Vec::with_capacity(rows + 1);
+    lines.push(Line::from(Span::styled(metadata, Style::default().fg(p.overlay0))));
+    for row in 0..rows {
+        if row < y_pad || row >= y_pad + height {
+            lines.push(Line::from(" "));
+            continue;
+        }
+        let source_y = ((row - y_pad) * 2 * source_height as usize / (height * 2))
+            .min(source_height as usize - 1);
+        let source_y_bottom = (source_y + 1).min(source_height as usize - 1);
+        let mut spans = Vec::new();
+        if x_pad > 0 {
+            spans.push(Span::raw(" ".repeat(x_pad)));
+        }
+        for column in 0..width {
+            let source_x = (column * source_width as usize / width).min(source_width as usize - 1);
+            let top = image.pixels.get_pixel(source_x as u32, source_y as u32).0;
+            let bottom = image.pixels.get_pixel(source_x as u32, source_y_bottom as u32).0;
+            spans.push(Span::styled(
+                "▀",
+                Style::default()
+                    .fg(ratatui::style::Color::Rgb(top[0], top[1], top[2]))
+                    .bg(ratatui::style::Color::Rgb(bottom[0], bottom[1], bottom[2])),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
+    // Paths remain raw in `App` for view identity and Files-only capability access. Only this
+    // final terminal label is sanitized (diff-view.md terminal-text boundary).
     let mut title = match (&app.diff_path, &app.diff.previous_path) {
-        (Some(new), Some(old)) => format!("{old} → {new}"),
-        (Some(new), None) => new.clone(),
+        (Some(new), Some(old)) => {
+            format!("{} → {}", sanitize_terminal_text(old), sanitize_terminal_text(new))
+        }
+        (Some(new), None) => sanitize_terminal_text(new),
         (None, _) => match app.tab {
             Tab::AllFiles => "File",
             _ => "Diff",
@@ -1036,6 +1405,15 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.note_diff_width(inner.width as usize);
+
+    if let Some(image) = &app.image_preview {
+        render_image_preview(frame, image, inner, p);
+        return;
+    }
+    if let Some(note) = app.image_preview_note {
+        frame.render_widget(dim_paragraph(note, p), inner);
+        return;
+    }
 
     if app.visible.is_empty() {
         // `All files` is a content browser, not a diff, so its empty/notice copy avoids diff
@@ -1121,11 +1499,23 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
             selected: selecting && i >= lo && i <= hi,
         };
         let mut lines = render_row(&app.visible[i], layout, state);
+        // A selection owns a dedicated row after its endpoint. It states the immutable anchor
+        // before composing and reserves a button target without painting over source code.
+        if selecting && i == app.diff_cursor && app.visible[i].is_content() {
+            lines.push(selection_action_line(app, width));
+        }
         for &ci in &cards[i] {
             if Some(ci) != editing
                 && let Some(c) = app.store.get(ci)
             {
-                lines.extend(comment_card_lines(c, width, p));
+                lines.extend(comment_card_lines(
+                    c,
+                    width,
+                    p,
+                    app.comment_ordinal(ci).unwrap_or(0),
+                    app.store.len(),
+                    app.stale_reason(c),
+                ));
             }
         }
         lines
@@ -1144,6 +1534,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
         let mut out = display(app.diff_scroll..rows);
         out.truncate(body_h);
         frame.render_widget(Paragraph::new(out), Rect { height: body_h as u16, ..inner });
+
         if finding {
             let band = Rect { y: inner.y + body_h as u16, height: 1, ..inner };
             render_find_band(frame, app, band);
@@ -1454,6 +1845,7 @@ fn code_cells(row: &Row, emph_on: bool, hl_ranges: &[(u32, u32)]) -> Vec<Cell> {
                     col += 1;
                 }
             } else {
+                let ch = if hostile_char(ch) { '�' } else { ch };
                 let w = UnicodeWidthChar::width(ch).unwrap_or(0);
                 cells.push(Cell { ch, w, fg, emph, hl });
                 col += w;
@@ -1556,9 +1948,31 @@ fn render_find_band(frame: &mut Frame, app: &App, area: Rect) {
 /// The inline comment input box, drawn at `area` (under the selection in the diff).
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
-    let loc = app.pending_location().unwrap_or_else(|| "comment".to_string());
+    let loc = sanitize_one_line(&app.pending_location().unwrap_or_else(|| "comment".to_string()));
     let editing = matches!(app.mode, Mode::Composing { editing: Some(_) });
-    let title = if editing { format!("edit · {loc}") } else { format!("comment · {loc}") };
+    let count = if editing {
+        match app.mode {
+            Mode::Composing { editing: Some(id) } => {
+                app.store.get(id).map_or(1, |comment| comment.end.saturating_sub(comment.start) + 1)
+            }
+            _ => 1,
+        }
+    } else {
+        app.selection_summary()
+            .and_then(|summary| summary.split('·').nth(1).map(str::trim).map(ToOwned::to_owned))
+            .unwrap_or_else(|| "1 line".to_string())
+            .trim_end_matches(" line")
+            .trim_end_matches(" lines")
+            .parse::<u32>()
+            .unwrap_or(1)
+    };
+    let verb = if editing { "Edit" } else { "New" };
+    let title = format!(
+        "{verb} comment · {} · {count} line{} · {} saved + draft",
+        elide_head(&loc, 36),
+        if count == 1 { "" } else { "s" },
+        app.store.len(),
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.peach))
@@ -1579,7 +1993,10 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::{box_rows, caret_rowcol, composer_caret_cell_position, single_line_caret_view};
+    use super::{
+        box_rows, caret_rowcol, composer_caret_cell_position, row_with_caret, sanitize_one_line,
+        single_line_caret_view,
+    };
 
     /// The production pairing: box rows built at the same width the caret maps against.
     fn caret_cell(input: &str, caret: usize, content_w: usize) -> (usize, usize) {
@@ -1639,6 +2056,24 @@ mod tests {
         // the character stays visible under the caret block.
         assert_eq!(single_line_caret_view("abcdef日x", 6, 4), ("ef日".to_string(), 2, 2));
     }
+
+    #[test]
+    fn one_line_comment_labels_and_editor_spans_neutralize_terminal_controls() {
+        let hostile = "path\u{1b}[31m\n\u{7f}\u{85}\u{202e}name";
+        let label = sanitize_one_line(hostile);
+        assert!(!label.contains('\u{1b}'));
+        assert!(!label.contains('\n'));
+        assert!(!label.contains('\u{7f}'));
+        assert!(!label.contains('\u{85}'));
+        assert!(!label.contains('\u{202e}'));
+
+        let line = row_with_caret(hostile, 4, &crate::theme::resolve(Some("dracula")).palette);
+        let painted: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(!painted.contains('\u{1b}'));
+        assert!(!painted.contains('\u{7f}'));
+        assert!(!painted.contains('\u{85}'));
+        assert!(!painted.contains('\u{202e}'));
+    }
 }
 
 /// The key glyph and label for a footer action; an empty label renders the glyph alone. The
@@ -1652,17 +2087,39 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::Comment => (hint(K::Comment), "comment"),
         A::Select => (hint(K::Select), "select"),
         A::ClearSelection => ("esc".into(), "clear"),
-        A::EditComment => (hint(K::Edit), "edit"),
-        A::DeleteComment => (hint(K::Delete), "delete"),
+        A::EditComment => {
+            let label = app.comment_focus.and_then(|id| app.comment_ordinal(id)).map_or_else(
+                || "edit".to_string(),
+                |ordinal| format!("edit {ordinal}/{}", app.store.len()),
+            );
+            return (hint(K::Edit), label);
+        }
+        A::DeleteComment => {
+            if matches!(app.mode, Mode::ConfirmDelete { .. }) {
+                return ("enter".to_string(), "delete".to_string());
+            }
+            let label = app.comment_focus.and_then(|id| app.comment_ordinal(id)).map_or_else(
+                || "delete".to_string(),
+                |ordinal| format!("delete {ordinal}/{}", app.store.len()),
+            );
+            return (hint(K::Delete), label);
+        }
         A::JumpComment => (format!("{}/{}", hint(K::NextComment), hint(K::PrevComment)), "jump"),
         A::ExpandFold => ("→".into(), "expand fold"),
+        A::HideUnchanged => (
+            hint(K::HideUnchanged),
+            if app.hide_unchanged { "show context" } else { "hide context" },
+        ),
         // The armed crossing is keyed to the hunk step that armed it, so a rebound `next-hunk`
         // is the key the hint shows.
         A::CrossFile { forward: true } => (hint(K::NextHunk), "next file"),
         A::CrossFile { forward: false } => (hint(K::PrevHunk), "prev file"),
         // The `move` band's pairs render as their two keys; `MovePage`'s are the fixed page keys.
         A::MoveLine => (format!("{} {}", hint(K::Down), hint(K::Up)), ""),
-        A::MoveHunk => (format!("{} {}", hint(K::NextHunk), hint(K::PrevHunk)), "hunk"),
+        A::MoveHunk => (format!("{} {}", hint(K::NextHunk), hint(K::PrevHunk)), "change"),
+        A::MoveChange => {
+            (format!("{} {}", hint(K::NextChange), hint(K::PrevChange)), "line change")
+        }
         A::MoveFile => (format!("{} {}", hint(K::NextFile), hint(K::PrevFile)), "file"),
         A::MovePage => ("PageUp PageDown".into(), ""),
         A::ExpandDir => ("→".into(), "expand"),
@@ -1823,7 +2280,45 @@ fn footer_lines(app: &App, w: usize) -> Vec<Line<'static>> {
         lines.extend(render_band(app, w, "", Band::Do, &overflow));
         lines.extend(render_band(app, w, "go", Band::Go, &of_band(Band::Go)));
         lines.extend(render_band(app, w, "move", Band::Move, &of_band(Band::Move)));
+        if matches!(app.tab, Tab::Changes | Tab::AllFiles)
+            && let Some(config) = app.plugin_config()
+        {
+            lines.extend(type_legend_lines(w, app.palette(), config.file_icons()));
+        }
     }
+    lines
+}
+
+/// The expanded `?` panel documents only the active navigator presentation. Plain's compact
+/// codes are a lexical aid; Nerd is an explicit best-effort font choice, not a detected fallback.
+fn type_legend_lines(width: usize, p: &Palette, mode: FileIconMode) -> Vec<Line<'static>> {
+    let legend = match mode {
+        FileIconMode::Plain => {
+            "types s source · c config · d document · j data · t template · i image · m media · p package · b binary · . other"
+        }
+        FileIconMode::Emoji => {
+            "types emoji icons · terminal appearance and width are best effort · type only, Git status is separate"
+        }
+        FileIconMode::Nerd => {
+            "types Nerd Font icons · requires a compatible Nerd Font · type only, Git status is separate"
+        }
+        FileIconMode::None => return Vec::new(),
+    };
+    let mut lines = Vec::new();
+    let mut current = String::from(" type ");
+    for word in legend.split(' ') {
+        let sep = usize::from(current != " type ");
+        if current.width() + sep + word.width() > width.max(1) && current != " type " {
+            lines.push(Line::from(Span::styled(current, Style::default().fg(p.overlay0))));
+            current = format!("      {word}");
+        } else {
+            if sep == 1 {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+    lines.push(Line::from(Span::styled(current, Style::default().fg(p.overlay0))));
     lines
 }
 
@@ -1946,7 +2441,10 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
         let more = if overflow.is_empty() { reserve } else { reserve.max(MORE_ELLIPSIS) };
         let room = w.saturating_sub(used + STATUS_FRAME + more);
         if room >= STATUS_MIN {
-            let text = format!("  · {} ", truncate_width(&app.status, room));
+            // Statuses can contain Files-only directory labels and read errors. Sanitize at the
+            // final terminal-text boundary so raw paths remain valid identities/capabilities.
+            let status = sanitize_terminal_text(&app.status);
+            let text = format!("  · {} ", truncate_width(&status, room));
             used += text.width();
             spans.push(Span::styled(text, Style::default().fg(p.peach)));
         }
@@ -2017,6 +2515,24 @@ fn render_band(
 const LIST_POPUP_W_PCT: u16 = 80;
 const LIST_POPUP_H_PCT: u16 = 70;
 
+fn render_delete_confirmation(frame: &mut Frame, app: &App, area: Rect) {
+    let p = app.palette();
+    let Mode::ConfirmDelete { id } = app.mode else { return };
+    let ordinal = app.comment_ordinal(id).unwrap_or(0);
+    let popup = body_popup(area, app, 46.min(panes(area, app).body.width), 5);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.red))
+        .title(framed_title(&format!("Delete comment {ordinal}/{}?", app.store.len())));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new("Enter delete · Esc cancel").style(Style::default().fg(p.text)),
+        inner,
+    );
+}
+
 fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let body = panes(area, app).body;
@@ -2024,34 +2540,63 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
     let h = body.height * LIST_POPUP_H_PCT / 100;
     let popup = body_popup(area, app, w, h);
     frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.mauve))
-        .title(framed_title(&format!("Comments ({})", app.store.len())));
+    let block =
+        Block::default().borders(Borders::ALL).border_style(Style::default().fg(p.mauve)).title(
+            framed_title(&format!("Comments ({}) · {} stale", app.store.len(), app.stale_count())),
+        );
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
     let width = inner.width as usize;
+    let rows = inner.height as usize;
+    let first = menu_scroll(app.list_cursor, app.store.len(), rows);
+    app.list_scroll.set(first);
     let items: Vec<ListItem> = app
         .store
         .iter()
         .enumerate()
+        .skip(first)
+        .take(rows)
         .map(|(i, c)| {
-            let loc = Span::styled(
-                format!(" {}", c.location()),
-                Style::default().fg(p.mauve).add_modifier(Modifier::BOLD),
+            let reason = app.stale_reason(c);
+            let state = reason.map_or_else(
+                || "current".to_string(),
+                |why| format!("STALE: {}", sanitize_one_line(why)),
             );
-            let mut spans = vec![loc, Span::styled(format!("  {}", c.text), text_style(p))];
-            // A comment whose anchor may have moved (file left the changeset, or a content
-            // comment's file was deleted) is flagged but kept.
-            if app.is_stale(c) {
-                spans.push(Span::styled("  (stale)", Style::default().fg(p.red)));
-            }
-            // The list overlay is the active modal, so its row reads at full brightness.
+            let preview = sanitize_one_line(c.text.lines().next().unwrap_or_default().trim());
+            let fixed = format!(
+                " {}/{}  {}  {state}  ",
+                i + 1,
+                app.store.len(),
+                sanitize_one_line(&c.location())
+            );
+            let room = width.saturating_sub(fixed.width());
+            let spans = vec![
+                Span::styled(
+                    fixed,
+                    Style::default()
+                        .fg(if reason.is_some() { p.red } else { p.mauve })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(truncate_width(&preview, room), text_style(p)),
+            ];
             selectable_row(p, spans, width, (i == app.list_cursor).then_some(p.surface2))
         })
         .collect();
     frame.render_widget(List::new(items), inner);
+}
+
+/// The comments-list row under the pointer. One click selects; a second opens the exact ID.
+pub fn hit_comment_list_row(area: Rect, app: &App, col: u16, row: u16) -> Option<usize> {
+    let body = panes(area, app).body;
+    let popup = body_popup(
+        area,
+        app,
+        body.width * LIST_POPUP_W_PCT / 100,
+        body.height * LIST_POPUP_H_PCT / 100,
+    );
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    menu_hit(inner, 0, app.list_scroll.get(), app.store.len(), col, row)
 }
 
 /// A popup box of `w` × `h`, centered in the body band and clamped to it. Both popups place
@@ -2127,7 +2672,13 @@ fn picker_popup(area: Rect, app: &App) -> Rect {
         .map(|row| 4 + name_width + 2 + picker_trail(app, row).width())
         .max()
         .unwrap_or(0);
-    menu_popup(area, app, widest, &picker_title(app), app.picker_rows.len() + 2)
+    menu_popup(
+        area,
+        app,
+        widest.max("Text is added to agent input and is not submitted.".width()),
+        &picker_title(app),
+        app.picker_rows.len() + 4,
+    )
 }
 
 /// The popup's row region, from the same `Block` shape the renderer draws, so the hit test
@@ -2154,11 +2705,11 @@ fn picker_trail(app: &App, row: &AgentChoice) -> String {
 fn picker_title(app: &App) -> String {
     let n = app.store.len();
     let noun = if n == 1 { "comment" } else { "comments" };
-    format!("Send {n} {noun} to")
+    format!("Send {n} {noun} to · {} stale", app.stale_count())
 }
 
 fn picker_scroll(app: &App, rows: usize) -> usize {
-    menu_scroll(app.picker_cursor, app.picker_rows.len(), rows)
+    menu_scroll(app.picker_cursor, app.picker_rows.len(), rows.saturating_sub(2))
 }
 
 fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
@@ -2172,6 +2723,23 @@ fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
     let inner = picker_inner(popup);
     frame.render_widget(block, popup);
 
+    let message = sanitize_terminal_text(
+        app.picker_notice
+            .as_deref()
+            .unwrap_or("Text is added to agent input and is not submitted."),
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                message,
+                Style::default().fg(if app.picker_notice.is_some() { p.red } else { p.text }),
+            )),
+            Line::from(Span::styled("Enter send · Esc cancel", Style::default().fg(p.subtext0))),
+        ]),
+        Rect { height: inner.height.min(2), ..inner },
+    );
+    let list_area =
+        Rect { y: inner.y.saturating_add(2), height: inner.height.saturating_sub(2), ..inner };
     let name_width = picker_name_width(app);
     let first = picker_scroll(app, inner.height as usize);
     let items: Vec<ListItem> = app
@@ -2179,7 +2747,7 @@ fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .skip(first)
-        .take(inner.height as usize)
+        .take(list_area.height as usize)
         .map(|(i, row)| {
             // Only the first nine rows carry a number, since no digit key reaches further.
             let lead = if i < 9 { format!(" {}  ", i + 1) } else { "    ".to_string() };
@@ -2188,9 +2756,13 @@ fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(lead, Style::default().fg(p.overlay0)),
                 // The name is the only part at full brightness: it is what the reviewer scans
                 // for, and the two weights are what keep this a picker rather than a table.
-                Span::styled(row.name.clone(), text_style(p)),
+                Span::styled(sanitize_terminal_text(&row.name), text_style(p)),
                 Span::styled(
-                    format!("{}  {}", " ".repeat(pad), picker_trail(app, row)),
+                    format!(
+                        "{}  {}",
+                        " ".repeat(pad),
+                        sanitize_terminal_text(&picker_trail(app, row))
+                    ),
                     Style::default().fg(p.overlay0),
                 ),
             ];
@@ -2202,14 +2774,14 @@ fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
             )
         })
         .collect();
-    frame.render_widget(List::new(items), inner);
+    frame.render_widget(List::new(items), list_area);
 }
 
 /// The picker row under the pointer, for click-to-highlight (`specs/input.md`).
 pub fn hit_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Option<usize> {
     let inner = picker_inner(picker_popup(area, app));
     let first = picker_scroll(app, inner.height as usize);
-    menu_hit(inner, 0, first, app.picker_rows.len(), col, row)
+    menu_hit(inner, 2, first, app.picker_rows.len(), col, row)
 }
 
 // --- Base picker (specs/input.md Base picker) ----------------------------------------------
@@ -2292,9 +2864,9 @@ fn render_base_picker(frame: &mut Frame, app: &App, area: Rect) {
             let pad = name_width.saturating_sub(row.name.width());
             let spans = vec![
                 Span::styled(lead.to_string(), Style::default().fg(p.yellow)),
-                Span::styled(row.name.clone(), text_style(p)),
+                Span::styled(sanitize_terminal_text(&row.name), text_style(p)),
                 Span::styled(
-                    format!("{}  {}", " ".repeat(pad), base_trail(row)),
+                    format!("{}  {}", " ".repeat(pad), sanitize_terminal_text(base_trail(row))),
                     Style::default().fg(p.overlay0),
                 ),
             ];
@@ -2506,7 +3078,7 @@ fn render_search_results(
         }
         crate::app::SearchPhase::Error(e) => {
             frame.render_widget(
-                Paragraph::new(Span::styled(e.clone(), Style::default().fg(p.red))),
+                Paragraph::new(Span::styled(sanitize_terminal_text(e), Style::default().fg(p.red))),
                 region,
             );
             return;
@@ -2548,6 +3120,8 @@ fn render_search_results(
                         indent: "",
                         annotation: app.changed_annotation(path),
                         name: path,
+                        icon: None,
+                        icon_mode: FileIconMode::None,
                         ignored: false,
                         emphasis: &[],
                     },
@@ -2567,6 +3141,8 @@ fn render_search_results(
                         indent: "",
                         annotation: app.changed_annotation(&hit.path),
                         name: &hit.path,
+                        icon: None,
+                        icon_mode: FileIconMode::None,
                         ignored: false,
                         emphasis: &hit.spans,
                     },
@@ -2597,7 +3173,8 @@ fn render_search_divider(
         return;
     }
     let label = match s.preview.as_ref() {
-        Some(pv) => format!("preview · {}", pv.path),
+        // Preserve `pv.path` as the raw path used by search/open; this is paint-only text.
+        Some(pv) => format!("preview · {}", sanitize_terminal_text(&pv.path)),
         None => "preview".to_string(),
     };
     frame.render_widget(Paragraph::new(search_pane_rule(&label, region.width as usize, p)), region);
@@ -2674,7 +3251,7 @@ fn search_preview_line(
         None => {
             for sp in row.spans() {
                 spans.push(Span::styled(
-                    sp.text.replace('\t', "    "),
+                    sanitize_terminal_text(&sp.text),
                     Style::default().fg(rgb(sp.color)),
                 ));
             }
@@ -2682,6 +3259,14 @@ fn search_preview_line(
         }
         Some(ranges) => {
             let text = row.text();
+            // Highlight offsets are raw-byte offsets. Once sanitization changes source text,
+            // preserving the old ranges risks highlighting a different terminal string; draw a
+            // safe unhighlighted copy instead.
+            if text.chars().any(hostile_char) {
+                spans
+                    .push(Span::styled(sanitize_terminal_text(&text), Style::default().fg(p.text)));
+                return Line::from(spans).style(Style::default().bg(p.cursor_bg(true)));
+            }
             // The engine trims each match line's leading indentation and reports offsets
             // into the trimmed text; the preview keeps the true indentation, so shift the
             // spans over this line's own leading whitespace to land them on the match
@@ -2709,7 +3294,7 @@ fn search_preview_line(
             spans.extend(
                 emphasized
                     .into_iter()
-                    .map(|sp| Span::styled(sp.content.replace('\t', "    "), sp.style)),
+                    .map(|sp| Span::styled(sanitize_terminal_text(&sp.content), sp.style)),
             );
             let mut line = Line::from(spans);
             let pad = width.saturating_sub(line.width());
@@ -2814,6 +3399,12 @@ fn emphasized_spans(
     hl: Color,
     mut base: impl FnMut(usize) -> Style,
 ) -> Vec<Span<'static>> {
+    // This is the final shared Span boundary for source/search text. Sanitizing here leaves
+    // model identities and exports untouched; when controls expand, raw byte offsets no longer
+    // describe the painted copy, so drop match emphasis rather than highlight the wrong cells.
+    let safe = sanitize_terminal_text(text);
+    let ranges = if safe == text { ranges } else { &[] };
+    let text = safe.as_str();
     let mut spans = Vec::new();
     let mut run = String::new();
     let mut run_style = Style::default();
@@ -2954,16 +3545,18 @@ fn render_pr_header(frame: &mut Frame, app: &App, area: Rect) {
         // fork PR is visible (specs/forge-host.md). Dropped first when the bar is narrow.
         let head = match (s.head_ref.is_empty(), s.head_is_fork) {
             (true, _) => String::new(),
-            (false, true) => format!("⑂ {}", s.head_ref),
-            (false, false) => s.head_ref.clone(),
+            (false, true) => format!("⑂ {}", sanitize_terminal_text(&s.head_ref)),
+            (false, false) => sanitize_terminal_text(&s.head_ref),
         };
         let head_w = if head.is_empty() { 0 } else { head.width() + 2 };
         // Keep the branch only while the title still gets a readable minimum beside it.
         let head_w =
             if w.saturating_sub(lead_tabs + chip_w + 2 + head_w) >= 8 { head_w } else { 0 };
         // The title fills the gap left of the branch + chip, right-aligned (a leading pad).
-        let name =
-            truncate_width(&s.title, w.saturating_sub(lead_tabs + chip_w + 2 + head_w).max(4));
+        let name = truncate_width(
+            &sanitize_terminal_text(&s.title),
+            w.saturating_sub(lead_tabs + chip_w + 2 + head_w).max(4),
+        );
         let pad = w.saturating_sub(lead_tabs + name.width() + head_w + 2 + chip_w);
         spans.push(Span::styled(" ".repeat(pad), bar));
         spans.push(Span::styled(name, bar.fg(p.subtext0)));
@@ -3023,7 +3616,9 @@ fn pr_state_line(app: &App, s: &forge::PrSnapshot) -> String {
     let mut parts: Vec<String> = Vec::new();
     if s.state == forge::PrState::Open {
         match s.merge {
-            forge::Merge::Conflicting => parts.push(format!("⚠ conflicts with {}", s.base_ref)),
+            forge::Merge::Conflicting => {
+                parts.push(format!("⚠ conflicts with {}", sanitize_terminal_text(&s.base_ref)));
+            }
             forge::Merge::Blocked => parts.push("blocked".into()),
             forge::Merge::Clean => {}
         }
@@ -3110,7 +3705,7 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
         rows.push(PrNavRow {
             spans: vec![
                 Span::styled(format!(" {glyph} "), Style::default().fg(color)),
-                Span::styled(check.name.clone(), text_style(p)),
+                Span::styled(sanitize_terminal_text(&check.name), text_style(p)),
             ],
             cursor: None,
         });
@@ -3172,9 +3767,9 @@ fn pr_comment_row(
     } else {
         forge::relative_age(&cm.created_at, now)
     };
-    let author = format!("@{} ", cm.author);
+    let author = format!("@{} ", sanitize_terminal_text(&cm.author));
     let budget = width.saturating_sub(author.width() + trailing.width() + 3).max(1);
-    let anchor = elide_head(&cm.anchor, budget);
+    let anchor = elide_head(&sanitize_terminal_text(&cm.anchor), budget);
     vec![
         Span::styled(author, Style::default().fg(author_color)),
         Span::styled(anchor, text_style(p)),
@@ -3255,7 +3850,11 @@ fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let selected = app.pr_selected_comment();
     let title = match selected {
-        Some(cm) => format!("@{} · {}", cm.author, cm.anchor),
+        Some(cm) => format!(
+            "@{} · {}",
+            sanitize_terminal_text(&cm.author),
+            sanitize_terminal_text(&cm.anchor)
+        ),
         None if app.pr_on_description() => "description".to_string(),
         None => app.pr_forge.abbr().to_string(),
     };
@@ -3263,8 +3862,10 @@ fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = inner.width as usize;
-    let notice_lines =
-        app.pr_notice().map(|notice| wrap_text(notice, width.max(1))).unwrap_or_default();
+    let notice_lines = app
+        .pr_notice()
+        .map(|notice| wrap_text(&sanitize_terminal_text(notice), width.max(1)))
+        .unwrap_or_default();
     // Keep one body row whenever the pane has room. If the remedy still cannot fit, retain its
     // opening state and actionable tail; the middle detail is less useful than a visible recovery.
     let notice_capacity = match inner.height {
@@ -3317,7 +3918,10 @@ fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
                     Some(b'-') => p.red,
                     _ => p.overlay0,
                 };
-                lines.push(Line::from(Span::styled(raw.to_string(), Style::default().fg(color))));
+                lines.push(Line::from(Span::styled(
+                    sanitize_terminal_text(raw),
+                    Style::default().fg(color),
+                )));
             }
             lines.push(Line::raw(""));
         }
@@ -3398,11 +4002,13 @@ fn pr_empty_msg(
                 .into()
         }
         forge::PrView::UnsupportedHost(host) => {
+            let host = sanitize_terminal_text(host);
             format!(
                 "Unsupported host: {host}. Self-hosted? Set `github_host`, `gitlab_host`, or `azure_devops_host`."
             )
         }
         forge::PrView::MalformedOrigin(host) => {
+            let host = sanitize_terminal_text(host);
             format!("The origin remote must point to a repository path on {host}.")
         }
     }

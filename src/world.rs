@@ -1,17 +1,25 @@
-//! The world snapshot: the derived state one refresh produces, built from git alone.
+//! The world snapshot: the derived state one refresh produces, built from Git review data or a
+//! Files-only directory tree.
 //!
 //! `build` reads nothing from `App`, so the same call runs synchronously (startup, scope
 //! switches, first visits) and behind the worker (polls, `r`, return visits)
 //! (specs/tui.md Refresh). Reconciling a snapshot into place state stays
 //! in `App::reconcile_world`, the one home for the Continuity rules (specs/overview.md).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{
+    Arc,
+    mpsc::{Receiver, Sender},
+};
 
 use anyhow::Result;
+use rustix::fs::{CWD, Dir, FileType, Mode, OFlags, fstat, openat, statat};
 
-use crate::app::Tab;
+use crate::app::{RepositoryMode, Tab};
 use crate::file_list::{Annotation, Entry};
 use crate::git;
 use crate::herdr::AgentSample;
@@ -23,6 +31,7 @@ use crate::turn::{TurnTracker, WorktreeState};
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WorldInput {
     pub repo: PathBuf,
+    pub repository_mode: RepositoryMode,
     pub tab: Tab,
     pub scope: Scope,
     /// The `--base` flag, resolved fresh per build. The pick is read from its ref at build
@@ -38,6 +47,17 @@ pub struct WorldInput {
     pub turn_baseline: Option<String>,
     /// Expanded ignored directories whose children the `All files` tree loads.
     pub toggled_dirs: HashSet<String>,
+    /// Directories a Files-only worker job lists. These are slash-relative to the retained
+    /// Files-only root capability; the root is the empty path. Git review always leaves this
+    /// empty.
+    pub raw_dirs: BTreeSet<String>,
+    /// The retained descriptor for the selected Files-only root. It is intentionally separate
+    /// from `repo`: display paths remain strings, but no Files-only filesystem operation uses
+    /// that pathname as authority.
+    pub files_root: Option<FilesRoot>,
+    /// Invalidates a Files-only completion when authored expansion changes without changing
+    /// the currently capped request batch.
+    pub raw_tree_epoch: u64,
 }
 
 /// The derived state one refresh produces: the scope changeset, the navigator entries, and
@@ -48,6 +68,17 @@ pub struct WorldSnapshot {
     pub changed: HashMap<String, Annotation>,
     pub entries: Vec<Entry>,
     pub branch_base: git::BaseStatus,
+    /// One-level Files-only outcomes. `None` is Git review, where `entries` remains the
+    /// complete existing tree contract.
+    pub raw_listings: Option<Vec<DirectoryListing>>,
+}
+
+/// One direct-directory listing from a Files-only worker job. A failed read is per directory,
+/// so a transient unreadable child never replaces another cached subtree with an empty tree.
+#[derive(Debug)]
+pub struct DirectoryListing {
+    pub path: String,
+    pub entries: Result<Vec<Entry>, String>,
 }
 
 /// Build the snapshot for `input`. The changeset is computed regardless of tab so the
@@ -55,13 +86,36 @@ pub struct WorldSnapshot {
 /// worktree. In `last-turn` with no baseline yet, the changeset is empty until a turn
 /// start is observed (specs/review-model.md).
 pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
-    // Outside a git repo, an empty snapshot paints the quiet empty state rather than a
-    // failing status line every poll (specs/herdr-host.md).
+    if input.repository_mode == RepositoryMode::FilesOnly {
+        // Files-only has no synthetic changeset. It is a raw directory browser rooted exactly
+        // at `repo`, so refresh performs filesystem enumeration only.
+        let raw_listings = input
+            .raw_dirs
+            .iter()
+            .map(|path| DirectoryListing {
+                path: path.clone(),
+                entries: input
+                    .files_root
+                    .as_ref()
+                    .ok_or_else(|| "selected root is unavailable".to_string())
+                    .and_then(|root| list_raw_dir(root, path)),
+            })
+            .collect();
+        return Ok(WorldSnapshot {
+            changed: HashMap::new(),
+            entries: Vec::new(),
+            branch_base: git::BaseStatus::default(),
+            raw_listings: Some(raw_listings),
+        });
+    }
+    // A Git worktree can disappear while a pane remains alive. Keep its stale frame rather
+    // than turn that failure into a process error. Files-only never reaches this probe.
     if !git::is_repo(&input.repo) {
         return Ok(WorldSnapshot {
             changed: HashMap::new(),
             entries: Vec::new(),
             branch_base: git::BaseStatus::default(),
+            raw_listings: None,
         });
     }
     let (branch_base, changed) = build_changed(input)?;
@@ -72,7 +126,7 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
         // `Changes` (the `PR` tab never builds a snapshot).
         _ => changed.iter().map(Entry::from_changed).collect(),
     };
-    Ok(WorldSnapshot { changed: changed_map, entries, branch_base })
+    Ok(WorldSnapshot { changed: changed_map, entries, branch_base, raw_listings: None })
 }
 
 /// The active scope's changed files and, on the `branch` scope, the base they diff against —
@@ -80,7 +134,7 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
 /// wear another scope's label (specs/tui.md).
 pub fn build_changed(input: &WorldInput) -> Result<(git::BaseStatus, Vec<ChangedFile>)> {
     let none = git::BaseStatus::default;
-    if !git::is_repo(&input.repo) {
+    if input.repository_mode == RepositoryMode::FilesOnly || !git::is_repo(&input.repo) {
         return Ok((none(), Vec::new()));
     }
     match input.scope {
@@ -115,6 +169,235 @@ pub fn seed_baseline(repo: &std::path::Path) -> Option<String> {
     git::read_baseline_ref(repo, &git::worktree_key(repo))
 }
 
+/// Identity of a retained Files-only capability root or directory. The device/inode pair is
+/// only compared between descriptors; it is never reconstructed into a pathname.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// The selected Files-only root as an open directory descriptor. This is the only filesystem
+/// authority for Files-only: display paths are parsed into checked components and opened below
+/// this descriptor with `openat(..., O_NOFOLLOW)`, never joined onto the launch pathname.
+#[derive(Clone, Debug)]
+pub struct FilesRoot {
+    directory: Arc<File>,
+    identity: DirectoryIdentity,
+}
+
+impl PartialEq for FilesRoot {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for FilesRoot {}
+
+impl FilesRoot {
+    /// Open the selected launch root once, refusing a symlink or non-directory before it can
+    /// become Files-only authority. Subsequent operations retain this descriptor even if its
+    /// launch pathname is renamed or replaced.
+    pub(crate) fn open(path: &Path) -> Result<Self, String> {
+        let fd = openat(
+            CWD,
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| "selected root is unavailable".to_string())?;
+        let directory = Arc::new(File::from(fd));
+        let identity = directory_identity(&directory)?;
+        Ok(Self { directory, identity })
+    }
+
+    fn open_directory(&self, relative: &str) -> Result<File, String> {
+        let components = checked_components(relative)?;
+        let mut directory =
+            self.directory.try_clone().map_err(|_| "directory is unavailable".to_string())?;
+        for name in components {
+            let fd = openat(
+                &directory,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| "directory is unavailable".to_string())?;
+            directory = File::from(fd);
+            directory_identity(&directory)?;
+        }
+        Ok(directory)
+    }
+
+    /// Verify that the requested target still names the descriptor about to be enumerated. The
+    /// re-resolution is descriptor-relative and no-follow; if a test or hostile writer replaced
+    /// it before enumeration, the operation fails rather than presenting either replacement.
+    fn verify_current_directory(&self, relative: &str, directory: &File) -> Result<(), String> {
+        let current = self.open_directory(relative)?;
+        if directory_identity(&current)? == directory_identity(directory)? {
+            Ok(())
+        } else {
+            Err("directory changed before enumeration".to_string())
+        }
+    }
+
+    /// Open a listed file at click time through its retained root. Every parent is reopened
+    /// relative to a verified descriptor, and the final open is no-follow before metadata or
+    /// bytes are read, so a post-listing symlink replacement cannot escape the root.
+    pub(crate) fn read_file(&self, relative: &str, max_bytes: usize) -> Result<RawFile, String> {
+        // The descriptor is opened no-follow before bytes are read. Metadata is only a capacity
+        // hint: a concurrent writer may grow the file after stat, so `take(cap + 1)` enforces the
+        // budget from the already-authorized FD and proves an oversized result without a second
+        // pathname lookup.
+        let mut file = self.open_regular_file(relative)?;
+        let hint = file
+            .metadata()
+            .map_err(|_| "file is unavailable".to_string())?
+            .len()
+            .min(max_bytes as u64) as usize;
+        let mut bytes = Vec::with_capacity(hint.saturating_add(1));
+        file.by_ref()
+            .take(max_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "file is unavailable".to_string())?;
+        if bytes.len() > max_bytes {
+            return Ok(RawFile::TooLarge);
+        }
+        Ok(RawFile::Content(bytes))
+    }
+
+    /// Resolve and open a regular file below the retained root without ever reconstructing an
+    /// authority pathname. This is shared by the search-open preflight and File view read.
+    fn open_regular_file(&self, relative: &str) -> Result<File, String> {
+        let components = checked_components(relative)?;
+        let (name, parents) =
+            components.split_last().ok_or_else(|| "invalid file path".to_string())?;
+        let mut directory =
+            self.directory.try_clone().map_err(|_| "directory is unavailable".to_string())?;
+        for parent in parents {
+            let fd = openat(
+                &directory,
+                *parent,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| "file is unavailable".to_string())?;
+            directory = File::from(fd);
+            directory_identity(&directory)?;
+        }
+        let fd = openat(
+            &directory,
+            *name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| "file is unavailable".to_string())?;
+        let file = File::from(fd);
+        let metadata = file.metadata().map_err(|_| "file is unavailable".to_string())?;
+        if !metadata.file_type().is_file() {
+            return Err("requested path is not a regular file".to_string());
+        }
+        Ok(file)
+    }
+}
+
+/// A safely opened Files-only file, either read from the descriptor or declined before a
+/// potentially expensive read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RawFile {
+    Content(Vec<u8>),
+    TooLarge,
+}
+
+fn directory_identity(directory: &File) -> Result<DirectoryIdentity, String> {
+    let stat = fstat(directory).map_err(|_| "directory is unavailable".to_string())?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir() {
+        return Err("requested path is not a directory".to_string());
+    }
+    Ok(DirectoryIdentity { device: stat.st_dev as u64, inode: stat.st_ino as u64 })
+}
+
+/// Parse a display path without granting it pathname authority. The components are later passed
+/// one at a time to `openat` below the retained root descriptor.
+fn checked_components(relative: &str) -> Result<Vec<&OsStr>, String> {
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        return Err("invalid path".to_string());
+    }
+    path.components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) if name != ".git" => Ok(name),
+            std::path::Component::Normal(_) => Err("path includes .git".to_string()),
+            std::path::Component::CurDir
+            | std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => Err("invalid path".to_string()),
+        })
+        .collect()
+}
+
+/// List exactly one Files-only directory through its retained descriptor. `relative` is parsed
+/// into checked components; no parent, absolute, `.git`, or symlink component reaches the
+/// directory stream. The caller controls recursion by issuing another worker request only after
+/// the reviewer expands a returned real directory.
+pub(crate) fn list_raw_dir(root: &FilesRoot, relative: &str) -> Result<Vec<Entry>, String> {
+    list_raw_dir_after_open(root, relative, || {})
+}
+
+fn list_raw_dir_after_open(
+    root: &FilesRoot,
+    relative: &str,
+    after_open: impl FnOnce(),
+) -> Result<Vec<Entry>, String> {
+    let directory = root.open_directory(relative)?;
+    after_open();
+    root.verify_current_directory(relative, &directory)?;
+    let mut stream =
+        Dir::read_from(&directory).map_err(|_| "directory is unavailable".to_string())?;
+    let mut out = Vec::new();
+    while let Some(entry) = stream.read() {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." || name.to_bytes() == b".git" {
+            continue;
+        }
+        let Some(name) = std::str::from_utf8(name.to_bytes()).ok() else { continue };
+        // Inspect the child relative to the verified directory without following it. A later
+        // replacement is harmless: traversal and content reads each open it no-follow again.
+        let Ok(stat) = statat(&directory, OsStr::new(name), rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        else {
+            continue;
+        };
+        let kind = FileType::from_raw_mode(stat.st_mode);
+        if kind.is_symlink() {
+            continue;
+        }
+        let path =
+            if relative.is_empty() { name.to_string() } else { format!("{relative}/{name}") };
+        if kind.is_dir() {
+            out.push(Entry {
+                path,
+                previous_path: None,
+                annotation: None,
+                ignored: false,
+                is_dir: true,
+                explicit_dir: true,
+            });
+        } else if kind.is_file() {
+            out.push(Entry {
+                path,
+                previous_path: None,
+                annotation: None,
+                ignored: false,
+                is_dir: false,
+                explicit_dir: false,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
 /// The `All files` entries: every worktree path (ignored dimmed), with the children of
 /// expanded ignored directories loaded lazily (`specs/file-list.md`). Only directories the
 /// user has expanded are walked, so the cost tracks what is on screen, not the whole tree.
@@ -122,12 +405,16 @@ pub(crate) fn all_files_entries(
     input: &WorldInput,
     changed: &HashMap<String, Annotation>,
 ) -> Result<Vec<Entry>> {
+    if input.repository_mode == RepositoryMode::FilesOnly {
+        return Ok(Vec::new());
+    }
     let to_entry = |w: git::WorktreeEntry| Entry {
         annotation: changed.get(&w.path).cloned(),
         path: w.path,
         previous_path: None,
         ignored: w.ignored,
         is_dir: w.is_dir,
+        explicit_dir: false,
     };
     let mut entries: Vec<Entry> = git::all_files(&input.repo)?.into_iter().map(&to_entry).collect();
     let mut i = 0;
@@ -157,6 +444,7 @@ pub struct TurnHost {
     /// run for is not cached either, and holds the poll rather than counting the agent out, so a
     /// transient failure never poisons a member for the session (specs/herdr-host.md).
     resolved: HashMap<String, bool>,
+    files_only: bool,
 }
 
 /// One sample's outcome, sent back with the completion: whether it ended a turn (the `PR`
@@ -216,7 +504,19 @@ impl TurnHost {
     pub fn open(repo: PathBuf) -> Self {
         let tracker = TurnTracker::with_baseline(seed_baseline(&repo));
         let turn_key = git::worktree_key(&repo);
-        Self { tracker, repo, turn_key, resolved: HashMap::new() }
+        Self { tracker, repo, turn_key, resolved: HashMap::new(), files_only: false }
+    }
+
+    /// A Files-only worker keeps the same request/completion topology without sampling Herdr or
+    /// invoking Git. Its raw-directory snapshots still land latest-wins.
+    pub fn open_files_only(repo: PathBuf) -> Self {
+        Self {
+            tracker: TurnTracker::default(),
+            turn_key: String::new(),
+            repo,
+            resolved: HashMap::new(),
+            files_only: true,
+        }
     }
 
     pub fn baseline(&self) -> Option<&str> {
@@ -226,6 +526,9 @@ impl TurnHost {
     /// Sample the agents over the herdr CLI and advance the baseline. A missing herdr is
     /// normal, so a failed enumeration only logs and changes nothing.
     pub fn sample(&mut self) -> TurnReport {
+        if self.files_only {
+            return TurnReport { ended: false, agents_present: None };
+        }
         self.observe_agents(crate::herdr::agent_samples().ok().as_deref())
     }
 
@@ -385,9 +688,244 @@ pub fn spawn(
 
 #[cfg(test)]
 mod tests {
-    use super::{Membership, classify, worktree_cwd};
+    use super::{
+        FilesRoot, Membership, WorldInput, build, classify, list_raw_dir as list_raw_dir_from_cap,
+        list_raw_dir_after_open, worktree_cwd,
+    };
+    use crate::app::{RepositoryMode, Tab};
     use crate::herdr::AgentSample;
+    use crate::model::Scope;
     use crate::turn::{Status, WorktreeState};
+    use std::collections::HashSet;
+
+    fn files_only_input(root: &std::path::Path) -> WorldInput {
+        WorldInput {
+            repo: root.to_path_buf(),
+            repository_mode: RepositoryMode::FilesOnly,
+            tab: Tab::AllFiles,
+            scope: Scope::Uncommitted,
+            base: None,
+            base_epoch: 0,
+            turn_baseline: None,
+            toggled_dirs: HashSet::new(),
+            raw_dirs: [String::new()].into_iter().collect(),
+            files_root: FilesRoot::open(root).ok(),
+            raw_tree_epoch: 0,
+        }
+    }
+
+    fn list_raw_dir(
+        root: &std::path::Path,
+        relative: &str,
+    ) -> Result<Vec<crate::file_list::Entry>, String> {
+        FilesRoot::open(root).and_then(|root| list_raw_dir_from_cap(&root, relative))
+    }
+
+    #[test]
+    fn files_only_lists_only_the_requested_direct_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs/guides")).unwrap();
+        std::fs::create_dir(root.path().join("empty")).unwrap();
+        std::fs::write(root.path().join("docs/guides/start.md"), "start\n").unwrap();
+
+        let root_entries = list_raw_dir(root.path(), "").unwrap();
+        let root_paths: Vec<(&str, bool)> =
+            root_entries.iter().map(|entry| (entry.path.as_str(), entry.is_dir)).collect();
+        assert_eq!(root_paths, [("docs", true), ("empty", true)]);
+        let nested = list_raw_dir(root.path(), "docs/guides").unwrap();
+        assert_eq!(nested[0].path, "docs/guides/start.md");
+    }
+
+    #[test]
+    fn files_only_resolves_a_nested_real_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs/guides")).unwrap();
+        std::fs::write(root.path().join("docs/guides/start.md"), "start\n").unwrap();
+
+        let entries = list_raw_dir(root.path(), "docs/guides").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "docs/guides/start.md");
+        assert!(!entries[0].is_dir);
+    }
+
+    #[test]
+    fn files_only_root_listing_does_not_materialize_a_deep_fixture() {
+        let root = tempfile::tempdir().unwrap();
+        let mut deep = root.path().join("project");
+        for segment in 0..64 {
+            deep.push(format!("l{segment}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("end.txt"), "end\n").unwrap();
+
+        let entries = list_raw_dir(root.path(), "").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "project");
+        assert!(entries[0].is_dir);
+    }
+
+    #[test]
+    fn files_only_excludes_nested_git_directories_and_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("project/.git/objects")).unwrap();
+        std::fs::write(root.path().join("project/.git/config"), "private\n").unwrap();
+        std::fs::write(root.path().join("project/readme.md"), "visible\n").unwrap();
+
+        let root_paths: Vec<String> =
+            list_raw_dir(root.path(), "").unwrap().into_iter().map(|entry| entry.path).collect();
+        let paths: Vec<String> = list_raw_dir(root.path(), "project")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        assert_eq!(root_paths, ["project"]);
+        assert_eq!(paths, ["project/readme.md"]);
+    }
+
+    #[test]
+    fn files_only_rejects_git_in_every_requested_path_component() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("project/.git/objects")).unwrap();
+
+        assert!(list_raw_dir(root.path(), ".git").is_err(), "reject a final .git component");
+        assert!(
+            list_raw_dir(root.path(), ".git/objects").is_err(),
+            "reject .git before a descendant"
+        );
+        assert!(
+            list_raw_dir(root.path(), "project/.git/objects").is_err(),
+            "reject an intermediate nested .git component"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_only_never_follows_file_or_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("local.txt"), "local\n").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+        symlink(outside.path().join("secret.txt"), root.path().join("linked-file")).unwrap();
+        symlink(outside.path(), root.path().join("linked-dir")).unwrap();
+
+        let paths: Vec<String> =
+            list_raw_dir(root.path(), "").unwrap().into_iter().map(|entry| entry.path).collect();
+        assert_eq!(paths, ["local.txt"]);
+        assert!(
+            list_raw_dir(root.path(), "linked-dir").is_err(),
+            "a requested directory symlink must not be followed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_only_rejects_a_root_or_listed_directory_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let listed = root.path().join("listed");
+        std::fs::create_dir(&listed).unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+
+        std::fs::remove_dir(&listed).unwrap();
+        symlink(outside.path(), &listed).unwrap();
+        assert!(
+            list_raw_dir(root.path(), "listed").is_err(),
+            "a stale worker request cannot follow a replacement symlink"
+        );
+
+        let linked_root = root.path().join("linked-root");
+        symlink(root.path(), &linked_root).unwrap();
+        assert!(
+            list_raw_dir(&linked_root, "").is_err(),
+            "the launch root itself must be a real directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_only_rejects_a_directory_replaced_after_descriptor_resolution() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+        std::fs::write(root.path().join("a/b/local.txt"), "local\n").unwrap();
+        std::fs::create_dir(outside.path().join("b")).unwrap();
+        std::fs::write(outside.path().join("b/secret.txt"), "secret\n").unwrap();
+        let capability = FilesRoot::open(root.path()).unwrap();
+
+        let result = list_raw_dir_after_open(&capability, "a/b", || {
+            std::fs::remove_dir_all(root.path().join("a")).unwrap();
+            symlink(outside.path(), root.path().join("a")).unwrap();
+        });
+        assert!(result.is_err(), "an intermediate replacement before enumeration is rejected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_only_rejects_a_target_directory_replaced_before_enumeration() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("docs/local.txt"), "local\n").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+        let capability = FilesRoot::open(root.path()).unwrap();
+
+        let result = list_raw_dir_after_open(&capability, "docs", || {
+            std::fs::remove_dir_all(root.path().join("docs")).unwrap();
+            symlink(outside.path(), root.path().join("docs")).unwrap();
+        });
+        assert!(result.is_err(), "a target replacement before enumeration is rejected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_only_rejects_a_listed_file_replaced_by_a_symlink_before_reading() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("report.txt"), "local\n").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+        let capability = FilesRoot::open(root.path()).unwrap();
+        assert!(
+            list_raw_dir_from_cap(&capability, "")
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == "report.txt"),
+            "the regular file is listed before its replacement"
+        );
+
+        std::fs::remove_file(root.path().join("report.txt")).unwrap();
+        symlink(outside.path().join("secret.txt"), root.path().join("report.txt")).unwrap();
+        assert!(
+            capability.read_file("report.txt", 1024).is_err(),
+            "the later read uses O_NOFOLLOW rather than the listed pathname"
+        );
+    }
+
+    #[test]
+    fn files_only_build_has_no_git_side_effects() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("folder")).unwrap();
+        std::fs::write(root.path().join("folder/note.txt"), "note\n").unwrap();
+
+        let snapshot = build(&files_only_input(root.path())).unwrap();
+        assert!(snapshot.changed.is_empty());
+        let listings = snapshot.raw_listings.expect("Files-only returns raw listings");
+        assert_eq!(listings.len(), 1);
+        assert!(listings[0].entries.as_ref().unwrap().iter().any(|entry| entry.path == "folder"));
+        assert!(
+            !root.path().join(".git").exists(),
+            "a Files-only build must not create Git metadata or private refs"
+        );
+    }
 
     fn working_at(cwd: &str) -> AgentSample {
         AgentSample { cwd: Some(cwd.into()), status: Status::Working }

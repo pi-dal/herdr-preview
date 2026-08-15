@@ -11,8 +11,13 @@ pub enum Action {
     Up,
     NextHunk,
     PrevHunk,
+    /// Step individual added/removed rows, distinct from change-run traversal.
+    NextChange,
+    PrevChange,
     NextFile,
     PrevFile,
+    /// Collapse unchanged context in the Changes source projection.
+    HideUnchanged,
     ScopeUncommitted,
     ScopeBranch,
     ScopeLastTurn,
@@ -64,14 +69,37 @@ impl Key {
         Self { ctrl: true, alt: false, ch }
     }
 
+    pub const fn alt(ch: char) -> Self {
+        Self { ctrl: false, alt: true, ch }
+    }
+
+    /// Named navigation keys are represented internally by private printable sentinels so the
+    /// compact keymap can still validate and collide with every binding in one place.
+    pub const fn alt_named(ch: char) -> Self {
+        Self::alt(ch)
+    }
+
+    pub const fn alt_shift(ch: char) -> Self {
+        Self::alt(ch.to_ascii_uppercase())
+    }
+
     /// The spelling `[keybindings]` and `--resolve-plugin-config` round-trip, also shown as the
     /// hint: `ctrl+f`, `alt+x`, or the bare character. Spelled out, never a glyph, so the same
     /// text names a key in the config and on screen (specs/input.md, specs/config.md).
     pub fn config_str(self) -> String {
-        match (self.ctrl, self.alt) {
-            (true, _) => format!("ctrl+{}", self.ch),
-            (false, true) => format!("alt+{}", self.ch),
-            (false, false) => self.ch.to_string(),
+        match (self.ctrl, self.alt, self.ch) {
+            (false, true, '↑') => "alt+up".into(),
+            (false, true, '↓') => "alt+down".into(),
+            (false, true, '←') => "alt+left".into(),
+            (false, true, '→') => "alt+right".into(),
+            (false, true, '⇧') => "alt+shift+up".into(),
+            (false, true, '⇩') => "alt+shift+down".into(),
+            (true, _, ch) => format!("ctrl+{ch}"),
+            (false, true, ch) if ch.is_ascii_uppercase() => {
+                format!("alt+shift+{}", ch.to_ascii_lowercase())
+            }
+            (false, true, ch) => format!("alt+{ch}"),
+            (false, false, ch) => ch.to_string(),
         }
     }
 }
@@ -85,20 +113,23 @@ impl std::fmt::Display for Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 34] = [
+const ACTIONS: [(Action, &str, &[Key]); 37] = [
     (Action::Down, "down", &[Key::plain('j')]),
     (Action::Up, "up", &[Key::plain('k')]),
-    (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
-    (Action::PrevHunk, "prev-hunk", &[Key::plain('[')]),
-    (Action::NextFile, "next-file", &[Key::plain('f')]),
-    (Action::PrevFile, "prev-file", &[Key::plain('F')]),
+    (Action::NextHunk, "next-hunk", &[Key::plain(']'), Key::alt_named('→')]),
+    (Action::PrevHunk, "prev-hunk", &[Key::plain('['), Key::alt_named('←')]),
+    (Action::NextChange, "next-change", &[Key::alt_named('↓')]),
+    (Action::PrevChange, "prev-change", &[Key::alt_named('↑')]),
+    (Action::NextFile, "next-file", &[Key::plain('f'), Key::alt_named('⇩')]),
+    (Action::PrevFile, "prev-file", &[Key::plain('F'), Key::alt_named('⇧')]),
+    (Action::HideUnchanged, "hide-unchanged", &[Key::alt('u')]),
     (Action::ScopeUncommitted, "scope-uncommitted", &[Key::plain('u')]),
     (Action::ScopeBranch, "scope-branch", &[Key::plain('b')]),
     (Action::ScopeLastTurn, "scope-last-turn", &[Key::plain('t')]),
     (Action::BasePick, "base-pick", &[Key::plain('B')]),
-    (Action::TabChanges, "tab-changes", &[Key::plain('1')]),
-    (Action::TabAllFiles, "tab-all-files", &[Key::plain('2')]),
-    (Action::TabPr, "tab-pr", &[Key::plain('3')]),
+    (Action::TabChanges, "tab-changes", &[Key::plain('1'), Key::alt('d')]),
+    (Action::TabAllFiles, "tab-all-files", &[Key::plain('2'), Key::alt('f')]),
+    (Action::TabPr, "tab-pr", &[Key::plain('3'), Key::alt('r')]),
     (Action::Wrap, "wrap", &[Key::plain('w')]),
     (Action::Preview, "preview", &[Key::plain('m')]),
     (Action::NavigatorPosition, "navigator-position", &[Key::plain('p')]),
@@ -106,19 +137,19 @@ const ACTIONS: [(Action, &str, &[Key]); 34] = [
     (Action::NavigatorGrow, "navigator-grow", &[Key::plain('<')]),
     (Action::NavigatorShrink, "navigator-shrink", &[Key::plain('>')]),
     (Action::Select, "select", &[Key::plain('v')]),
-    (Action::Comment, "comment", &[Key::plain('c')]),
+    (Action::Comment, "comment", &[Key::plain('c'), Key::alt('c')]),
     (Action::Edit, "edit", &[Key::plain('e')]),
     (Action::Delete, "delete", &[Key::plain('d')]),
     (Action::NextComment, "next-comment", &[Key::plain('n')]),
     (Action::PrevComment, "prev-comment", &[Key::plain('N')]),
-    (Action::Comments, "comments", &[Key::plain('l')]),
+    (Action::Comments, "comments", &[Key::plain('l'), Key::alt('l')]),
     (Action::Search, "search", &[Key::plain('/')]),
     (Action::Find, "find", &[Key::ctrl('f')]),
-    (Action::Keys, "keys", &[Key::plain('?')]),
-    (Action::Send, "send", &[Key::plain('s'), Key::plain('S')]),
+    (Action::Keys, "keys", &[Key::plain('?'), Key::alt('h')]),
+    (Action::Send, "send", &[Key::plain('s'), Key::plain('S'), Key::alt('s')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
-    (Action::Refresh, "refresh", &[Key::plain('r')]),
+    (Action::Refresh, "refresh", &[Key::plain('r'), Key::alt_shift('r')]),
     (Action::Quit, "quit", &[Key::plain('q')]),
 ];
 
@@ -254,6 +285,8 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('?')), Some(Action::Keys));
         assert_eq!(keymap.hint(Action::Send), Key::plain('s'));
         assert_eq!(keymap.hint(Action::TabPr), Key::plain('3'));
+        assert_eq!(keymap.action_for(Key::alt_named('↓')), Some(Action::NextChange));
+        assert_eq!(keymap.action_for(Key::alt('u')), Some(Action::HideUnchanged));
         assert_eq!(Action::by_config_name("list-wider"), Some(Action::NavigatorGrow));
         assert_eq!(Action::by_config_name("list-narrower"), Some(Action::NavigatorShrink));
     }

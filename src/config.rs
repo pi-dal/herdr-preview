@@ -66,8 +66,10 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 10] = [
+const PLUGIN_CONFIG_KEYS: [&str; 12] = [
     "theme",
+    "file_icons",
+    "file_icon_overrides",
     "default_scope",
     "navigator_position",
     "toggle_placement",
@@ -157,6 +159,8 @@ impl ToggleDirection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginConfig {
     theme: String,
+    file_icons: crate::file_icon::FileIconMode,
+    file_icon_overrides: crate::file_icon::FileIconOverrides,
     default_scope: crate::model::Scope,
     navigator_position: NavigatorPosition,
     toggle_placement: TogglePlacement,
@@ -172,6 +176,8 @@ impl Default for PluginConfig {
     fn default() -> Self {
         Self {
             theme: crate::theme::DEFAULT.to_owned(),
+            file_icons: crate::file_icon::FileIconMode::Plain,
+            file_icon_overrides: crate::file_icon::FileIconOverrides::default(),
             default_scope: crate::model::Scope::Uncommitted,
             navigator_position: NavigatorPosition::Right,
             toggle_placement: TogglePlacement::Split,
@@ -188,6 +194,16 @@ impl Default for PluginConfig {
 impl PluginConfig {
     pub fn theme(&self) -> &str {
         &self.theme
+    }
+
+    /// The navigator icon representation from this validated snapshot.
+    pub fn file_icons(&self) -> crate::file_icon::FileIconMode {
+        self.file_icons
+    }
+
+    /// The validated lexical file-kind association overlay.
+    pub fn file_icon_overrides(&self) -> &crate::file_icon::FileIconOverrides {
+        &self.file_icon_overrides
     }
 
     /// The scope a fresh reviewr pane is built with — startup and config recovery. A reread never
@@ -249,8 +265,22 @@ impl PluginConfig {
                 (action.name().to_owned(), serde_json::json!(keys))
             })
             .collect();
+        let icon_names: serde_json::Map<String, serde_json::Value> = self
+            .file_icon_overrides
+            .names
+            .iter()
+            .map(|(name, icon)| (name.clone(), serde_json::json!(icon.as_str())))
+            .collect();
+        let icon_extensions: serde_json::Map<String, serde_json::Value> = self
+            .file_icon_overrides
+            .extensions
+            .iter()
+            .map(|(extension, icon)| (extension.clone(), serde_json::json!(icon.as_str())))
+            .collect();
         serde_json::json!({
             "theme": self.theme,
+            "file_icons": self.file_icons.as_str(),
+            "file_icon_overrides": { "names": icon_names, "extensions": icon_extensions },
             "default_scope": self.default_scope.name(),
             "navigator_position": self.navigator_position.as_str(),
             "toggle_placement": self.toggle_placement.as_str(),
@@ -344,6 +374,29 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             ));
         }
         theme.clone_into(&mut config.theme);
+    }
+    if let Some(value) = table.get("file_icons") {
+        config.file_icons = match string_value(
+            path,
+            "file_icons",
+            value,
+            "one of plain, emoji, nerd, none (unicode accepted as a legacy alias)",
+        )? {
+            "plain" | "unicode" => crate::file_icon::FileIconMode::Plain,
+            "emoji" => crate::file_icon::FileIconMode::Emoji,
+            "nerd" => crate::file_icon::FileIconMode::Nerd,
+            "none" => crate::file_icon::FileIconMode::None,
+            _ => {
+                return Err(value_error(
+                    path,
+                    "file_icons",
+                    "one of plain, emoji, nerd, none (unicode accepted as a legacy alias)",
+                ));
+            }
+        };
+    }
+    if let Some(value) = table.get("file_icon_overrides") {
+        config.file_icon_overrides = parse_file_icon_overrides(path, value)?;
     }
     if let Some(value) = table.get("default_scope") {
         config.default_scope = match string_value(
@@ -459,11 +512,34 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
 fn parse_key(text: &str) -> Option<crate::keymap::Key> {
     let (ctrl, alt, rest) = if let Some(rest) = text.strip_prefix("ctrl+") {
         (true, false, rest)
+    } else if let Some(rest) = text.strip_prefix("alt+shift+") {
+        (false, true, rest)
     } else if let Some(rest) = text.strip_prefix("alt+") {
         (false, true, rest)
     } else {
         (false, false, text)
     };
+    if alt {
+        let shifted = text.starts_with("alt+shift+");
+        let named = match (shifted, rest) {
+            (false, "up") => Some('↑'),
+            (false, "down") => Some('↓'),
+            (false, "left") => Some('←'),
+            (false, "right") => Some('→'),
+            (true, "up") | (false, "shift+up") => Some('⇧'),
+            (true, "down") | (false, "shift+down") => Some('⇩'),
+            _ => None,
+        };
+        if let Some(ch) = named {
+            return Some(crate::keymap::Key { ctrl, alt, ch });
+        }
+        if text.starts_with("alt+shift+") {
+            let mut chars = rest.chars();
+            let ch = chars.next()?;
+            return (chars.next().is_none() && ch.is_ascii_alphabetic())
+                .then_some(crate::keymap::Key { ctrl, alt, ch: ch.to_ascii_uppercase() });
+        }
+    }
     let mut it = rest.chars();
     match (it.next(), it.next()) {
         (Some(ch), None)
@@ -531,6 +607,76 @@ fn parse_keybindings(
     Keymap::resolve(&overrides).map_err(|detail| {
         PluginConfigError::new(path, format!("invalid value for `keybindings`: {detail}"))
     })
+}
+
+/// Parse `[file_icon_overrides]` as a finite, lexical overlay. Invalid nested data is a
+/// whole-file configuration error even when `file_icons = "none"`.
+fn parse_file_icon_overrides(
+    path: &Path,
+    value: &toml::Value,
+) -> Result<crate::file_icon::FileIconOverrides, PluginConfigError> {
+    let Some(tables) = value.as_table() else {
+        return Err(value_error(
+            path,
+            "file_icon_overrides",
+            "a table with `names` and/or `extensions`",
+        ));
+    };
+    let mut result = crate::file_icon::FileIconOverrides::default();
+    for (kind, entries) in tables {
+        let target = match kind.as_str() {
+            "names" => &mut result.names,
+            "extensions" => &mut result.extensions,
+            _ => {
+                return Err(unknown_key_error(
+                    path,
+                    &format!("file_icon_overrides.{kind}"),
+                    "names, extensions",
+                ));
+            }
+        };
+        let Some(entries) = entries.as_table() else {
+            return Err(value_error(
+                path,
+                &format!("file_icon_overrides.{kind}"),
+                "a table mapping a name or suffix to a built-in icon ID",
+            ));
+        };
+        for (raw_key, value) in entries {
+            let key = raw_key.to_ascii_lowercase();
+            let entry_key = format!("file_icon_overrides.{kind}.{raw_key}");
+            let valid = match kind.as_str() {
+                "names" => !raw_key.is_empty() && !raw_key.contains(['/', '\\']),
+                "extensions" => {
+                    !raw_key.is_empty()
+                        && !raw_key.starts_with('.')
+                        && !raw_key.contains(['/', '\\'])
+                        && raw_key.split('.').all(|component| !component.is_empty())
+                }
+                _ => unreachable!(),
+            };
+            if !valid {
+                let expected = if kind == "names" {
+                    "a non-empty basename without a path separator"
+                } else {
+                    "a non-empty dot-separated suffix without a leading dot or path separator"
+                };
+                return Err(value_error(path, &entry_key, expected));
+            }
+            let Some(icon) = value.as_str().and_then(crate::file_icon::IconId::parse) else {
+                return Err(value_error(path, &entry_key, "a documented built-in icon ID"));
+            };
+            if target.insert(key.clone(), icon).is_some() {
+                return Err(PluginConfigError::new(
+                    path,
+                    format!(
+                        "invalid value for `file_icon_overrides.{kind}`: duplicate key after ASCII normalization: {key:?}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn string_value<'a>(
@@ -666,6 +812,7 @@ mod tests {
         std::fs::write(dir.path().join("config.toml"), "theme = \"gruvbox\"\n").unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.theme(), "gruvbox");
+        assert_eq!(config.file_icons(), crate::file_icon::FileIconMode::Plain);
         assert_eq!(config.default_scope(), Scope::Uncommitted);
         assert_eq!(config.navigator_position(), NavigatorPosition::Right);
         assert_eq!(config.toggle_placement(), TogglePlacement::Split);
@@ -675,12 +822,45 @@ mod tests {
     }
 
     #[test]
+    fn documented_complete_example_parses_with_root_settings_and_icon_overrides() {
+        let docs = include_str!("../specs/config.md");
+        let example = docs
+            .split_once("```toml\n")
+            .and_then(|(_, tail)| tail.split_once("\n```"))
+            .map(|(toml, _)| toml)
+            .expect("configuration spec has its complete TOML example");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), example).unwrap();
+        let config = super::plugin_config_in(dir.path()).expect("documented example validates");
+
+        assert_eq!(config.theme(), "tokyo-night");
+        assert_eq!(config.default_scope(), Scope::Branch);
+        assert_eq!(config.navigator_position(), NavigatorPosition::Bottom);
+        assert_eq!(config.toggle_placement(), TogglePlacement::Overlay);
+        assert_eq!(config.toggle_direction(), ToggleDirection::Down);
+        assert!(!config.auto_open());
+        assert_eq!(config.github_host(), Some("github.example.com"));
+        assert_eq!(config.gitlab_host(), Some("git.corp.example"));
+        assert_eq!(config.azure_devops_host(), Some("tfs.corp.example"));
+        assert_eq!(
+            config.file_icon_overrides().names["containerfile"],
+            crate::file_icon::IconId::Docker
+        );
+        assert_eq!(
+            config.file_icon_overrides().extensions["d.mts"],
+            crate::file_icon::IconId::Typescript
+        );
+        assert_eq!(config.file_icon_overrides().extensions["astro"], crate::file_icon::IconId::Vue);
+    }
+
+    #[test]
     fn reads_complete_valid_file_as_one_value() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
             concat!(
                 "theme = \"tokyo-night\"\n",
+                "file_icons = \"plain\"\n",
                 "default_scope = \"last-turn\"\n",
                 "navigator_position = \"bottom\"\n",
                 "toggle_placement = \"overlay\"\n",
@@ -692,12 +872,76 @@ mod tests {
         .unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.theme(), "tokyo-night");
+        assert_eq!(config.file_icons(), crate::file_icon::FileIconMode::Plain);
         assert_eq!(config.default_scope(), Scope::LastTurn);
         assert_eq!(config.navigator_position(), NavigatorPosition::Bottom);
         assert_eq!(config.toggle_placement(), TogglePlacement::Overlay);
         assert_eq!(config.toggle_direction(), ToggleDirection::Down);
         assert!(!config.auto_open());
         assert_eq!(config.github_host(), Some("github.example.com"));
+    }
+
+    #[test]
+    fn file_icon_modes_validate_and_normalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (text, expected) in [
+            ("file_icons = \"unicode\"\n", crate::file_icon::FileIconMode::Plain),
+            ("file_icons = \"plain\"\n", crate::file_icon::FileIconMode::Plain),
+            ("file_icons = \"emoji\"\n", crate::file_icon::FileIconMode::Emoji),
+            ("file_icons = \"nerd\"\n", crate::file_icon::FileIconMode::Nerd),
+            ("file_icons = \"none\"\n", crate::file_icon::FileIconMode::None),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let config = super::plugin_config_in(dir.path()).unwrap();
+            assert_eq!(config.file_icons(), expected, "{text}");
+            assert_eq!(config.to_json()["file_icons"], expected.as_str());
+            if text.contains("unicode") {
+                assert_eq!(config.to_json()["file_icons"], "plain");
+            }
+        }
+    }
+
+    #[test]
+    fn file_icon_overrides_are_normalized_and_whole_file_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "file_icons = \"none\"\n",
+                "[file_icon_overrides.names]\n",
+                "\"Containerfile\" = \"docker\"\n",
+                "[file_icon_overrides.extensions]\n",
+                "\"d.MTS\" = \"typescript\"\n",
+            ),
+        )
+        .unwrap();
+        let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(
+            config.file_icon_overrides().names["containerfile"],
+            crate::file_icon::IconId::Docker
+        );
+        assert_eq!(
+            config.file_icon_overrides().extensions["d.mts"],
+            crate::file_icon::IconId::Typescript
+        );
+        assert_eq!(config.to_json()["file_icon_overrides"]["names"]["containerfile"], "docker");
+
+        for text in [
+            "file_icon_overrides = \"nope\"\n",
+            "[file_icon_overrides.unknown]\nx = \"rust\"\n",
+            "[file_icon_overrides.names]\npath/name = \"rust\"\n",
+            "[file_icon_overrides.extensions]\n\".rs\" = \"rust\"\n",
+            "[file_icon_overrides.extensions]\n\"d..ts\" = \"rust\"\n",
+            "[file_icon_overrides.names]\nCargo.toml = \"rust\"\ncargo.toml = \"docker\"\n",
+            "[file_icon_overrides.names]\nx = \"unknown\"\n",
+            "[file_icon_overrides.names]\nx = 1\n",
+            "file_icons = \"none\"\n[file_icon_overrides.names]\nx = \"unknown\"\n",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(super::plugin_config_in(dir.path()).is_err(), "{text}");
+        }
     }
 
     #[test]
@@ -725,6 +969,8 @@ mod tests {
     fn every_invalid_value_fails_instead_of_falling_back() {
         let cases = [
             ("theme = \"unknown\"\n", "`theme`"),
+            ("file_icons = \"rainbow\"\n", "`file_icons`"),
+            ("file_icons = true\n", "`file_icons`"),
             ("default_scope = \"weekly\"\n", "`default_scope`"),
             ("default_scope = \"last turn\"\n", "`default_scope`"),
             ("navigator_position = \"center\"\n", "`navigator_position`"),
@@ -953,10 +1199,30 @@ mod tests {
     }
 
     #[test]
+    fn named_alt_navigation_keys_round_trip_and_remain_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[keybindings]\nnext-change = [\"alt+down\"]\nnext-file = [\"alt+shift+down\"]\n",
+        )
+        .unwrap();
+        let keymap = super::plugin_config_in(dir.path()).unwrap().keymap().clone();
+        assert_eq!(
+            keymap.action_for(crate::keymap::Key::alt_named('↓')),
+            Some(crate::keymap::Action::NextChange)
+        );
+        assert_eq!(
+            keymap.action_for(crate::keymap::Key::alt_named('⇩')),
+            Some(crate::keymap::Action::NextFile)
+        );
+    }
+
+    #[test]
     fn normalized_json_contains_every_key() {
         let value = PluginConfig::default().to_json();
         let object = value.as_object().unwrap();
         assert_eq!(object.len(), super::PLUGIN_CONFIG_KEYS.len(), "one JSON key per config key");
+        assert_eq!(object["file_icons"], "plain");
         assert_eq!(object["default_scope"], "uncommitted");
         assert_eq!(object["navigator_position"], "right");
         assert_eq!(object["toggle_placement"], "split");
@@ -970,6 +1236,8 @@ mod tests {
             "every action is present, resolved"
         );
         assert_eq!(keybindings["quit"], serde_json::json!(["q"]));
-        assert_eq!(keybindings["send"], serde_json::json!(["s", "S"]));
+        assert_eq!(keybindings["send"], serde_json::json!(["s", "S", "alt+s"]));
+        assert_eq!(keybindings["next-change"], serde_json::json!(["alt+down"]));
+        assert_eq!(keybindings["hide-unchanged"], serde_json::json!(["alt+u"]));
     }
 }

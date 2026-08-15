@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-06-23
-Last edited: 2026-08-08
+Last edited: 2026-08-15
 ---
 
 # Review model
@@ -21,13 +21,16 @@ The central object is a comment: a note on a run of diff lines in one file, carr
 | `lines` | the verbatim diff lines, each keeping its `+`/`-`/space marker   |
 | `text`  | free-form reviewer text, possibly multi-line                     |
 
-Every field is required.
+Every field is required. The in-memory store also assigns each comment a monotonically increasing session ID. Cards, composing, list selection, navigation, and delete confirmation carry that ID and resolve it when acting. It is not persisted.
 
 - `lines` is the authoritative anchor.
 - `side`, `start`, and `end` are never re-bound when the diff shifts.
-- The range is always contiguous.
+- A card, indicator, jump, inline edit, or open resolves only when the original file, authoring view, side, range, and exact `lines` all match current rows. It is otherwise `STALE` and detached. It never attaches to replacement code.
+- The range is always contiguous. A deletion-only selection uses `old`. A range containing any current-side row uses `new`.
 
-### Scopes
+### Git review scopes
+
+Scopes exist only in Git review. Files-only has no changeset, base, turn baseline, or comment/export state. A scope action there is inert and identifies Files-only mode.
 
 A scope selects which changes `Changes` shows and which files `All files` annotates. The two tabs share one active scope. A reviewr pane starts in the config's `default_scope`, `uncommitted` when unset (`config.md`). A config reread never switches the active scope.
 
@@ -114,6 +117,7 @@ Comments are a review pass, not a durable record.
 - Export takes the whole set and clears it.
 - A comment whose file leaves the changeset is flagged stale, and kept.
 - An `All files` comment is flagged stale only when its file is deleted from the worktree.
+- A visible file or view whose rows no longer reconstruct the exact anchor is also stale. Stale comments remain editable only as detached list text and remain exportable.
 
 ### Export
 
@@ -140,7 +144,7 @@ why drop this? it is still needed
 | order     | by `file`, then `start`                                                               |
 | preamble  | none                                                                                  |
 
-- Send injects every block into the agent input, focuses the agent pane, and clears the list. It never submits (paste framing: `herdr-host.md`).
+- Send confirms the frozen batch and selected agent before injecting every block into the agent input, focuses the agent pane, and clears the list only after the write succeeds. It never submits (paste framing: `herdr-host.md`).
 - Copy writes the same blocks to the system clipboard, then clears the list.
 
 How the agent pane is found and filled is in `herdr-host.md`.

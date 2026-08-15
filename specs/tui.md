@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-06-23
-Last edited: 2026-08-08
+Last edited: 2026-08-15
 ---
 
 # TUI
@@ -26,16 +26,17 @@ The terminal frame: the pane layout, the tabs, and how the view stays current.
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- The header carries the three tabs with the active one highlighted, the active scope, and the changed-file count with the scope's `+added −removed` totals, right-aligned one cell off the pane edge.
+- Git review headers carry the three tabs with the active one highlighted, the active scope, and the changed-file count with the scope's `+added −removed` totals, right-aligned one cell off the pane edge.
+- Files-only carries a `Files-only` header and its root. It has one Files browser, no scope chip, no change totals, and no PR refresh.
 - The `All files` tab's header label reads `Files`.
 - On the `branch` scope the header names the base after the scope, `vs dev`, the bare branch name however it resolved. Clicking it opens the base picker (`input.md`). With no resolving base it reads `no base`.
 - A skipped pick or `--base` shows after the base, `vs main · dev missing` — and after the empty state too, `no base · dev missing`, so a dormant choice never reads as never-chosen.
 - A base name the header cannot fit truncates with a trailing `…`. The picker always shows it whole. Too narrow for even one column of the name, the base leaves the header rather than paint a nameless `vs`.
 - The header's line totals drop a zero side and vanish when nothing changed, like a file row's stats (`file-list.md`).
 - The active tab sets both panes: diff and changed files in `Changes`, content and repo tree in `All files`, checks and comments in `PR` (`diff-view.md`, `pr-tab.md`).
-- The comment input opens inline, directly under the last line of the selection, and grows as you type (`input.md`). It is never a footer band.
+- The comment input opens inline, directly under the last line of the selection, and grows as you type (`input.md`). It is never a footer band. The selection's separate action strip takes one display row before the composer so it cannot overwrite source.
 - The footer is a live action bar (`input.md`).
-- The comments list, the agent picker, and the base picker open as popups over the body (`input.md`, `herdr-host.md`). While one is open, every painted color in the header and the body recedes halfway to the theme base. The footer stays bright.
+- The comments list, the send confirmation sheet, the delete confirmation, and the base picker open as popups over the body (`input.md`, `herdr-host.md`). While one is open, every painted color in the header and the body recedes halfway to the theme base. The footer stays bright.
 - The review loop is the same in `Changes` and `All files`. `PR` is a read-only mirror. Comments are one set across the authoring tabs and export together.
 
 The navigator has one global position across all tabs, and the position derives the split direction.
@@ -52,7 +53,7 @@ The navigator has one global position across all tabs, and the position derives 
 | `left`, `right` | 32% of the body width   | 15–60%        |
 | `top`, `bottom` | 25% of the body height  | 15–50%        |
 
-The side and stacked shares are separate session values. Switching position restores the share for that split direction. Restarting reviewr restores both defaults.
+The side and stacked shares are separate session values. Switching position restores the share for that split direction. Restarting reviewr restores both defaults. Each position paints and hit-tests the same full-width directory-row target, so the navigator's tree controls do not shrink to a disclosure cell.
 
 Dragging the divider changes the active split direction's share. A resize never crosses that direction's allowed range.
 
@@ -78,9 +79,9 @@ A layout change moves nothing else (`overview.md`), and both remembered shares p
 - A poll rebuilds the changed set and the file tree, reconciles them into the view (`overview.md`), and refreshes the open diff as it lands.
 - A result lands whole: the header counts and the list they head come from one refresh.
 - A result lands only when the view it described is still current: the same repository, tab, scope, and scope base. The scope base is the branch base or the turn baseline. A result that no longer matches is discarded, and a newer request supersedes an older one.
-- Entering a file tab paints the tab's stashed state in the switch frame, exactly as it was left, and a refresh lands behind it (`overview.md`). A first-ever visit has no stash and loads before its frame.
+- Entering a file tab paints the tab's stashed state in the switch frame, exactly as it was left, and a refresh lands behind it (`overview.md`). A first-ever Git-review visit has no stash and loads before its frame. A first Files-only visit lists its root before its frame and dispatches descendant listings only after that frame.
 - A scope switch rebuilds the changed set before its frame. A `last-turn` switch diffs against the most recently observed baseline. The `All files` tree re-marks its rows in place and refreshes behind the switch.
-- While a comment is being composed, the input and its diff are frozen. A result that lands mid-composition leaves both untouched, however early its refresh began. The file list still updates.
+- While a selection is live or a comment is being composed, the input and its diff are frozen. A result that lands mid-composition leaves both untouched, however early its refresh began. The file list still updates.
 - `r` triggers an immediate refresh. Its result lands like a poll's.
 - `r` shows a one-cell `⟳` immediately. An ambient refresh shows it only after 200ms in flight. Once shown, the glyph holds for at least 300ms. It paints in a reserved cell at the end of the tab strip, so nothing shifts when it appears.
 - Each tab shows only its own refresh: the file tabs the world refresh, the `PR` tab its fetch on its own cadence (`pr-tab.md`).
@@ -92,7 +93,7 @@ A layout change moves nothing else (`overview.md`), and both remembered shares p
 - A poll never touches the comment input or saved comments. Draft text and caret survive every refresh.
 - A config error and its automatic-reload remedy replace the view. Saved comments, an open composer, comments list, or base picker, and the footer's shortcut expansion all survive it (`config.md`).
 - A poll that finds no change makes no visible update: no flicker, no lost selection or scroll.
-- A refresh in flight never delays input or a paint.
+- A refresh in flight never delays input or a paint. A failed Files-only directory refresh keeps its loaded subtree. A never-loaded failed directory reports a retryable error without presenting it as empty.
 - A first open of a very large file can briefly block.
 - A hung clipboard or agent send can briefly block input.
 

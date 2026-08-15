@@ -2,15 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. AGENTS.md is the primary file. CLAUDE.md is a symlink to it.
 
-herdr-reviewr is a Rust TUI (ratatui) code-review pane: it runs in a [herdr](https://herdr.dev) pane beside a coding agent, shows the agent's diff, takes line comments, and sends them back to the agent's input. One binary, one git worktree per pane. It also runs standalone (`cargo run` in any repo).
+Herdr Preview is a fork of herdr-reviewr, a Rust TUI (ratatui) code-review pane. It runs in a [Herdr](https://herdr.dev) pane beside a coding agent, shows the agent's diff, takes line comments, and sends them back to the agent's input. The internal Rust crate retains the `herdr-reviewr` name; the installed executable is `herdr-preview`. One binary, one git worktree per pane. It also runs standalone (`cargo run` in any repo).
 
 ## Commands
 
-- `just test` — full test suite. Single test: `cargo test <name>` (unit tests live beside the code, integration tests in `tests/`: `cargo test --test app_flow <name>`).
+- `just test` — full test suite. `just` wraps every Rust command in `mise exec rust@1.97.1 --`; direct invocations use the same prefix, e.g. `mise exec rust@1.97.1 -- cargo test <name>` (unit tests live beside the code, integration tests in `tests/`: `mise exec rust@1.97.1 -- cargo test --test app_flow <name>`).
 - `just lint` — clippy with warnings as errors. `just fmt` / `just fmt-check` — rustfmt.
-- `just ci` — exactly what CI runs (fmt-check, lint, test, release build).
+- `just ci` — exactly what CI runs (fmt-check, lint, test, release build), all under Rust 1.97.1.
 - `just qa-install` — put a local build into the user's real herdr panes. See "QA install" below before using it.
-- `python3 scripts/bench_tui.py --binary target/release/herdr-reviewr --fixture` — perceived-latency benchmark (keypress → painted frame, via PTY), the acceptance instrument. `cargo run --release --example bench_latency -- <repo>` attributes a slow number to its component calls. Baselines in `scripts/bench-results/`. Run before/after any change to the reload, render, git, or highlight paths, and compare medians A/B under the same system load (rebuild the old binary to a second target dir and interleave runs — absolute numbers drift with background load).
+- `python3 scripts/bench_tui.py --binary target/release/herdr-preview --fixture` — perceived-latency benchmark (keypress → painted frame, via PTY), the acceptance instrument. `cargo run --release --example bench_latency -- <repo>` attributes a slow number to its component calls. Baselines in `scripts/bench-results/`. Run before/after any change to the reload, render, git, or highlight paths, and compare medians A/B under the same system load (rebuild the old binary to a second target dir and interleave runs — absolute numbers drift with background load).
 
 ## Spec-first
 
@@ -41,7 +41,7 @@ The runtime is a single-threaded frame loop (`event_loop` in `src/lib.rs`): draw
 
 ## QA install — putting a local build into the user's herdr panes
 
-The user tests builds in real herdr panes. The panes run the GitHub-installed plugin's binary at `~/.config/herdr/plugins/github/persiyanov.reviewr-<hash>/bin/herdr-reviewr`, NOT anything in this worktree. Full procedure: `docs/qa-install.md`. Short form:
+The user tests builds in real Herdr panes. The panes run the GitHub-installed plugin's binary at `~/.config/herdr/plugins/github/pi-dal.herdr-preview-<hash>/bin/herdr-preview`, NOT anything in this worktree. Full procedure: `docs/qa-install.md`. Short form:
 
 ```
 just qa-install
@@ -55,4 +55,4 @@ Three rules. Each one has already burned a session:
 2. **Swapping the file does not restart running panes.** They keep the old binary image until closed and reopened. Refresh inside reviewr does nothing for this.
 3. **Never script pane opens.** The plugin's `open`/`toggle` actions act on the currently focused workspace and ignore `HERDR_WORKSPACE_ID`. Automating reopens stacks panes into whatever space the user is looking at. Closing via `herdr/pane.sh close` is safe. Reopening is the user's keystroke, always.
 
-Rollback: `bin/herdr-reviewr.release-backup` sits beside the installed binary, swap it back the same fresh-inode way (or `herdr plugin install` to restore the release).
+Rollback: `bin/herdr-preview.release-backup` sits beside the installed binary, swap it back the same fresh-inode way (or `herdr plugin install` to restore the release).

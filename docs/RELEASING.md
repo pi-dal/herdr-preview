@@ -1,14 +1,13 @@
 # Releasing
 
-How to cut a herdr-reviewr release. A `v*` tag push is the trigger: `.github/workflows/release.yml`
-creates the GitHub Release and uploads a prebuilt binary per target, and `herdr/install.sh`
-downloads the matching asset on `herdr plugin install`.
+How to cut a Herdr Preview release. A `v*` tag push triggers
+`.github/workflows/release.yml`. Managed `herdr plugin install` builds the tagged checkout from
+source through `herdr/build.sh`; it never downloads an upstream release binary.
 
 ## The one rule
 
-**The manifest version and the tag must match.** `herdr/install.sh` reads `version` from
-`herdr-plugin.toml`, sets `TAG="v${version}"`, and downloads from
-`releases/download/${TAG}/`. A `0.2.0` manifest needs a `v0.2.0` tag, or installs 404.
+**The manifest version and the tag must match.** A `0.2.0` manifest needs a `v0.2.0` tag so the
+installed plugin identity and source release agree.
 
 Two files carry the version — keep them equal:
 
@@ -30,7 +29,7 @@ Pick the new version with semver: a behavior change or new feature is a minor bu
 
    ```bash
    git checkout main && git pull
-   git tag -a vX.Y.Z -m "herdr-reviewr vX.Y.Z"
+   git tag -a vX.Y.Z -m "Herdr Preview vX.Y.Z"
    git push origin main
    git push origin vX.Y.Z        # triggers release.yml
    ```
@@ -49,9 +48,9 @@ Pick the new version with semver: a behavior change or new feature is a minor bu
 - creates the Release **as a draft** with the tag's `CHANGELOG.md` section as its body
   (`taiki-e/create-gh-release-action`). A tag with no matching changelog section fails the
   release — finalize the changelog before tagging;
-- builds `herdr-reviewr` for `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+- builds `herdr-preview` for `aarch64-apple-darwin`, `x86_64-apple-darwin`,
   `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`;
-- uploads each as `herdr-reviewr-<target>.tar.gz` with a `.sha256` sidecar;
+- uploads each as `herdr-preview-<target>.tar.gz` with a `.sha256` sidecar;
 - publishes the draft only after every target's assets attached. The repo's releases are
   immutable — assets cannot be added after publish — so publish is the last step, and a
   failed target leaves an editable draft instead of a sealed, assetless release.
@@ -69,19 +68,19 @@ Switch your own machine from the dev link to the published release. This is also
 end-to-end test: it exercises the exact `herdr plugin install` path a user hits.
 
 1. **Swap the link for the release.** Your config survives — `config.toml` lives in
-   `~/.config/herdr/plugins/config/persiyanov.reviewr/`, keyed by plugin id, untouched by a reinstall.
+   `~/.config/herdr/plugins/config/pi-dal.herdr-preview/`, keyed by plugin id, untouched by a reinstall.
 
    ```bash
-   herdr plugin unlink persiyanov.reviewr
-   herdr plugin install persiyanov/herdr-reviewr --yes   # install.sh downloads the vX.Y.Z binary
-   herdr plugin list --plugin persiyanov.reviewr          # confirm: github source + version X.Y.Z
+   herdr plugin unlink pi-dal.herdr-preview
+   herdr plugin install pi-dal/herdr-preview --yes
+   herdr plugin list --plugin pi-dal.herdr-preview   # confirm: github source + version X.Y.Z
    ```
 
-2. **Relaunch the reviewr pane** so it runs the new binary instead of the old process.
+2. **Relaunch the Preview pane** so it runs the new binary instead of the old process.
    A running pane keeps its old binary image until it closes. Closing is safe to script:
 
    ```bash
-   herdr plugin action invoke close --plugin persiyanov.reviewr   # closes the focused workspace's reviewr panes
+   herdr plugin action invoke close --plugin pi-dal.herdr-preview   # closes the focused workspace's Preview panes
    ```
 
    **Reopen with your own toggle keybinding, never a scripted `open`.** The `open` and `toggle`
@@ -93,9 +92,8 @@ end-to-end test: it exercises the exact `herdr plugin install` path a user hits.
 
 - **`min_herdr_version`** (in `herdr-plugin.toml`) only changes when a release depends on a newer
   herdr API. A normal feature release leaves it as is.
-- **Code signing** is a local-dev concern, not a release one: CI produces fresh binaries, while a
-  contributor's in-place rebuild needs `just install` (see the README) to avoid an Apple-Silicon
-  SIGKILL. Release assets are downloaded fresh by `install.sh`, so they are unaffected.
+- **Code signing** is handled by the shared fresh-inode swap helper used by `herdr/build.sh` and
+  `just install`. This avoids the Apple-Silicon SIGKILL caused by overwriting an executable inode.
 - **QA against the installed plugin** uses `just qa-install`, never a bare `cp`. Overwriting the
   installed binary in place invalidates its cached code signature, macOS SIGKILLs every launch,
   and the pane opens dead with no error — the recipe replaces the inode and ad-hoc re-signs.

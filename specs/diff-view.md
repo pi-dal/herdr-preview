@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-06-24
-Last edited: 2026-07-20
+Last edited: 2026-08-15
 ---
 
 # Diff view
@@ -73,9 +73,11 @@ Content rows are selectable for comments. A `fold` is not.
 
 ### File view
 
+Files-only uses this read-only File view directly. It has no diff side, comment selection, or Git-backed degradation path. Files-only opens every displayed relative path under its retained launch-root descriptor. It rejects any vanished or symlinked path.
+
 - The `FileDiff` is built from current content alone: every line a `context` row, no change rows, no emphasis, no folds.
 - The gutter shows the new-line number and a blank change bar.
-- Highlighting, wrapping, horizontal scroll, selection, and comments behave exactly as in Diff view.
+- Highlighting, wrapping, and horizontal scroll behave exactly as in Diff view. In Git review, File view also supports its content comments. Files-only remains read-only: it has no selection or comments.
 - A `binary` or `too_large` file degrades to a notice, worded `file too large` here and `file too large to diff` in Diff view.
 
 ### Markdown preview
@@ -117,6 +119,7 @@ Returning to source differs per view:
 
 ### Folding
 
+- `hide-unchanged` folds every unchanged run, including the normal three-line margins, in Changes source only. It keeps source rows and comments intact rather than deleting context. `→` expands only the selected fold. Turning it off restores the normal projection.
 - An unchanged run longer than the context margin collapses to one `fold` row showing its hidden-line count.
 - Leading and trailing unchanged regions fold too, so the pane opens focused on the changes.
 - Expanding replaces the fold with `context` rows. There is no manual collapse-back.
@@ -134,8 +137,9 @@ Returning to source differs per view:
 ### Comment anchoring
 
 - A comment anchors as `review-model.md` defines: a `side`, a `start..end` range, the verbatim snippet.
-- A selection runs over content rows. A fold is a hard boundary it cannot cross.
+- A selection runs over content rows. A fold is a hard boundary it cannot cross or start on. Clicking one expands it.
 - A selection covers the same rows whichever end it grew from. Extending upward and extending downward over the same rows anchor the same comment, and the input box opens under the range's last line either way (`tui.md`).
+- A selection renders a one-row anchor/action strip after its endpoint. It participates in wrap height, scroll clamp, and mouse mapping. The strip names range, count, and side and reserves the `Comment` click target without replacing source cells.
 - The export snippet is rebuilt from the selected rows as `+`/`−`/space-prefixed lines. The markers live in the export, not on screen.
 
 ### Config
@@ -160,6 +164,38 @@ The viewer is read-only and recomputed on every refresh. It degrades rather than
 - No alternate diff layouts. One unified column, a side-by-side split is roadmap.
 - No editing, staging, or reverting from the viewer.
 - No line-number rebasing of comments. `review-model.md` owns comment anchoring, via the snippet.
+
+## Image preview
+
+A selected current-content PNG, JPEG, WebP, or GIF renders as a read-only truecolor
+Unicode-halfblock image in the read pane. GIF renders its first frame only. Preview inputs are
+strictly signature-sniffed from bounded raw bytes before any lossy text conversion. A malformed,
+oversized, unsupported, deleted, or unavailable image paints a stable notice instead. SVG is
+recognized only by a bounded 8 KiB lexical prologue scan: optional UTF-8 BOM, ASCII whitespace,
+XML declaration, comments, and doctype may precede a real `<svg` start tag with an element-name
+boundary. Text, CDATA, comments, malformed/incomplete prologues, and names such as `<svgx>` are
+not SVG. Recognized SVG deliberately paints `SVG preview unavailable` in this release; it is
+never parsed or handed to a browser, helper, terminal protocol, or external resolver.
+
+Image pixels are reduced in memory and painted through Ratatui cells. Preview emits no Kitty,
+iTerm, Sixel, OSC, or other terminal graphics escape sequence, creates no thumbnail/cache file,
+and invokes no external command. It is derived state only and obeys **No writes**. Its identity is
+the current selected path/content; a file switch, vanished selection, or emptied changeset
+atomically clears the old image and fallback notice before the next frame can paint, which
+preserves **Continuity**.
+
+The encoded image source limit is 2 MiB. Source dimensions are limited to 8,192 pixels per side
+and 16 million pixels total; the cached raster is capped at 160×96 pixels. Files-only uses the
+same 2 MiB cap through its retained descriptor-relative, no-follow root; non-image text remains
+subject to the smaller normal text-view cap. Images have no line rows: cursor/hunk/change/file
+source traversal, selection, comments, edit/delete confirmation, send/copy anchors, find,
+wrapping, and Markdown preview are inert. Every terminal-visible file path, including diff headers and Search result/preview labels, is
+sanitized only at its final paint boundary; raw paths remain internal identities and descriptor
+access inputs. The same display boundary applies to source text, saved-comment cards, comment-list
+rows, composer titles, and editor input: C0/C1/DEL and bidi-format controls become a visible
+replacement character before reaching Ratatui. One-line labels flatten newlines to spaces;
+multiline source and editor input retain intentional newlines and expanded tabs. Sanitization never
+changes a comment's raw text, anchor, export/send payload, editable input, or path identity.
 
 ## Related specs
 

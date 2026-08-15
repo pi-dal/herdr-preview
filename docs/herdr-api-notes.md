@@ -1,8 +1,9 @@
 # herdr API notes (verified against herdr 0.7.5)
 
-The herdr surface herdr-reviewr depends on, confirmed live (last sweep 2026-07-31).
-herdr-reviewr ships as a herdr **plugin** (`../herdr-plugin.toml`), and the binary is a plain
-terminal program: any pane that runs it is a reviewr pane (`../specs/herdr-host.md`).
+The Herdr surface the Herdr Preview review engine depends on, confirmed live (last sweep 2026-07-31).
+Herdr Preview ships as a Herdr **plugin** (`../herdr-plugin.toml`). The retained
+`herdr-reviewr` crate builds the `herdr-preview` executable. Any pane that runs it is a Preview pane
+(`../specs/herdr-host.md`). The fork requires Herdr 0.8.0 or newer.
 
 ## Plugin manifest (`herdr-plugin.toml`)
 
@@ -15,7 +16,7 @@ command = ["cargo", "install", "--path", "."]
 [[panes]]                                   # an openable pane entrypoint
 id = "pane"
 placement = "split"                         # overlay (default) | split | tab | zoomed
-command = ["herdr-reviewr"]                 # see "pane command" below
+command = ["herdr-preview"]                 # see "pane command" below
 
 [[actions]]                                 # invokable command, bindable to a key
 id = "toggle"
@@ -41,15 +42,15 @@ The direct-run mode rides on four calls plus the plain-pane env, all confirmed l
 
   ```json
   {"result":{"process_info":{"foreground_process_group_id":17124,"foreground_processes":[
-    {"pid":17124,"name":"herdr-reviewr","argv0":"herdr-reviewr",
-     "argv":["/…/bin/herdr-reviewr"],"cwd":"/…/repo"}],
+    {"pid":17124,"name":"herdr-preview","argv0":"herdr-preview",
+     "argv":["/…/bin/herdr-preview"],"cwd":"/…/repo"}],
     "pane_id":"w4:p5","shell_pid":81333}}}
   ```
 
   `name` is the rewritable process title, not the executable (a live claude pane reports
-  `name: "2.1.220"`), so identity keys on the `argv0`/`argv[0]` basename. A live reviewr pane
-  reports `argv0: "herdr-reviewr"` bare and `argv[0]` as the full binary path. `pane.sh` reads
-  this per pane to find the workspace's reviewr panes.
+  `name: "2.1.220"`), so identity keys on the `argv0`/`argv[0]` basename. A live Preview pane
+  reports `argv0: "herdr-preview"` bare and `argv[0]` as the full binary path. `pane.sh` reads
+  this per pane to find the workspace's Preview panes.
 
   A `pane list` entry carries no foreground-process fields — its only process-adjacent keys
   are `foreground_cwd` and `terminal_title`/`terminal_title_stripped`, and the title is the
@@ -60,21 +61,21 @@ The direct-run mode rides on four calls plus the plain-pane env, all confirmed l
   `pane process-info` and plain `pane close` (verified live, 0.7.5). `pane.sh` keys its
   converge-vs-refuse branches on that code.
 - **`herdr pane rename <id> [LABEL]... [--clear]`** sets and clears a pane's label. The binary
-  stamps its own pane `reviewr` at startup and clears it on a normal exit — display only,
+  stamps its own pane `Preview` at startup and clears it on a normal exit — display only,
   nothing reads it back.
 - **`herdr plugin config-dir <plugin_id>`** prints the plugin's config directory
-  (`~/.config/herdr/plugins/config/persiyanov.reviewr`). The binary falls back to it when
+  (`~/.config/herdr/plugins/config/pi-dal.herdr-preview`). The binary falls back to it when
   `HERDR_PLUGIN_CONFIG_DIR` is unset, so a hand-launched pane reads the same `config.toml`
   (`../specs/config.md`).
 - **`herdr pane split [--pane <id>|--current] [--direction …] [--ratio …] [--cwd …] [--env K=V]
   [--focus|--no-focus]`, `pane run <id> <command>…`, `pane current`** exist for layout tooling.
-  reviewr's own actions still open through `plugin pane open`; a layout plugin can use these
-  directly with `command = "herdr-reviewr"` and the result is the same reviewr pane.
+  Preview's own actions still open through `plugin pane open`; a layout plugin can use these
+  directly with `command = "herdr-preview"` and the result is the same Preview pane.
 
-## Open / close a reviewr pane
+## Open / close a Preview pane
 
 ```
-herdr plugin pane open --plugin reviewr --entrypoint pane \
+herdr plugin pane open --plugin pi-dal.herdr-preview --entrypoint pane \
   --placement split --direction right --target-pane <pane> --cwd <repo> --no-focus
 herdr plugin pane close <pane_id>
 ```
@@ -116,7 +117,7 @@ herdr runs plugin commands with a minimal `PATH`; prepend common bin dirs for `j
 [[keys.command]]
 key = "cmd+r"
 type = "plugin_action"
-command = "persiyanov.reviewr.toggle"   # <plugin_id>.<action_id> — plugin_id is the manifest `id`, not `name`
+command = "pi-dal.herdr-preview.toggle"   # <plugin_id>.<action_id> — plugin_id is the manifest `id`, not `name`
 ```
 `cmd+…` chords reach herdr; `alt+…` chords are composed into characters by macOS and don't register.
 
@@ -127,13 +128,13 @@ It takes no flags, so any filter is the caller's to apply. The row order is herd
 observed on 0.7.5 across 13 live agents, entries arrive grouped by workspace and by tab within a
 workspace. No sample held two agents in one tab, so the order inside a tab is unverified.
 
-- Send candidates = every agent in the reviewr pane's `HERDR_WORKSPACE_ID`. One sends directly,
+- Send candidates = every agent in the Preview pane's `HERDR_WORKSPACE_ID`. One sends directly,
   several open the picker (`../specs/herdr-host.md`). Turn tracking reads no pane topology at
-  all: it takes every agent's `cwd` and keeps those resolving to the reviewr pane's git top level.
+  all: it takes every agent's `cwd` and keeps those resolving to the Preview pane's git top level.
 - `cwd` and `foreground_cwd` both carry the agent's working directory, and matched on every
   entry of a 10-agent sample. Each entry also carries `agent_session` (a stable UUID),
   `state_change_seq`, `focused`, and `terminal_title_stripped`, none of which reviewr reads.
-- 0.7.5 lists only real agent panes. A reviewr pane or a plain shell appears in `pane list`
+- 0.7.5 lists only real agent panes. A Preview pane or a plain shell appears in `pane list`
   without an `agent` key and never in `agent list`, so excluding our own pane is defensive.
 - `name`, `display_agent`, and `state_labels` are omitted entirely until something sets them.
   `herdr agent rename <pane> <name>` makes `name` appear; `--clear` leaves it present and null.
@@ -144,7 +145,7 @@ workspace. No sample held two agents in one tab, so the order inside a tab is un
 ordinal. The picker joins `label` on `tab_id`, best effort.
 
 `herdr tab rename <tab_id> <label>` sets a tab's `label` (0.7.5). A `tab`-placement open uses it to
-name the fresh tab `reviewr`.
+name the fresh tab `Preview`.
 
 ```
 herdr pane send-text <agent_pane> "<literal text>"   # writes input, no Enter

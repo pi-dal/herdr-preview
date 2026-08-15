@@ -1,16 +1,18 @@
 ---
 Status: Current
 Created: 2026-06-23
-Last edited: 2026-08-08
+Last edited: 2026-08-15
 ---
 
-# herdr-reviewr
+# Herdr Preview
 
-A terminal review pane for herdr: browse a coding agent's changes, comment on line ranges, and send the comments back to the agent.
+A terminal review pane for Herdr: browse a coding agent's changes, comment on line ranges, and send the comments back to the agent.
 
 ## Overview
 
-One binary (`herdr-reviewr`, Rust + ratatui) runs in a herdr pane, pointed at one git worktree. It renders in the real terminal, so fonts and colors are whatever the user already runs.
+Herdr Preview is the `pi-dal.herdr-preview` plugin. It retains the `herdr-reviewr` Rust crate and review engine from its upstream foundation. It installs the review UI as `herdr-preview`, so its panes remain distinct from upstream `herdr-reviewr` panes. One binary runs in a Herdr pane, rooted at its launch directory. A Git worktree opens Git review. Any other readable directory opens Files-only. It renders in the real terminal, so fonts and colors are whatever the user already runs.
+
+Humans open the pane with configurable placement. Agents use the stable `peek` action to open a non-focusing right split (`herdr-host.md`).
 
 The reviewer's loop:
 
@@ -26,6 +28,8 @@ Three tabs:
 | `Changes`   | the active scope's changed files, with a syntax-highlighted diff viewer |
 | `All files` | the whole repo tree, with a read-and-comment content viewer             |
 | `PR`        | a read-only mirror of the pull request: state, checks, comments         |
+
+Files-only shows only the `Files` browser. It roots the tree at the launch directory and shows read-only content. The launch root is retained as a real-directory capability, and Files-only resolves listings and content reads descriptor-relative with no-follow semantics rather than treating display paths as filesystem authority. It lists the root directly, then lists one real directory at a time only after expansion. It never selects another pane or repository. Git review tabs, scopes, comments, agent send, and Git refresh are unavailable there. `.git` remains excluded from the Files-only tree.
 
 ## Voice
 

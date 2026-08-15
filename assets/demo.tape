@@ -1,7 +1,7 @@
-# Demo recording for herdr-reviewr. Regenerate with:
-#   VERSION=$(awk -F'"' '/^version = / {print $2; exit}' herdr-plugin.toml) && herdr plugin install persiyanov/herdr-reviewr --ref "v$VERSION" --yes && vhs assets/demo.tape
+# Demo recording for Herdr Preview. Regenerate with:
+#   VERSION=$(awk -F'"' '/^version = / {print $2; exit}' herdr-plugin.toml) && herdr plugin install pi-dal/herdr-preview --ref "v$VERSION" --yes && vhs assets/demo.tape
 # Builds a throwaway git repo with an agent-style change, then drives the installed release through
-# the review loop. Needs `git`, `herdr`, `jq`, and `vhs`, with `persiyanov.reviewr` installed.
+# the review loop. Needs `git`, `herdr`, `jq`, and `vhs`, with `pi-dal.herdr-preview` installed.
 
 Require git
 Require herdr
@@ -19,8 +19,8 @@ Set TypingSpeed 45ms
 
 # --- Hidden setup: a temp repo with a committed baseline + an uncommitted edit to review ---
 Hide
-Type "BIN=$(bash assets/demo-bin.sh) && bash assets/demo-fixture.sh /tmp/herdr-reviewr-demo || exit 1" Enter
-Type "bash /tmp/herdr-reviewr-demo/.git/reviewr-demo/demo-session $BIN || exit 1" Enter
+Type "BIN=$(bash assets/demo-bin.sh) && bash assets/demo-fixture.sh /tmp/herdr-preview-demo || exit 1" Enter
+Type "bash /tmp/herdr-preview-demo/.git/reviewr-demo/demo-session $BIN || exit 1" Enter
 Show
 
 # --- The review loop ---

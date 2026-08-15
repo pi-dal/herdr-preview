@@ -142,7 +142,8 @@ pub struct FileDiff {
 /// the byte budget also catches a single huge line that the line budget misses.
 const MAX_LINES: usize = 50_000;
 /// The byte budget. A file larger than this renders as a `too_large` notice.
-const MAX_BYTES: usize = 2_000_000;
+/// Largest file the File view reads through its descriptor before presenting the bounded notice.
+pub(crate) const MAX_BYTES: usize = 2_000_000;
 
 /// Whether a file of `len` bytes is over the size budget. `set_file_view` checks the on-disk
 /// size with this before reading, so an oversize blob never loads (`app.rs`).

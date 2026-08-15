@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Herdr Preview fork identity and agent peek.** The plugin is now `pi-dal.herdr-preview` at
+  version 0.1.0. Human placement remains configurable, while agents can idempotently open a
+  non-focusing right split through `peek`. Its installed executable is `herdr-preview`, distinct from upstream `herdr-reviewr` panes.
+
 ## [0.30.4] — 2026-08-13
 
 ### Changed

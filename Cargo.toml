@@ -1,22 +1,31 @@
 [package]
 name = "herdr-reviewr"
-version = "0.30.4"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 description = "A terminal review pane for herdr: browse an agent's changes and send comments back to chat."
 authors = ["Dmitry Persiyanov <dmitry.persiyanov@gmail.com>"]
 license = "MIT"
-repository = "https://github.com/persiyanov/herdr-reviewr"
+repository = "https://github.com/pi-dal/herdr-preview"
+homepage = "https://github.com/pi-dal/herdr-preview"
 readme = "README.md"
 keywords = ["herdr", "tui", "diff", "review", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 
+[[bin]]
+name = "herdr-preview"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 dirs = "6"
+# Bounded, in-process raster decode for the read-only halfblock image preview.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 fff-search = "0.10.0"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = "0.30"
+# Descriptor-relative `openat`/`O_NOFOLLOW` Files-only capability boundary.
+rustix = { version = "=1.1.4", features = ["fs", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = { version = "3.1.1", features = ["text"] }

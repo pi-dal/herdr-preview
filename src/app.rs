@@ -5,7 +5,7 @@
 //! whole interaction model is testable without a backend. `src/main.rs` owns the
 //! terminal and maps input events onto these methods.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -17,8 +17,9 @@ use crate::forge;
 use crate::git;
 use crate::herdr::{self, AgentChoice, SendTarget};
 use crate::highlight::Highlighter;
+use crate::image_preview::{self, ImagePreview, ImagePreviewError};
 use crate::logln;
-use crate::model::{Comment, CommentStore, Scope, Side};
+use crate::model::{Comment, CommentId, CommentStore, Scope, Side};
 use crate::theme::{self, Palette};
 
 /// Navigator shares and bounds, as percentages of the body's split axis.
@@ -32,6 +33,18 @@ const MAX_STACK_PCT: u16 = 50;
 const DEFAULT_SEARCH_PCT: u16 = 50;
 const MIN_SEARCH_PCT: u16 = 10;
 const MAX_SEARCH_PCT: u16 = 90;
+/// Bounded one-level Files-only directory listings per world job.
+const RAW_DIR_BATCH_CAP: usize = 32;
+const RAW_DIR_STATUS_LIMIT: usize = 48;
+
+fn raw_dir_label(path: &str) -> String {
+    if path.is_empty() {
+        return "root".to_string();
+    }
+    let mut chars = path.chars();
+    let label: String = chars.by_ref().take(RAW_DIR_STATUS_LIMIT).collect();
+    if chars.next().is_some() { format!("{label}…") } else { label }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum DividerDrag {
@@ -66,6 +79,15 @@ pub enum Tab {
     Pr,
 }
 
+/// The domain the pane is rooted in. Git review owns diffs, scopes, PRs, comments, and
+/// agent export. Files-only owns exactly a readable directory and never substitutes another
+/// pane or repository for it (`specs/overview.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositoryMode {
+    GitReview,
+    FilesOnly,
+}
+
 /// What a pending PR refresh may do to a fetch already in flight: an ambient trigger —
 /// tab entry, a turn end, the fallback timer — rides it, the user's `refresh` key
 /// supersedes it (specs/forge-host.md). `Ord` so merging pending requests keeps the
@@ -86,9 +108,11 @@ impl Tab {
 
 /// The inactive tab's saved navigator and read-pane state, swapped in on a tab switch so
 /// each tab keeps its own selection and scroll (specs/tui.md).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 struct TabStash {
     entries: Vec<Entry>,
+    raw_tree: RawTree,
     file_rows: Vec<file_list::Row>,
     file_cursor: usize,
     file_scroll: usize,
@@ -101,13 +125,29 @@ struct TabStash {
     diff_scroll: usize,
     h_scroll: usize,
     select_anchor: Option<usize>,
+    hide_unchanged: bool,
     preview: bool,
     preview_scroll: usize,
     preview_scrolled: bool,
     preview_text: String,
+    /// Raster/fallback image presentation belongs to the file-tab identity too: an image from
+    /// another tab must never paint while this tab waits for a refresh (Continuity).
+    image_preview: Option<ImagePreview>,
+    image_preview_note: Option<&'static str>,
     /// Whether this tab has ever completed a reload. A never-visited tab has nothing worth
     /// painting, so its first entry loads before the frame instead of deferring.
     visited: bool,
+}
+
+/// The Files-only tree's per-tab cache. Each listing contains direct children only. The app
+/// materializes entries from reachable expanded listings, keeping collapsed or orphaned cache
+/// data out of the navigator (specs/file-list.md).
+#[derive(Debug, Default)]
+struct RawTree {
+    listings: BTreeMap<String, Vec<Entry>>,
+    loading: HashSet<String>,
+    failed: HashMap<String, String>,
+    epoch: u64,
 }
 
 /// A file crossing offered by the footer, waiting for the hunk step that armed it to repeat: the
@@ -159,9 +199,13 @@ impl BasePicker {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
     Normal,
-    /// Writing a comment; `editing` is the store index when editing an existing one.
+    /// Writing a comment; `editing` is a stable session comment ID when editing an existing one.
     Composing {
-        editing: Option<usize>,
+        editing: Option<CommentId>,
+    },
+    /// A deliberate, exact-comment delete confirmation.
+    ConfirmDelete {
+        id: CommentId,
     },
     /// Browsing the comments-list overlay.
     List,
@@ -189,7 +233,14 @@ impl Mode {
     /// `Search` replaces the body rather than holding a place in it, and `Find` is a band the
     /// reviewer navigates the live diff with. Neither freezes anything, so neither is modal here.
     pub fn is_modal(&self) -> bool {
-        matches!(self, Mode::Composing { .. } | Mode::List | Mode::Picker | Mode::BasePick)
+        matches!(
+            self,
+            Mode::Composing { .. }
+                | Mode::ConfirmDelete { .. }
+                | Mode::List
+                | Mode::Picker
+                | Mode::BasePick
+        )
     }
 }
 
@@ -346,6 +397,7 @@ pub enum FooterAction {
     DeleteComment,
     JumpComment,
     ExpandFold,
+    HideUnchanged,
     /// Take the armed crossing: the hunk step that armed it leaves the file when pressed again.
     /// The direction names the destination and picks the key (`] next file`, `[ prev file`).
     CrossFile {
@@ -355,6 +407,7 @@ pub enum FooterAction {
     /// `MovePage` names the fixed page keys, which are not rebindable.
     MoveLine,
     MoveHunk,
+    MoveChange,
     MoveFile,
     MovePage,
     ExpandDir,
@@ -429,7 +482,9 @@ pub enum Band {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct App {
+    /// The exact Git top level in review mode, or the exact launch directory in Files-only mode.
     pub repo: PathBuf,
+    pub repository_mode: RepositoryMode,
     pub base: Option<String>,
     /// The `branch` scope's base outcome, carried by the latest landed snapshot — the
     /// header names its winner (or the skip) and the diff builds against the winner's OID
@@ -472,6 +527,12 @@ pub struct App {
     /// (expanded by default), expanded in `All files` (collapsed by default). Keyed by path,
     /// so it survives a poll that rebuilds the tree.
     toggled_dirs: HashSet<String>,
+    /// Cached direct Files-only directory listings, loading/error state, and stale-completion
+    /// epoch. This is tab state just like `toggled_dirs`.
+    raw_tree: RawTree,
+    /// Retained descriptor authority for the selected Files-only root. `repo` remains display
+    /// identity only in this mode; directory listings and file reads go through this capability.
+    files_root: Option<crate::world::FilesRoot>,
     /// The inactive tab's saved state, swapped in on a tab switch.
     stash: TabStash,
     /// The active scope's changed files, keyed by repo-relative path and recomputed every
@@ -507,6 +568,12 @@ pub struct App {
     /// content does not render as a preview: a non-markdown file, a notice, or an empty new
     /// side (a deleted or empty file). One half of the `previewable()` signal.
     preview_text: String,
+    /// A bounded raster preview derived from current raw bytes. It is mutually exclusive with
+    /// markdown preview and has no selectable/commentable source rows.
+    pub image_preview: Option<ImagePreview>,
+    /// Fixed, non-path-derived image failure copy. SVG is deliberately recognized but not
+    /// rasterized in v1; all render paths stay ordinary Ratatui cells.
+    pub image_preview_note: Option<&'static str>,
     /// The preview's maximum useful scroll (rendered lines minus the viewport), noted
     /// by the renderer each frame so [`Self::preview_scroll_by`] can clamp. `usize::MAX`
     /// until the first paint.
@@ -538,12 +605,24 @@ pub struct App {
     pub search_pct: u16,
     divider_drag: DividerDrag,
     pub select_anchor: Option<usize>,
+    /// Changes-only presentation preference. It projects context into expandable folds without
+    /// removing source rows, comments, or find coverage (`specs/diff-view.md`).
+    pub hide_unchanged: bool,
     pub store: CommentStore,
+    /// The ordinal currently highlighted in the list. It is presentation-only: actions resolve
+    /// `list_selected` by stable ID at the moment they execute.
     pub list_cursor: usize,
+    /// Exact selected comment in the list or on a card. It never aliases a different card after
+    /// a neighboring deletion.
+    pub comment_focus: Option<CommentId>,
+    /// First visible comments-list row. The renderer keeps the highlighted ordinal in this window.
+    pub list_scroll: std::cell::Cell<usize>,
     /// The picker's rows, frozen at the moment it opened. A refresh behind it adds, drops,
     /// and reorders nothing (`specs/herdr-host.md`).
     pub picker_rows: Vec<AgentChoice>,
     pub picker_cursor: usize,
+    /// A no-agent or unavailable-Herdr explanation shown by the send confirmation sheet.
+    pub picker_notice: Option<String>,
     /// The mode the picker opened over — `Normal`, the comments list, or the find band —
     /// so closing it restores the view the reviewer sent from (`specs/input.md`).
     pub picker_over: Mode,
@@ -653,28 +732,75 @@ enum PluginConfigState {
 
 impl App {
     pub fn new(repo: PathBuf, scope: Scope, base: Option<String>) -> Self {
-        Self::build(repo, scope, base, true)
+        let (repo, mode) = match git::toplevel(&repo) {
+            Some(root) => (root, RepositoryMode::GitReview),
+            None => (repo, RepositoryMode::FilesOnly),
+        };
+        Self::build(repo, mode, scope, base, true)
     }
 
-    /// Construct the error-only reviewr pane without reading repository state.
+    /// Construct the error-only pane without reading derived repository state.
+    #[cfg(test)]
     pub(crate) fn blocked(repo: PathBuf, scope: Scope, base: Option<String>) -> Self {
-        Self::build(repo, scope, base, false)
+        // Unit seams exercise the Git review projection without loading a repository.
+        Self::build(repo, RepositoryMode::GitReview, scope, base, false)
     }
 
-    fn build(repo: PathBuf, scope: Scope, base: Option<String>, load_turn: bool) -> Self {
-        // Mirror any persisted turn baseline for this worktree, so `last-turn` keeps its
-        // anchor across a reviewr pane restart. The worker's `TurnHost` owns the tracker; this
-        // mirror follows its completions (specs/herdr-host.md).
-        let turn_baseline = if load_turn { crate::world::seed_baseline(&repo) } else { None };
+    pub(crate) fn blocked_with_mode(
+        repo: PathBuf,
+        repository_mode: RepositoryMode,
+        scope: Scope,
+        base: Option<String>,
+    ) -> Self {
+        Self::build(repo, repository_mode, scope, base, false)
+    }
+
+    /// Construct from an already classified root. The runtime performs the one necessary Git
+    /// probe before this call; all Files-only refreshes thereafter remain filesystem-only.
+    pub(crate) fn new_with_mode(
+        repo: PathBuf,
+        repository_mode: RepositoryMode,
+        scope: Scope,
+        base: Option<String>,
+    ) -> Self {
+        Self::build(repo, repository_mode, scope, base, true)
+    }
+
+    fn build(
+        repo: PathBuf,
+        repository_mode: RepositoryMode,
+        scope: Scope,
+        base: Option<String>,
+        load_turn: bool,
+    ) -> Self {
+        // Mirror any persisted turn baseline for a Git worktree only. Files-only mode never
+        // touches Git refs or invokes Git after launch classification.
+        let turn_baseline = (load_turn && repository_mode == RepositoryMode::GitReview)
+            .then(|| crate::world::seed_baseline(&repo))
+            .flatten();
+        // Retain the selected root once. A failure stays Files-only and becomes a bounded root
+        // listing error; it never falls back to pathname-based filesystem access.
+        let files_root = (repository_mode == RepositoryMode::FilesOnly)
+            .then(|| crate::world::FilesRoot::open(&repo))
+            .and_then(Result::ok);
         let theme = theme::resolve(None);
         Self {
             repo,
+            repository_mode,
             base,
             branch_base: git::BaseStatus::default(),
             base_epoch: 0,
             scope,
-            tab: Tab::Changes,
-            active_file_tab: Tab::Changes,
+            tab: if repository_mode == RepositoryMode::FilesOnly {
+                Tab::AllFiles
+            } else {
+                Tab::Changes
+            },
+            active_file_tab: if repository_mode == RepositoryMode::FilesOnly {
+                Tab::AllFiles
+            } else {
+                Tab::Changes
+            },
             focus: Focus::Files,
             entries: Vec::new(),
             file_rows: Vec::new(),
@@ -685,11 +811,14 @@ impl App {
             armed_cross: None,
             resume_list: false,
             toggled_dirs: HashSet::new(),
+            raw_tree: RawTree::default(),
+            files_root,
             stash: TabStash::default(),
             changed: HashMap::new(),
             diff: FileDiff::empty(),
             visible: Vec::new(),
             expanded_folds: HashSet::new(),
+            hide_unchanged: false,
             diff_path: None,
             diff_cursor: 0,
             diff_scroll: 0,
@@ -698,6 +827,8 @@ impl App {
             preview: false,
             preview_scroll: 0,
             preview_text: String::new(),
+            image_preview: None,
+            image_preview_note: None,
             preview_max_scroll: std::cell::Cell::new(usize::MAX),
             preview_scrolled: false,
             pane_width: std::cell::Cell::new(0),
@@ -713,8 +844,11 @@ impl App {
             select_anchor: None,
             store: CommentStore::new(),
             list_cursor: 0,
+            comment_focus: None,
+            list_scroll: std::cell::Cell::new(0),
             picker_rows: Vec::new(),
             picker_cursor: 0,
+            picker_notice: None,
             picker_over: Mode::Normal,
             last_sent_pane: None,
             base_picker: None,
@@ -753,6 +887,17 @@ impl App {
             turn_baseline,
             agents_present: None,
         }
+    }
+
+    /// Whether this pane has the Git review domain. Files-only callers gate Git-only state
+    /// transitions here rather than treating an empty diff as a repository.
+    #[must_use]
+    pub fn is_git_review(&self) -> bool {
+        self.repository_mode == RepositoryMode::GitReview
+    }
+
+    fn files_only_unavailable(&mut self) {
+        self.status = "unavailable in Files-only mode".to_string();
     }
 
     /// Resolve `name` (a CLI or config value; `None` = default) and apply it when it changes:
@@ -840,8 +985,14 @@ impl App {
     /// comments always survive; an in-progress draft keeps the exact frozen diff it was written
     /// against, matching the ordinary refresh invariant.
     pub(crate) fn carry_authored_state_from(&mut self, old: &mut Self) {
+        // The Changes projection belongs to that tab even while `All files` is active, where
+        // it lives in the stash. Recovery rebuilds a fresh Changes frame first, then reapplies
+        // this user-held choice without borrowing the other tab's preference.
+        let changes_hide_unchanged = old.changes_hide_unchanged();
         self.store = std::mem::take(&mut old.store);
         self.list_cursor = old.list_cursor;
+        self.comment_focus = old.comment_focus;
+        self.list_scroll.set(old.list_scroll.get());
         // The footer expansion is one global toggle, carried regardless of the recovered mode
         // (`specs/input.md`).
         self.keys_expanded = old.keys_expanded;
@@ -868,7 +1019,7 @@ impl App {
             // restored and the picker's frozen rows are not either (specs/search.md,
             // specs/find-in-file.md, specs/herdr-host.md).
             Mode::Normal | Mode::Search | Mode::Find | Mode::Picker => {}
-            Mode::List | Mode::Composing { .. } | Mode::BasePick => {
+            Mode::List | Mode::Composing { .. } | Mode::ConfirmDelete { .. } | Mode::BasePick => {
                 self.scope = old.scope;
                 self.tab = old.tab;
                 self.active_file_tab = old.active_file_tab;
@@ -894,6 +1045,7 @@ impl App {
                 self.select_anchor = old.select_anchor;
                 self.resume_list = old.resume_list;
                 self.toggled_dirs = std::mem::take(&mut old.toggled_dirs);
+                self.raw_tree = std::mem::take(&mut old.raw_tree);
                 self.stash = std::mem::take(&mut old.stash);
                 self.wrap = old.wrap;
                 self.preview = old.preview;
@@ -908,6 +1060,42 @@ impl App {
                 self.base_picker = old.base_picker.take();
             }
         }
+        self.set_changes_hide_unchanged(changes_hide_unchanged);
+    }
+
+    /// The Changes tab's projection preference, whether it is the active file tab or stashed
+    /// behind `All files` (`specs/diff-view.md`).
+    fn changes_hide_unchanged(&self) -> bool {
+        if self.active_file_tab == Tab::Changes {
+            self.hide_unchanged
+        } else {
+            self.stash.hide_unchanged
+        }
+    }
+
+    /// Restore the Changes projection after config recovery without moving the reader away
+    /// from the source row they were on. A context row hidden by the projection reconciles to
+    /// the fold that now contains it, rather than retaining a stale numeric row index.
+    fn set_changes_hide_unchanged(&mut self, hide_unchanged: bool) {
+        if self.active_file_tab != Tab::Changes {
+            self.stash.hide_unchanged = hide_unchanged;
+            return;
+        }
+        if self.hide_unchanged == hide_unchanged {
+            return;
+        }
+        let current = self.visible.get(self.diff_cursor).cloned();
+        self.hide_unchanged = hide_unchanged;
+        self.rebuild_visible();
+        if let Some(current) = current
+            && let Some(cursor) = self.visible.iter().position(|candidate| {
+                candidate == &current
+                    || matches!(candidate, Row::Fold { lines } if lines.contains(&current))
+            })
+        {
+            self.diff_cursor = cursor;
+        }
+        self.settle_read();
     }
 
     fn config_snapshot(&self) -> &crate::config::PluginConfig {
@@ -1020,21 +1208,6 @@ impl App {
         if !self.tab.is_file_tab() {
             return Ok(());
         }
-        // Outside a git repo, show an empty state rather than failing (herdr-host.md).
-        if !git::is_repo(&self.repo) {
-            self.entries.clear();
-            self.changed.clear();
-            self.file_rows.clear();
-            self.file_cursor = 0;
-            self.file_scroll = 0;
-            if !self.composing() {
-                self.diff = FileDiff::empty();
-                self.diff_path = None;
-                self.visible.clear(); // keep `visible` mirroring `diff` so no stale rows paint
-                self.reset_diff_view();
-            }
-            return Ok(());
-        }
         let snapshot = crate::world::build(&self.world_input())?;
         self.reconcile_world(snapshot);
         Ok(())
@@ -1045,6 +1218,7 @@ impl App {
     pub fn world_input(&self) -> crate::world::WorldInput {
         crate::world::WorldInput {
             repo: self.repo.clone(),
+            repository_mode: self.repository_mode,
             tab: self.tab,
             scope: self.scope,
             base: self.base.clone(),
@@ -1057,6 +1231,128 @@ impl App {
             } else {
                 HashSet::new()
             },
+            raw_dirs: self.raw_request_dirs(),
+            files_root: self.files_root.clone(),
+            raw_tree_epoch: self.raw_tree.epoch,
+        }
+    }
+
+    /// Directories for the next Files-only world job. Root is always included. The currently
+    /// loading set has priority so a capped job drains user requests before refresh work.
+    fn raw_request_dirs(&self) -> BTreeSet<String> {
+        if self.repository_mode != RepositoryMode::FilesOnly {
+            return BTreeSet::new();
+        }
+        let mut candidates = BTreeSet::new();
+        candidates.insert(String::new());
+        for path in &self.raw_tree.loading {
+            if self.raw_dir_reachable(path) {
+                candidates.insert(path.clone());
+            }
+        }
+        for path in &self.toggled_dirs {
+            if self.dir_expanded(path) && self.raw_dir_reachable(path) {
+                candidates.insert(path.clone());
+            }
+        }
+        candidates.into_iter().take(RAW_DIR_BATCH_CAP).collect()
+    }
+
+    /// A nested raw directory may be listed only if each ancestor is a loaded, expanded real
+    /// directory. This rejects stale paths after a parent disappears and keeps collapsed cache
+    /// data from re-entering a request or the painted tree.
+    fn raw_dir_reachable(&self, path: &str) -> bool {
+        if path.is_empty() {
+            return true;
+        }
+        let Some((parent, _)) = path.rsplit_once('/') else {
+            return self.raw_tree.listings.get("").is_some_and(|entries| {
+                entries.iter().any(|entry| entry.is_dir && entry.path == path)
+            });
+        };
+        self.dir_expanded(parent)
+            && self.raw_tree.listings.get(parent).is_some_and(|entries| {
+                entries.iter().any(|entry| entry.is_dir && entry.path == path)
+            })
+            && self.raw_dir_reachable(parent)
+    }
+
+    /// Fold cached direct listings into exactly the root and descendants reachable through
+    /// currently expanded ancestors. This is the only Files-only tree materialization path.
+    fn materialized_raw_entries(&self) -> Vec<Entry> {
+        fn append(app: &App, path: &str, out: &mut Vec<Entry>) {
+            let Some(entries) = app.raw_tree.listings.get(path) else { return };
+            for entry in entries {
+                out.push(entry.clone());
+                if entry.is_dir && app.dir_expanded(&entry.path) {
+                    append(app, &entry.path, out);
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        append(self, "", &mut entries);
+        entries
+    }
+
+    /// Apply one Files-only batch. Successful reads replace only their own direct listing;
+    /// failed reads retain the known subtree and leave a retryable status for a never-loaded one.
+    fn apply_raw_listings(&mut self, listings: Vec<crate::world::DirectoryListing>) {
+        for listing in listings {
+            self.raw_tree.loading.remove(&listing.path);
+            match listing.entries {
+                Ok(entries) => {
+                    self.raw_tree.failed.remove(&listing.path);
+                    self.raw_tree.listings.insert(listing.path, entries);
+                    self.prune_raw_cache();
+                }
+                Err(error) => {
+                    let unknown = !self.raw_tree.listings.contains_key(&listing.path);
+                    self.raw_tree.failed.insert(listing.path.clone(), error);
+                    if unknown {
+                        self.status = format!(
+                            "could not read {}; press r to retry",
+                            raw_dir_label(&listing.path)
+                        );
+                    }
+                }
+            }
+        }
+        // The worker takes a bounded batch. Continue after its landing rather than enqueueing
+        // a wide/deep expansion sweep ahead of input.
+        if self.raw_tree.loading.iter().any(|path| self.raw_dir_reachable(path)) {
+            self.request_world_refresh(false, false);
+        }
+    }
+
+    /// Drop cached descendants only after a successful parent listing proves they no longer name
+    /// real directories. A failed listing never reaches here, so stale-but-known content remains.
+    fn prune_raw_cache(&mut self) {
+        loop {
+            let removed: Vec<String> = self
+                .raw_tree
+                .listings
+                .keys()
+                .filter(|path| !path.is_empty())
+                .filter(|path| {
+                    let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+                    self.raw_tree.listings.get(parent).is_some_and(|entries| {
+                        !entries.iter().any(|entry| entry.is_dir && entry.path == **path)
+                    })
+                })
+                .cloned()
+                .collect();
+            if removed.is_empty() {
+                break;
+            }
+            for path in removed {
+                let descendant_prefix = format!("{path}/");
+                self.raw_tree.listings.remove(&path);
+                self.raw_tree.loading.remove(&path);
+                self.raw_tree.failed.remove(&path);
+                self.toggled_dirs.retain(|candidate| {
+                    candidate != &path && !candidate.starts_with(&descendant_prefix)
+                });
+            }
         }
     }
 
@@ -1078,7 +1374,12 @@ impl App {
         let anchor = self.cursor_anchor();
         let open = self.diff_path.clone();
         self.changed = snapshot.changed;
-        self.entries = snapshot.entries;
+        if let Some(listings) = snapshot.raw_listings {
+            self.apply_raw_listings(listings);
+            self.entries = self.materialized_raw_entries();
+        } else {
+            self.entries = snapshot.entries;
+        }
         self.adopt_branch_base(snapshot.branch_base);
         self.rebuild_file_rows();
         self.file_cursor = anchor
@@ -1093,7 +1394,7 @@ impl App {
         // beneath the writer, reset the scroll and selection under the overlay, or move the
         // reviewer's place while they choose an agent (`Mode::is_modal`, overview.md Continuity).
         // The file list still updates above (specs/tui.md).
-        if !self.mode.is_modal() {
+        if !self.mode.is_modal() && self.select_anchor.is_none() {
             // A poll keeps the reader on the same file; only a different shown file resets
             // the diff view to the top. It also drops an armed crossing, which was armed at the
             // edge of a file that is no longer the one on screen (specs/input.md).
@@ -1119,9 +1420,19 @@ impl App {
     /// content in `All files`. Both flatten into `visible` and settle the cursor/scroll.
     fn load_read(&mut self) {
         let Some(entry) = self.shown_entry() else {
+            // One atomic unavailable-reader transition: no old source, markdown, or image
+            // payload may survive an emptied/removed selection (`diff-view.md` Continuity).
             self.diff = FileDiff::empty();
             self.diff_path = None;
             self.visible.clear();
+            self.preview_text.clear();
+            self.image_preview = None;
+            self.image_preview_note = None;
+            self.clear_selection();
+            self.comment_focus = None;
+            if matches!(self.mode, Mode::ConfirmDelete { .. }) {
+                self.mode = Mode::Normal;
+            }
             self.reset_diff_view();
             return;
         };
@@ -1152,8 +1463,11 @@ impl App {
             self.preview_scroll = 0;
             self.preview_max_scroll.set(usize::MAX);
         }
+        self.image_preview = None;
+        self.image_preview_note = None;
         self.diff_path = Some(path.clone());
         let (old, new) = self.content_sides(&path, previous_path.as_deref());
+        self.load_current_image_preview(&path);
         self.diff = self.cache.get(path, previous_path, &old, &new, &self.highlighter);
         // Hold the new side as the preview's render input, the same current content the File
         // view previews. A non-markdown file, a notice, or a deleted file (empty new side)
@@ -1170,6 +1484,13 @@ impl App {
     /// Build the File view for `path`: its current worktree content as `Context` rows, no
     /// folds. The `All files` read pane (specs/diff-view.md). Content is scope-independent.
     fn set_file_view(&mut self, path: &str) {
+        self.set_file_view_with(path, None);
+    }
+
+    /// Set the File view from an optional descriptor-relative read already made for a selected
+    /// Files-only search result. Reusing that read closes the preflight-to-open race: a result
+    /// that becomes unavailable never leaves search for an empty replacement view.
+    fn set_file_view_with(&mut self, path: &str, prepared: Option<(FileDiff, String)>) {
         // Opening a different file starts in source; a same-file refresh keeps the
         // preview choice and its scroll (specs/diff-view.md).
         if self.diff_path.as_deref() != Some(path) {
@@ -1177,9 +1498,11 @@ impl App {
             self.preview_scroll = 0;
             self.preview_max_scroll.set(usize::MAX);
         }
+        self.image_preview = None;
+        self.image_preview_note = None;
         self.diff_path = Some(path.to_string());
         self.expanded_folds.clear(); // the File view has no folds
-        let (diff, content) = self.file_view(path);
+        let (diff, content) = prepared.unwrap_or_else(|| self.file_view(path));
         // Keep the preview's render input current without a per-frame rebuild. A file the
         // source view degrades to a notice never previews (specs/diff-view.md), so its
         // content is not held either.
@@ -1189,6 +1512,7 @@ impl App {
             self.preview_text.clear();
         }
         self.diff = diff;
+        self.load_current_image_preview(path);
         self.rebuild_visible();
         self.settle_read();
     }
@@ -1201,6 +1525,15 @@ impl App {
     /// raw content (specs/diff-view.md). The one build the source view and the search
     /// preview share.
     fn file_view(&mut self, path: &str) -> (FileDiff, String) {
+        if self.repository_mode == RepositoryMode::FilesOnly {
+            return self.files_only_file_view(path).unwrap_or_else(|| {
+                // A disappeared, replaced, or unreadable Files-only file has no pathname
+                // fallback. Its empty read pane is bounded to the retained capability.
+                let content = String::new();
+                let diff = self.cache.get_file(path.to_string(), &content, &self.highlighter);
+                (diff, content)
+            });
+        }
         let oversize = std::fs::metadata(self.repo.join(path))
             .is_ok_and(|m| crate::diff::over_byte_budget(m.len() as usize));
         if oversize {
@@ -1209,6 +1542,71 @@ impl App {
             let content = worktree_content(&self.repo, path);
             let diff = self.cache.get_file(path.to_string(), &content, &self.highlighter);
             (diff, content)
+        }
+    }
+
+    /// Build one Files-only File view through the retained descriptor authority. `None` means
+    /// the exact relative target no longer resolves to a regular, no-follow file below the root.
+    fn files_only_file_view(&mut self, path: &str) -> Option<(FileDiff, String)> {
+        // The descriptor read uses the image cap so a valid image is not rejected by the smaller
+        // text budget. Non-images retain the text-view limit below.
+        match self.files_root.as_ref()?.read_file(path, image_preview::MAX_SOURCE_BYTES).ok()? {
+            crate::world::RawFile::TooLarge => {
+                Some((FileDiff::too_large_notice(path.to_string()), String::new()))
+            }
+            crate::world::RawFile::Content(bytes) => {
+                self.set_image_preview(&bytes);
+                if !self.image_view_active() && crate::diff::over_byte_budget(bytes.len()) {
+                    return Some((FileDiff::too_large_notice(path.to_string()), String::new()));
+                }
+                let content = String::from_utf8_lossy(&bytes).into_owned();
+                let diff = self.cache.get_file(path.to_string(), &content, &self.highlighter);
+                Some((diff, content))
+            }
+        }
+    }
+
+    /// Establish a bounded image-only read for the current worktree file. Files-only remains
+    /// descriptor-relative; Git review gets a separate capped raw reader and never reuses the
+    /// lossy text path.
+    fn load_current_image_preview(&mut self, path: &str) {
+        if self.repository_mode == RepositoryMode::FilesOnly {
+            // `files_only_file_view` already supplied authoritative bytes. Changes calls this
+            // directly, so reopen only through the retained root capability.
+            if self.tab == Tab::Changes
+                && let Some(root) = &self.files_root
+                && let Ok(crate::world::RawFile::Content(bytes)) =
+                    root.read_file(path, image_preview::MAX_SOURCE_BYTES)
+            {
+                self.set_image_preview(&bytes);
+            }
+            return;
+        }
+        if let Ok(bytes) = bounded_worktree_bytes(&self.repo, path, image_preview::MAX_SOURCE_BYTES)
+        {
+            self.set_image_preview(&bytes);
+        }
+    }
+
+    fn set_image_preview(&mut self, bytes: &[u8]) {
+        match image_preview::decode(bytes) {
+            Ok(preview) => self.image_preview = Some(preview),
+            Err(ImagePreviewError::SvgUnavailable) => {
+                self.image_preview_note = Some("SVG preview unavailable");
+            }
+            Err(ImagePreviewError::TooLarge) => self.image_preview_note = Some("image too large"),
+            Err(ImagePreviewError::Malformed) => {
+                self.image_preview_note = Some("unsupported image format");
+            }
+            Err(ImagePreviewError::NotImage) => return,
+        }
+        // Images have no source rows. A modal/comment focus authored before a refresh must not
+        // survive as an invisible action against the newly non-text reader.
+        self.clear_selection();
+        self.comment_focus = None;
+        self.find = None;
+        if matches!(self.mode, Mode::ConfirmDelete { .. } | Mode::Composing { .. } | Mode::Find) {
+            self.mode = Mode::Normal;
         }
     }
 
@@ -1230,10 +1628,10 @@ impl App {
         self.select_anchor = self.select_anchor.map(|a| a.min(last));
     }
 
-    /// Flatten `diff.rows` into `visible`: an expanded fold becomes its lines, a
-    /// collapsed fold stays a single marker row.
+    /// Project source rows into the displayed diff. Hide-unchanged turns every contiguous
+    /// context run into an independently expandable fold; it is a projection, never data loss.
     fn rebuild_visible(&mut self) {
-        self.visible = self
+        let normal: Vec<Row> = self
             .diff
             .rows
             .iter()
@@ -1246,6 +1644,33 @@ impl App {
                 _ => vec![row.clone()],
             })
             .collect();
+        if !self.hide_unchanged || self.tab != Tab::Changes {
+            self.visible = normal;
+            return;
+        }
+        let mut projected = Vec::new();
+        let mut context = Vec::new();
+        let flush = |projected: &mut Vec<Row>, context: &mut Vec<Row>, expanded: &HashSet<u32>| {
+            if context.is_empty() {
+                return;
+            }
+            let anchor = context[0].new_no().or_else(|| context[0].old_no());
+            if anchor.is_some_and(|a| expanded.contains(&a)) {
+                projected.append(context);
+            } else {
+                projected.push(Row::Fold { lines: std::mem::take(context) });
+            }
+        };
+        for row in normal {
+            if matches!(row, Row::Context { .. }) {
+                context.push(row);
+            } else {
+                flush(&mut projected, &mut context, &self.expanded_folds);
+                projected.push(row);
+            }
+        }
+        flush(&mut projected, &mut context, &self.expanded_folds);
+        self.visible = projected;
     }
 
     /// Expand the fold under the cursor, revealing its hidden lines. Expansion is
@@ -1280,6 +1705,19 @@ impl App {
     /// merge-base on the branch scope), new from the worktree. A rename reads its old side
     /// from `previous_path`, so the diff shows real edits, not a wholesale delete-and-add.
     fn content_sides(&self, path: &str, previous_path: Option<&str>) -> (String, String) {
+        if !self.is_git_review() {
+            let content = self
+                .files_root
+                .as_ref()
+                .and_then(|root| match root.read_file(path, crate::diff::MAX_BYTES) {
+                    Ok(crate::world::RawFile::Content(bytes)) => {
+                        Some(String::from_utf8_lossy(&bytes).into_owned())
+                    }
+                    Ok(crate::world::RawFile::TooLarge) | Err(_) => None,
+                })
+                .unwrap_or_default();
+            return (String::new(), content);
+        }
         let new_path = path;
         let old_path = previous_path.unwrap_or(new_path);
         match self.scope {
@@ -1353,6 +1791,14 @@ impl App {
     /// `sample` rides the poll's status sample along; `reveal` re-reveals the cursor when
     /// the result lands, for user-initiated switches only (specs/tui.md).
     pub fn request_world_refresh(&mut self, sample_turn: bool, reveal: bool) {
+        if self.repository_mode == RepositoryMode::FilesOnly {
+            self.raw_tree.loading.insert(String::new());
+            for path in self.toggled_dirs.clone() {
+                if self.dir_expanded(&path) && self.raw_dir_reachable(&path) {
+                    self.raw_tree.loading.insert(path);
+                }
+            }
+        }
         let request = self.world_request.get_or_insert(crate::world::WorldRequest::default());
         request.sample_turn |= sample_turn;
         request.reveal |= reveal;
@@ -1370,7 +1816,7 @@ impl App {
     /// while wrap is on, since the renderer ignores `h_scroll` when wrapping — so the offset
     /// never silently accumulates and then jumps the view when wrap is toggled off.
     pub fn scroll_h(&mut self, delta: isize) {
-        if self.wrap || self.preview_active() {
+        if self.wrap || self.preview_active() || self.image_view_active() {
             return;
         }
         self.h_scroll = if delta >= 0 {
@@ -1382,7 +1828,7 @@ impl App {
 
     /// Toggle line wrap; reset the horizontal scroll, which only applies with wrap off.
     pub fn toggle_wrap(&mut self) {
-        if self.preview_active() {
+        if self.preview_active() || self.image_view_active() {
             return; // the wrap toggle is inert in the preview (specs/diff-view.md)
         }
         self.wrap = !self.wrap;
@@ -1416,10 +1862,20 @@ impl App {
         self.previewable() && self.preview
     }
 
+    /// Whether the read pane is an image raster or fixed image fallback rather than source rows.
+    /// This is the one gate for source-only interactions (specs/diff-view.md).
+    #[must_use]
+    pub fn image_view_active(&self) -> bool {
+        self.image_preview.is_some() || self.image_preview_note.is_some()
+    }
+
     /// Toggle source ↔ preview on a markdown file in a file tab; inert anywhere else.
     /// Entering clears a live selection and opens at the cursor's block; returning in the
     /// File view maps the top visible block back to a source cursor (specs/diff-view.md).
     pub fn toggle_preview(&mut self) {
+        if self.image_view_active() {
+            return;
+        }
         // A file whose source view shows a notice, or a deleted file with no current
         // content, is not previewable, so the title can never claim a preview over a
         // notice (specs/diff-view.md).
@@ -1818,7 +2274,11 @@ impl App {
     /// in progress is never stranded against a different diff.
     pub fn set_scope(&mut self, scope: Scope) -> Result<()> {
         self.ensure_config_ready()?;
-        if self.scope != scope && !self.composing() {
+        if !self.is_git_review() {
+            self.files_only_unavailable();
+            return Ok(());
+        }
+        if self.scope != scope && !self.composing() && self.select_anchor.is_none() {
             self.scope = scope;
             self.rebase_changes()?;
             // An explicit switch reveals the cursor (a poll does not).
@@ -1872,7 +2332,9 @@ impl App {
     /// Queue a PR refresh, merging into any request already pending: the stronger kind
     /// wins, so an ambient trigger can never downgrade the user's commanded refresh.
     pub fn request_pr_refresh(&mut self, kind: RefreshKind) {
-        self.pr_pending = self.pr_pending.max(Some(kind));
+        if self.is_git_review() {
+            self.pr_pending = self.pr_pending.max(Some(kind));
+        }
     }
 
     /// Switch to `tab`, saving the active tab's navigator and read-pane state and restoring the
@@ -1883,7 +2345,11 @@ impl App {
     /// stays on the same side.
     pub fn set_tab(&mut self, tab: Tab) -> Result<()> {
         self.ensure_config_ready()?;
-        if self.tab == tab || self.composing() {
+        if !self.is_git_review() && tab != Tab::AllFiles {
+            self.files_only_unavailable();
+            return Ok(());
+        }
+        if self.tab == tab || self.composing() || self.select_anchor.is_some() {
             return Ok(());
         }
         self.tab = tab;
@@ -2117,6 +2583,7 @@ impl App {
     /// tab's selection or scroll into the other.
     fn swap_active_with_stash(&mut self) {
         std::mem::swap(&mut self.entries, &mut self.stash.entries);
+        std::mem::swap(&mut self.raw_tree, &mut self.stash.raw_tree);
         std::mem::swap(&mut self.file_rows, &mut self.stash.file_rows);
         std::mem::swap(&mut self.file_cursor, &mut self.stash.file_cursor);
         std::mem::swap(&mut self.file_scroll, &mut self.stash.file_scroll);
@@ -2129,9 +2596,12 @@ impl App {
         std::mem::swap(&mut self.diff_scroll, &mut self.stash.diff_scroll);
         std::mem::swap(&mut self.h_scroll, &mut self.stash.h_scroll);
         std::mem::swap(&mut self.select_anchor, &mut self.stash.select_anchor);
+        std::mem::swap(&mut self.hide_unchanged, &mut self.stash.hide_unchanged);
         std::mem::swap(&mut self.preview, &mut self.stash.preview);
         std::mem::swap(&mut self.preview_scroll, &mut self.stash.preview_scroll);
         std::mem::swap(&mut self.preview_text, &mut self.stash.preview_text);
+        std::mem::swap(&mut self.image_preview, &mut self.stash.image_preview);
+        std::mem::swap(&mut self.image_preview_note, &mut self.stash.image_preview_note);
         std::mem::swap(&mut self.preview_scrolled, &mut self.stash.preview_scrolled);
         std::mem::swap(&mut self.tab_visited, &mut self.stash.visited);
     }
@@ -2157,6 +2627,12 @@ impl App {
     /// reuse this with a larger `delta`, since paging is just a bigger cursor move in the focus.
     pub fn move_cursor(&mut self, delta: isize) -> Result<()> {
         self.ensure_config_ready()?;
+        if self.focus == Focus::Diff && self.image_view_active() {
+            return Ok(());
+        }
+        if self.select_anchor.is_some() && self.focus == Focus::Files {
+            return Ok(());
+        }
         match self.focus {
             Focus::Files => {
                 if !self.file_rows.is_empty() {
@@ -2223,7 +2699,7 @@ impl App {
         self.reveal_files = true;
     }
 
-    /// `next-hunk`: jump to the nearest hunk below the cursor (`specs/input.md`).
+    /// `next-hunk`: jump to the nearest change run below the cursor (`specs/input.md`).
     pub fn next_hunk(&mut self) {
         self.step_hunk(true);
     }
@@ -2238,9 +2714,17 @@ impl App {
     /// stops at each file. Only `Changes` paints change rows — `All files` is all context, and
     /// the preview has no cursor — so a step anywhere else has no target (`specs/input.md`).
     fn step_hunk(&mut self, forward: bool) {
+        if !self.is_git_review() {
+            self.files_only_unavailable();
+            return;
+        }
         // Any step drops the standing arm. A step the other way is not the repeat it waits for.
         let armed = self.armed_cross.take().filter(|a| a.forward == forward);
-        if !self.can_traverse() || self.tab != Tab::Changes || self.preview_active() {
+        if !self.can_traverse()
+            || self.tab != Tab::Changes
+            || self.preview_active()
+            || self.image_view_active()
+        {
             return;
         }
         if let Some(row) = hunk_row(&self.visible, Some(self.diff_cursor), forward) {
@@ -2274,6 +2758,67 @@ impl App {
         self.reveal_diff = true;
     }
 
+    /// Step exactly one added or removed source row, crossing to the nearest changed row in an
+    /// adjacent file when needed. Change-run traversal remains independent for compatibility.
+    pub fn step_change(&mut self, forward: bool) {
+        if !self.is_git_review() {
+            self.files_only_unavailable();
+            return;
+        }
+        if !self.can_traverse()
+            || self.tab != Tab::Changes
+            || self.preview_active()
+            || self.image_view_active()
+        {
+            return;
+        }
+        let range: Box<dyn Iterator<Item = usize>> = if forward {
+            Box::new(self.diff_cursor.saturating_add(1)..self.visible.len())
+        } else {
+            Box::new((0..self.diff_cursor).rev())
+        };
+        if let Some(i) = range.into_iter().find(|&i| is_change(&self.visible[i])) {
+            self.diff_cursor = i;
+            self.reveal_diff = true;
+            return;
+        }
+        let mut row = self.open_file_row();
+        while let Some(next) = self.file_row_from(row, forward) {
+            row = next;
+            self.file_cursor = row;
+            self.open_cursor_file();
+            let pick = if forward {
+                (0..self.visible.len()).find(|&i| is_change(&self.visible[i]))
+            } else {
+                (0..self.visible.len()).rev().find(|&i| is_change(&self.visible[i]))
+            };
+            if let Some(i) = pick {
+                self.diff_cursor = i;
+                self.reveal_files = true;
+                self.reveal_diff = true;
+                return;
+            }
+        }
+    }
+
+    /// Toggle Changes-only context projection. A live selection or non-source view holds its
+    /// exact visible identity, so the control is deliberately inert there.
+    pub fn toggle_hide_unchanged(&mut self) {
+        if !self.is_git_review() {
+            self.files_only_unavailable();
+            return;
+        }
+        if self.tab != Tab::Changes
+            || self.preview_active()
+            || self.image_view_active()
+            || self.select_anchor.is_some()
+            || self.diff.state != crate::diff::FileState::Normal
+        {
+            return;
+        }
+        self.set_changes_hide_unchanged(!self.hide_unchanged);
+    }
+
     /// The row of the nearest file a crossing would open: the first one that has a hunk. A file
     /// with no hunk — a binary, a pure rename, an over-budget notice — is crossed over, so a
     /// crossing always lands on a change. `None` when no such file lies that way.
@@ -2294,8 +2839,9 @@ impl App {
             // An over-budget file renders a notice, so it holds no hunk either. Check the size
             // before reading, as `set_file_view` does: pulling a vendored bundle in whole would
             // spike the UI thread for a file the reviewer only crosses over.
-            if std::fs::metadata(self.repo.join(&entry.path))
-                .is_ok_and(|m| crate::diff::over_byte_budget(m.len() as usize))
+            if self.is_git_review()
+                && std::fs::metadata(self.repo.join(&entry.path))
+                    .is_ok_and(|m| crate::diff::over_byte_budget(m.len() as usize))
             {
                 continue;
             }
@@ -2355,7 +2901,7 @@ impl App {
     /// Whether the traversal keys act at all: a live selection holds the cursor still, since a
     /// jump would silently drop the selection under it (`specs/input.md`).
     fn can_traverse(&self) -> bool {
-        self.plugin_config().is_some() && self.select_anchor.is_none()
+        self.plugin_config().is_some() && self.select_anchor.is_none() && !self.image_view_active()
     }
 
     /// The open file's row, the origin of every traversal the diff drives. Falls back to the
@@ -2380,21 +2926,78 @@ impl App {
         }
     }
 
-    /// Act on the file-list row at `index` (a mouse click): a file opens its diff, a
-    /// directory toggles its expansion.
+    /// Act on a whole file-list row. A directory click selects it and toggles its expansion;
+    /// a file click selects and opens it (`specs/file-list.md`).
     pub fn select_file(&mut self, index: usize) -> Result<()> {
         self.ensure_config_ready()?;
+        if self.select_anchor.is_some() {
+            // Keep the anchor authoritative, but make the mouse no-op legible rather than
+            // looking like a missed click (`specs/file-list.md` Selection).
+            "clear selection before opening a file".clone_into(&mut self.status);
+            return Ok(());
+        }
         if index >= self.file_rows.len() {
             return Ok(());
         }
         self.focus = Focus::Files;
         self.file_cursor = index;
         self.reveal_files = true;
-        match self.file_rows[index].kind {
-            RowKind::File { .. } => self.open_cursor_file(),
-            RowKind::Dir { .. } => self.toggle_dir(),
+        if self.on_folder() {
+            self.toggle_dir();
+        } else {
+            self.open_cursor_file();
         }
         Ok(())
+    }
+
+    /// Expand the directory under the cursor, or move onto its first visible child when it is
+    /// already open. This is the tree's fixed `→` control (`specs/input.md`).
+    pub fn right_dir(&mut self) {
+        let Some(path) = self.dir_under_cursor() else { return };
+        if !self.dir_expanded(&path) {
+            self.expand_dir();
+            return;
+        }
+        let depth = self.file_rows[self.file_cursor].depth;
+        if self.file_rows.get(self.file_cursor + 1).is_some_and(|row| row.depth > depth) {
+            // The next visible indented row is the first child. Use normal cursor movement so
+            // selecting a file still opens it and reveal behavior stays centralized.
+            let _ = self.move_cursor(1);
+        }
+    }
+
+    /// Collapse the directory under the cursor, or move to its nearest visible parent after it
+    /// is already closed. This is the tree's fixed `←` control (`specs/input.md`).
+    pub fn left_dir(&mut self) {
+        let path = if let Some(path) = self.dir_under_cursor() {
+            if self.dir_expanded(&path) {
+                self.collapse_dir();
+                return;
+            }
+            path
+        } else if let Some(index) = self.file_under_cursor_index() {
+            self.entries[index].path.clone()
+        } else {
+            return;
+        };
+        if let Some(parent) = self.file_rows[..self.file_cursor].iter().rposition(|row| {
+            row.dir_path().is_some_and(|candidate| {
+                path.strip_prefix(candidate).is_some_and(|rest| rest.starts_with('/'))
+            })
+        }) {
+            self.file_cursor = parent;
+            self.reveal_files = true;
+        }
+    }
+
+    /// Activate the current navigator row. Directories toggle like a whole-row mouse click;
+    /// files are selected already, so activation simply ensures their read pane is loaded.
+    pub fn activate_file_row(&mut self) {
+        if self.on_folder() {
+            self.toggle_dir();
+        } else if self.focus == Focus::Files {
+            self.open_cursor_file();
+        }
     }
 
     /// Collapse or expand the directory under the cursor, then rebuild the tree. The cursor
@@ -2469,11 +3072,24 @@ impl App {
 
     /// Rebuild the tree after a directory's expansion changed, keeping the cursor in range.
     fn apply_dir_change(&mut self) {
-        // In `All files`, expanding an ignored directory loads its children lazily, so the
-        // entry set is rebuilt before the rows (file-list.md). Other tabs just re-flatten.
-        if self.tab == Tab::AllFiles
+        if self.repository_mode == RepositoryMode::FilesOnly {
+            // Expansion is authored place state. It never reads the filesystem on the event
+            // loop; its one-level listing is requested after this frame paints.
+            self.raw_tree.epoch = self.raw_tree.epoch.wrapping_add(1);
+            if let Some(path) = self.dir_under_cursor() {
+                if self.dir_expanded(&path) && !self.raw_tree.listings.contains_key(&path) {
+                    self.raw_tree.loading.insert(path.clone());
+                    self.status = format!("loading {}", raw_dir_label(&path));
+                } else if !self.dir_expanded(&path) {
+                    self.raw_tree.loading.remove(&path);
+                }
+            }
+            self.entries = self.materialized_raw_entries();
+            self.request_world_refresh(false, true);
+        } else if self.tab == Tab::AllFiles
             && let Ok(entries) = crate::world::all_files_entries(&self.world_input(), &self.changed)
         {
+            // Git review retains its existing ignored-directory lazy listing behavior.
             self.entries = entries;
         }
         self.rebuild_file_rows();
@@ -2485,6 +3101,9 @@ impl App {
     /// so wheeling to read context never moves what a comment will attach to. The upper
     /// bound is applied each frame by `bound_diff_scroll`.
     pub fn wheel_diff(&mut self, delta: isize) {
+        if self.image_view_active() {
+            return;
+        }
         if self.preview_active() {
             self.preview_scroll_by(delta);
             return;
@@ -2506,11 +3125,16 @@ impl App {
 
     /// Extend a mouse drag-selection to the diff line at `index`, anchoring on first drag.
     pub fn drag_select_to(&mut self, index: usize) {
-        if index < self.visible.len() {
+        if !self.is_git_review() || self.preview_active() || self.image_view_active() {
+            return;
+        }
+        if index < self.visible.len() && self.visible[index].is_content() {
             self.focus = Focus::Diff;
             let anchor = *self.select_anchor.get_or_insert(self.diff_cursor);
-            self.diff_cursor = self.fold_clamped(anchor, index);
-            self.reveal_diff = true;
+            if self.visible.get(anchor).is_some_and(Row::is_content) {
+                self.diff_cursor = self.fold_clamped(anchor, index);
+                self.reveal_diff = true;
+            }
         }
     }
 
@@ -2530,16 +3154,19 @@ impl App {
 
     /// Toggle a range-selection anchor at the current diff line.
     pub fn toggle_select(&mut self) {
-        if self.preview_active() {
-            return; // the preview is read-only (specs/diff-view.md)
+        if !self.is_git_review()
+            || self.preview_active()
+            || self.image_view_active()
+            || self.focus != Focus::Diff
+            || !self.visible.get(self.diff_cursor).is_some_and(Row::is_content)
+        {
+            return;
         }
-        if self.focus == Focus::Diff && !self.visible.is_empty() {
-            self.select_anchor = match self.select_anchor {
-                Some(_) => None,
-                None => Some(self.diff_cursor),
-            };
-            self.reveal_diff = true;
-        }
+        self.select_anchor = match self.select_anchor {
+            Some(_) => None,
+            None => Some(self.diff_cursor),
+        };
+        self.reveal_diff = true;
     }
 
     /// Drop the range-selection anchor (the `esc` clear in the diff); a no-op when none is set.
@@ -2559,10 +3186,20 @@ impl App {
     }
 
     pub fn start_comment(&mut self) {
-        if self.preview_active() {
-            return; // the preview is read-only (specs/diff-view.md)
+        if !self.is_git_review() {
+            self.files_only_unavailable();
+            return;
         }
-        if self.focus == Focus::Diff && self.has_anchorable_selection() {
+        if self.preview_active() || self.image_view_active() {
+            return; // image and markdown previews are read-only (specs/diff-view.md)
+        }
+        if self.focus == Focus::Diff
+            && self.visible.get(self.diff_cursor).is_some_and(Row::is_content)
+        {
+            // `c` from browse creates the same singleton selection as a one-line drag.
+            if self.select_anchor.is_none() {
+                self.select_anchor = Some(self.diff_cursor);
+            }
             self.reveal_diff = true; // scroll the anchored line into view before the box opens
             self.input.clear();
             self.caret = 0;
@@ -2572,56 +3209,80 @@ impl App {
     }
 
     pub fn start_edit(&mut self) {
-        // Cards don't show in the preview, so `e` on the invisible source cursor is inert;
-        // an edit reached through the comments-list overlay drops back to source, where
-        // the composer and its anchor are visible (specs/diff-view.md).
-        if self.preview_active() && self.mode != Mode::List {
+        if self.image_view_active() {
             return;
         }
-        // Editing from the comments-list overlay returns there on finish (else to the diff).
+        if !self.is_git_review() {
+            self.files_only_unavailable();
+            return;
+        }
         let from_list = self.mode == Mode::List;
-        let Some(i) = self.target_comment() else { return };
-        let Some(c) = self.store.get(i) else { return };
-        self.preview = false;
-        let (file, side, start, end, text) =
-            (c.file.clone(), c.side, c.start, c.end, c.text.clone());
+        let Some(id) = self.target_comment() else { return };
+        self.start_edit_id(id, from_list);
+    }
 
-        // Bring the comment's file into the diff and land the cursor on its line, so the
-        // inline edit box opens over the comment — even when editing from the list, and even
-        // when the file's row is hidden inside a collapsed directory (load it by path, not by
-        // tree row). Move the list cursor onto its row when one exists.
+    /// Open the exact card the pointer hit. The UI carries its stable `CommentId`, never the
+    /// store's mutable vector position.
+    pub fn start_edit_comment(&mut self, id: CommentId) {
+        if self.image_view_active() {
+            return;
+        }
+        self.comment_focus = Some(id);
+        self.start_edit_id(id, false);
+    }
+
+    fn start_edit_id(&mut self, id: CommentId, from_list: bool) {
+        if !self.is_git_review()
+            || self.image_view_active()
+            || (self.preview_active() && !from_list)
+        {
+            return;
+        }
+        let Some(c) = self.store.get(id) else { return };
+        let (file, text, owning_tab) = (
+            c.file.clone(),
+            c.text.clone(),
+            if c.diff_anchored { Tab::Changes } else { Tab::AllFiles },
+        );
+
+        // A list item must enter the representation that authored it. In particular, a Changes
+        // anchor cannot be revealed against matching File-view line numbers, or vice versa.
+        if self.tab != owning_tab && self.set_tab(owning_tab).is_err() {
+            self.status = "could not open comment view".to_string();
+            return;
+        }
+        self.preview = false;
         if self.diff_path.as_deref() != Some(file.as_str())
             && let Some(e) = self.entries.iter().find(|e| e.path == file).cloned()
         {
             self.reset_diff_view();
-            // Open it in the active tab's view — the File view on `All files`, not a diff — so
-            // the pane and the comment's anchor kind stay consistent with the tab.
             self.open_path_in_tab(e.path, e.previous_path);
             if let Some(fi) = self.file_row_of_path(&file) {
                 self.file_cursor = fi;
             }
         }
-        // Only move the cursor when the open diff is actually the comment's file, so a
-        // stale comment (file gone from the changeset) never jumps the cursor onto a
-        // same-numbered line in a different file.
-        if self.diff_path.as_deref() == Some(file.as_str())
-            && let Some(idx) = self.visible.iter().position(|row| {
-                let no = match side {
-                    Side::New => row.new_no(),
-                    Side::Old => row.old_no(),
-                };
-                no.is_some_and(|n| start <= n && n <= end)
-            })
-        {
-            self.diff_cursor = idx;
-            self.select_anchor = None;
-        }
+
+        let resolved = self
+            .store
+            .get(id)
+            .filter(|comment| self.diff_path.as_deref() == Some(comment.file.as_str()))
+            .filter(|comment| self.comment_in_view(comment))
+            .and_then(|comment| resolve_comment_anchor(comment, &self.visible));
+        let Some(last) = resolved else {
+            // A stale anchor remains safely stored and exportable, but no editor is rendered
+            // below a merely same-numbered replacement line. It can be inspected in the list.
+            self.status = "comment is STALE — anchor no longer visible".to_string();
+            return;
+        };
+        self.diff_cursor = last;
+        self.select_anchor = None;
+        self.comment_focus = Some(id);
         self.focus = Focus::Diff;
-        self.reveal_diff = true; // scroll the edited line into view before the box opens
-        self.caret = text.chars().count(); // edit opens with the caret at the end
+        self.reveal_diff = true;
+        self.caret = text.chars().count();
         self.input = text;
         self.resume_list = from_list;
-        self.mode = Mode::Composing { editing: Some(i) };
+        self.mode = Mode::Composing { editing: Some(id) };
     }
 
     // --- text editing: a character caret into the active field ----------------------------
@@ -2638,7 +3299,7 @@ impl App {
             Mode::Search => self.search.as_mut().map(|s| (&mut s.query, &mut s.caret)),
             Mode::Find => self.find.as_mut().map(|f| (&mut f.query, &mut f.caret)),
             Mode::BasePick => self.base_picker.as_mut().map(|b| (&mut b.query, &mut b.caret)),
-            Mode::Normal | Mode::List | Mode::Picker => None,
+            Mode::Normal | Mode::ConfirmDelete { .. } | Mode::List | Mode::Picker => None,
         }
     }
 
@@ -2786,6 +3447,11 @@ impl App {
     }
 
     pub fn cancel_comment(&mut self) {
+        // Cancelling a new draft returns to Browse, so the implicit singleton selection made by
+        // `c` cannot linger as a hidden gesture.
+        if matches!(self.mode, Mode::Composing { editing: None }) {
+            self.select_anchor = None;
+        }
         self.leave_compose();
     }
 
@@ -2813,9 +3479,9 @@ impl App {
             return;
         }
         match editing {
-            Some(i) => {
-                logln!("comment edit [{i}] :: {text}");
-                self.store.edit(i, text);
+            Some(id) => {
+                logln!("comment edit [{:?}] :: {text}", id);
+                self.store.edit(id, text);
                 self.status = "comment updated".to_string();
             }
             None => {
@@ -2830,17 +3496,29 @@ impl App {
         self.leave_compose();
     }
 
-    /// Whether the selection has at least one content row a comment can attach to —
-    /// a fold marker does not qualify.
-    fn has_anchorable_selection(&self) -> bool {
-        let (lo, hi) = self.selection_range();
-        self.visible.get(lo..=hi).is_some_and(|s| s.iter().any(Row::is_content))
-    }
-
     /// The `(side, start, end, snippet)` the current selection anchors to.
     fn selection_anchor(&self) -> Option<(Side, u32, u32, String)> {
         let (lo, hi) = self.selection_range();
         anchor(self.visible.get(lo..=hi)?)
+    }
+
+    /// Human-readable immutable anchor summary for the dedicated selection action strip.
+    pub fn selection_summary(&self) -> Option<String> {
+        let (lo, hi) = self.selection_range();
+        let selected = self.visible.get(lo..=hi)?;
+        let (side, start, end, _) = anchor(selected)?;
+        let count = selected.iter().filter(|row| row.is_content()).count();
+        let has_old = selected.iter().any(|row| row.old_no().is_some());
+        let has_new = selected.iter().any(|row| row.new_no().is_some());
+        let side_label = if has_old && has_new {
+            "mixed"
+        } else if side == Side::Old {
+            "old"
+        } else {
+            "new"
+        };
+        let range = if start == end { start.to_string() } else { format!("{start}–{end}") };
+        Some(format!("{range} · {count} line{} · {side_label}", if count == 1 { "" } else { "s" }))
     }
 
     fn build_comment(&self, text: String) -> Option<Comment> {
@@ -2875,6 +3553,7 @@ impl App {
                 Some(c.location())
             }
             Mode::Normal
+            | Mode::ConfirmDelete { .. }
             | Mode::List
             | Mode::Picker
             | Mode::BasePick
@@ -2900,86 +3579,126 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, row)| {
-                self.store
-                    .iter()
-                    .any(|c| c.file == file && self.comment_in_view(c) && line_in(c, row))
+                self.store.iter().any(|c| {
+                    c.file == file
+                        && self.comment_in_view(c)
+                        && resolve_comment_anchor(c, &self.visible).is_some()
+                        && line_in(c, row)
+                })
             })
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// For each visible diff row, the store indices of comments whose card renders after it.
-    /// A comment's card sits under the last visible row its line range covers, so the renderer
-    /// can splice it inline (always visible) and the geometry stays anchored to a real row.
-    pub fn comment_cards(&self) -> Vec<Vec<usize>> {
+    /// For each visible diff row, the stable IDs of exactly the comments whose cards render
+    /// after it. The authoritative snippet must match before a card can attach to code.
+    pub fn comment_cards(&self) -> Vec<Vec<CommentId>> {
         let mut cards = vec![Vec::new(); self.visible.len()];
         let Some(file) = self.diff_path.as_deref() else { return cards };
-        for (ci, c) in self.store.iter().enumerate() {
-            if c.file == file
-                && self.comment_in_view(c)
-                && let Some(last) = self.visible.iter().rposition(|row| line_in(c, row))
+        for (id, comment) in self.store.iter_with_ids() {
+            if comment.file == file
+                && self.comment_in_view(comment)
+                && let Some(last) = resolve_comment_anchor(comment, &self.visible)
             {
-                cards[last].push(ci);
+                cards[last].push(id);
             }
         }
         cards
     }
 
-    /// The store index to act on: the comment under the diff cursor, or — in the
-    /// list overlay — the highlighted row.
-    fn target_comment(&self) -> Option<usize> {
+    fn target_comment(&self) -> Option<CommentId> {
+        if self.image_view_active() {
+            return None;
+        }
         if self.mode == Mode::List {
-            return (self.list_cursor < self.store.len()).then_some(self.list_cursor);
+            return self.comment_focus.or_else(|| self.store.id_at(self.list_cursor));
         }
         self.comment_under_cursor()
     }
 
-    /// The store index of a comment whose range covers the current diff row, if any.
-    fn comment_under_cursor(&self) -> Option<usize> {
+    fn comment_under_cursor(&self) -> Option<CommentId> {
+        if self.image_view_active() {
+            return None;
+        }
         let file = self.diff_path.as_deref()?;
         let row = self.visible.get(self.diff_cursor)?;
-        self.store.iter().position(|c| c.file == file && self.comment_in_view(c) && line_in(c, row))
-    }
-
-    pub fn delete_comment(&mut self) {
-        // Cards don't show in the preview: `d` only acts through the comments-list overlay.
-        if self.preview_active() && self.mode != Mode::List {
-            return;
-        }
-        if let Some(i) = self.target_comment() {
-            logln!("comment delete [{i}]");
-            self.store.take(i);
-            self.clamp_list_cursor();
-            self.status = "comment deleted".to_string();
-            // Don't strand the user in an empty "Comments (0)" overlay, matching `export`.
-            if self.store.is_empty() {
-                self.close_list();
-            }
-        }
-    }
-
-    /// Move the diff cursor to the next (`dir >= 0`) or previous commented line.
-    pub fn jump_comment(&mut self, dir: isize) {
-        if self.preview_active() {
-            return; // no cursor and no cards in the preview (specs/diff-view.md)
-        }
-        let mut idxs: Vec<usize> = self.commented_lines().into_iter().collect();
-        if idxs.is_empty() {
-            return;
-        }
-        idxs.sort_unstable();
-        self.focus = Focus::Diff;
-        let cur = self.diff_cursor;
-        let target = if dir >= 0 {
-            idxs.iter().copied().find(|&i| i > cur).or_else(|| idxs.first().copied())
-        } else {
-            idxs.iter().rev().copied().find(|&i| i < cur).or_else(|| idxs.last().copied())
+        let applies = |c: &Comment| {
+            c.file == file
+                && self.comment_in_view(c)
+                && resolve_comment_anchor(c, &self.visible).is_some()
+                && line_in(c, row)
         };
-        if let Some(t) = target {
-            self.select_anchor = None; // a comment jump is navigation, not a selection extend
-            self.diff_cursor = t;
-            self.reveal_diff = true;
+        self.comment_focus
+            .filter(|&id| self.store.get(id).is_some_and(applies))
+            .or_else(|| self.store.iter_with_ids().find_map(|(id, c)| applies(c).then_some(id)))
+    }
+
+    /// Begin a deliberate delete for the exact selected card/list item.
+    pub fn delete_comment(&mut self) {
+        if self.image_view_active() || (self.preview_active() && self.mode != Mode::List) {
+            return;
         }
+        if let Some(id) = self.target_comment() {
+            self.comment_focus = Some(id);
+            self.mode = Mode::ConfirmDelete { id };
+        }
+    }
+
+    pub fn confirm_delete_comment(&mut self) {
+        let Mode::ConfirmDelete { id } = self.mode else { return };
+        if self.image_view_active() {
+            self.mode = Mode::Normal;
+            self.comment_focus = None;
+            return;
+        }
+        self.store.take(id);
+        self.comment_focus = None;
+        self.clamp_list_cursor();
+        self.status = "comment deleted".to_string();
+        self.mode = Mode::Normal;
+    }
+
+    pub fn cancel_delete_comment(&mut self) {
+        if matches!(self.mode, Mode::ConfirmDelete { .. }) {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// Move through exact resolved comment cards, including several attached to one source row.
+    pub fn jump_comment(&mut self, dir: isize) {
+        if self.preview_active() || self.image_view_active() {
+            return;
+        }
+        let mut targets: Vec<(usize, CommentId)> = self
+            .comment_cards()
+            .into_iter()
+            .enumerate()
+            .flat_map(|(row, ids)| ids.into_iter().map(move |id| (row, id)))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        targets.sort_by_key(|(row, id)| (*row, *id));
+        let current = self
+            .comment_focus
+            .and_then(|id| targets.iter().position(|&(_, candidate)| candidate == id));
+        let position = match (current, dir >= 0) {
+            (Some(i), true) => (i + 1) % targets.len(),
+            (Some(i), false) => (i + targets.len() - 1) % targets.len(),
+            (None, true) => {
+                targets.iter().position(|(row, _)| *row > self.diff_cursor).unwrap_or(0)
+            }
+            (None, false) => targets
+                .iter()
+                .rposition(|(row, _)| *row < self.diff_cursor)
+                .unwrap_or(targets.len() - 1),
+        };
+        let (row, id) = targets[position];
+        self.focus = Focus::Diff;
+        self.select_anchor = None;
+        self.diff_cursor = row;
+        self.comment_focus = Some(id);
+        self.reveal_diff = true;
     }
 
     // --- Search overlay (specs/search.md) ------------------------------------------------
@@ -2990,8 +3709,21 @@ impl App {
         self.changed.get(path)
     }
 
-    /// `/`: open the search screen, from any tab, from either pane (specs/search.md).
+    /// Whether global search may use the Git-worktree search engine. Files-only's retained
+    /// descriptor is its only filesystem authority, so it never invokes that pathname-based
+    /// scanner or its Git discovery (`specs/search.md`).
+    #[must_use]
+    pub fn search_available(&self) -> bool {
+        self.is_git_review()
+    }
+
+    /// `/`: open the search screen in Git review. Files-only keeps in-file find but must not
+    /// start the global pathname search engine (`specs/search.md`).
     pub fn open_search(&mut self) {
+        if !self.search_available() {
+            self.status = "global search unavailable in Files-only mode".to_string();
+            return;
+        }
         // A navigator-divider drag held from the review view must not become a search-split
         // resize: cancel it so its remaining drag events are consumed, not acted on — the
         // search divider only drags a gesture it started itself (specs/input.md).
@@ -3016,7 +3748,10 @@ impl App {
     /// the markdown preview, at least one content row. A notice (binary, too large) and an empty
     /// file carry no content rows, so `any(is_content)` excludes them (specs/find-in-file.md).
     pub fn find_available(&self) -> bool {
-        self.tab.is_file_tab() && !self.preview && self.visible.iter().any(Row::is_content)
+        self.tab.is_file_tab()
+            && !self.preview
+            && !self.image_view_active()
+            && self.visible.iter().any(Row::is_content)
     }
 
     /// `ctrl+f`: open the find band over the read pane, inert with nothing to search. Opening is a
@@ -3286,17 +4021,35 @@ impl App {
             Some(PickedResult::Code(c)) => (c.path.clone(), Some(c.line)),
             None => return Ok(()),
         };
-        if !self.repo.join(&path).is_file() {
-            return Ok(());
-        }
+        // Git review validates its worktree path as before. Files-only instead builds the
+        // File view through its retained root descriptor before leaving search. This both
+        // rejects stale/symlinked results and reuses the successful no-follow read below, so a
+        // replacement between a separate preflight and open cannot create a blank escape hatch
+        // (specs/search.md, specs/diff-view.md).
+        let prepared = if self.repository_mode == RepositoryMode::FilesOnly {
+            let Some(view) = self.files_only_file_view(&path) else {
+                return Ok(());
+            };
+            Some(view)
+        } else {
+            if !self.repo.join(&path).is_file() {
+                return Ok(());
+            }
+            None
+        };
         self.close_search();
         // Opening is a deliberate leave: the origin tab stashes its place on the switch,
-        // kept for `1`/`2`/`3` (specs/search.md).
-        if self.tab != Tab::AllFiles {
+        // kept for `1`/`2`/`3` (specs/search.md). Files-only is already and always in All
+        // files, so it cannot enter a Git tab or scope here.
+        if self.repository_mode == RepositoryMode::GitReview && self.tab != Tab::AllFiles {
             self.set_tab(Tab::AllFiles)?;
         }
-        // The pick feeds the engine's frecency store, so ranking improves with use.
-        self.search_track = Some(path.clone());
+        // The Git worktree-backed engine records access by a pathname. Files-only deliberately
+        // skips that side effect: its selected path remains descriptor-relative through
+        // `set_file_view` / `FilesRoot::read_file`, with no root-joined fallback.
+        if self.repository_mode == RepositoryMode::GitReview {
+            self.search_track = Some(path.clone());
+        }
         let mut expanded = false;
         let mut dir = path.as_str();
         while let Some((parent, _)) = dir.rsplit_once('/') {
@@ -3314,7 +4067,7 @@ impl App {
         // A same-file pick must land on the hit line in source, not behind an open
         // markdown preview (`set_file_view` keeps the choice for a same-path open).
         self.preview = false;
-        self.set_file_view(&path);
+        self.set_file_view_with(&path, prepared);
         if let Some(fi) = self.file_row_of_path(&path) {
             self.file_cursor = fi;
             self.reveal_files = true;
@@ -3329,8 +4082,18 @@ impl App {
     }
 
     pub fn open_list(&mut self) {
+        if self.image_view_active() {
+            return;
+        }
+        if !self.is_git_review() {
+            self.files_only_unavailable();
+            return;
+        }
         if !self.store.is_empty() {
-            self.list_cursor = 0;
+            self.list_cursor =
+                self.comment_focus.and_then(|id| self.store.position_of(id)).unwrap_or(0);
+            self.comment_focus = self.store.id_at(self.list_cursor);
+            self.list_scroll.set(0);
             self.mode = Mode::List;
         }
     }
@@ -3350,12 +4113,30 @@ impl App {
         use Band::{Do, Go, Move, Primary, Send};
         use FooterAction as A;
 
+        // This check precedes modal footers: a refresh may turn a previously-confirmed source
+        // action into an image view, which must never keep an invisible delete/edit affordance.
+        if self.image_view_active() {
+            let mut out = vec![(A::Refresh, Primary), (A::Tabs, Go)];
+            if !self.file_rows.is_empty() || self.navigator_hidden_here() {
+                out.push((A::TogglePane, Go));
+            }
+            if !self.navigator_hidden_here() {
+                out.push((A::NavigatorPosition, Go));
+            }
+            out.push((A::NavigatorHide, if self.navigator_hidden_here() { Do } else { Go }));
+            out.push((A::Quit, Go));
+            return out;
+        }
+
         // A modal sub-task owns the whole bar: one row, the primary then its own actions, no `?`
         // and no bands. The escape action comes right after the primary so the exit hint survives a
         // narrow-width trim (trailing `Do` actions drop first).
         match self.mode {
             Mode::Composing { .. } => {
                 return vec![(A::Save, Primary), (A::Cancel, Do), (A::Newline, Do)];
+            }
+            Mode::ConfirmDelete { .. } => {
+                return vec![(A::DeleteComment, Primary), (A::Cancel, Do)];
             }
             Mode::List => {
                 return vec![
@@ -3402,6 +4183,49 @@ impl App {
                 };
             }
             Mode::Normal => {}
+        }
+
+        // Files-only deliberately has no Git review state to offer. Its navigator and reader
+        // retain the normal browser controls, but scopes, PR, comment, export, and change
+        // traversal never reach this action model (`specs/overview.md`).
+        if !self.is_git_review() {
+            let mut out = Vec::new();
+            if self.preview_active() && self.focus == Focus::Diff {
+                out.push((A::Preview, Primary));
+            } else if self.file_rows.is_empty() {
+                out.push((A::Refresh, Primary));
+            } else if self.focus == Focus::Files {
+                match self.file_rows.get(self.file_cursor).map(|r| &r.kind) {
+                    Some(RowKind::Dir { expanded: true, .. }) => {
+                        out.push((A::CollapseDir, Primary));
+                    }
+                    Some(RowKind::Dir { expanded: false, .. }) => out.push((A::ExpandDir, Primary)),
+                    _ => out.push((A::TogglePane, Primary)),
+                }
+            } else if self.find_available() {
+                out.push((A::Find, Primary));
+            } else {
+                out.push((A::Refresh, Primary));
+            }
+            if self.search_available() {
+                out.push((A::Search, Go));
+            }
+            if self.find_available() {
+                out.push((A::Find, Go));
+            }
+            out.push((A::Wrap, Go));
+            out.push((A::Refresh, Go));
+            if !self.navigator_hidden_here() {
+                out.push((A::NavigatorPosition, Go));
+            }
+            out.push((A::NavigatorHide, if self.navigator_hidden_here() { Do } else { Go }));
+            out.push((A::Quit, Go));
+            if !self.file_rows.is_empty() {
+                out.push((A::MoveLine, Move));
+                out.push((A::MoveFile, Move));
+                out.push((A::MovePage, Move));
+            }
+            return out;
         }
 
         // The read-only PR tab: the state summary leads row 1 (rendered separately); `o open` is the
@@ -3518,6 +4342,12 @@ impl App {
             out.push((A::Find, Go));
         }
         out.push((A::Wrap, Go));
+        if self.tab == Tab::Changes
+            && !self.preview_active()
+            && self.diff.state == crate::diff::FileState::Normal
+        {
+            out.push((A::HideUnchanged, Go));
+        }
         if !self.store.is_empty() {
             out.push((A::List, Go));
             out.push((A::Copy, Go));
@@ -3550,6 +4380,7 @@ impl App {
             out.push((A::MoveLine, Move));
             if self.tab == Tab::Changes && !self.preview_active() && self.armed_cross().is_none() {
                 out.push((A::MoveHunk, Move));
+                out.push((A::MoveChange, Move));
             }
             out.push((A::MoveFile, Move));
             out.push((A::MovePage, Move));
@@ -3560,6 +4391,50 @@ impl App {
     pub fn list_move(&mut self, delta: isize) {
         if self.mode == Mode::List && !self.store.is_empty() {
             self.list_cursor = step(self.list_cursor, delta, self.store.len());
+            self.comment_focus = self.store.id_at(self.list_cursor);
+        }
+    }
+
+    pub fn list_select(&mut self, row: usize) {
+        if self.mode == Mode::List && row < self.store.len() {
+            self.list_cursor = row;
+            self.comment_focus = self.store.id_at(row);
+        }
+    }
+
+    /// Enter on a list row opens its exact resolved card without turning it into an editor.
+    /// Unresolved anchors remain in the bounded list and report their detached state.
+    pub fn open_list_item(&mut self) {
+        if self.image_view_active() {
+            return;
+        }
+        let Some(id) = self.target_comment() else { return };
+        let Some(comment) = self.store.get(id) else { return };
+        let file = comment.file.clone();
+        let owner = if comment.diff_anchored { Tab::Changes } else { Tab::AllFiles };
+        if self.tab != owner && self.set_tab(owner).is_err() {
+            self.status = "could not open comment view".to_string();
+            return;
+        }
+        if self.diff_path.as_deref() != Some(file.as_str())
+            && let Some(entry) = self.entries.iter().find(|entry| entry.path == file).cloned()
+        {
+            self.reset_diff_view();
+            self.open_path_in_tab(entry.path, entry.previous_path);
+        }
+        let resolved = self
+            .store
+            .get(id)
+            .filter(|c| self.comment_in_view(c))
+            .and_then(|c| resolve_comment_anchor(c, &self.visible));
+        if let Some(row) = resolved {
+            self.mode = Mode::Normal;
+            self.focus = Focus::Diff;
+            self.diff_cursor = row;
+            self.comment_focus = Some(id);
+            self.reveal_diff = true;
+        } else {
+            self.status = "STALE — anchor detached; review text in this list".to_string();
         }
     }
 }
@@ -3577,16 +4452,22 @@ impl App {
     /// of [`Self::export`]'s own, so `Send` with nothing written shells out to no herdr call
     /// and opens no picker.
     pub fn send_to_agent(&mut self) {
+        if self.image_view_active() {
+            return;
+        }
+        if !self.is_git_review() {
+            self.files_only_unavailable();
+            return;
+        }
         if self.store.is_empty() {
             self.status = "no comments to send".to_string();
             return;
         }
         match herdr::send_target() {
-            Ok(SendTarget::One(agent)) => self.export_to_agent(&agent),
+            // Every delivery, including one agent, stops at the same explicit confirmation.
+            Ok(SendTarget::One(agent)) => self.open_picker(vec![agent]),
             Ok(SendTarget::Many(rows)) => self.open_picker(rows),
-            // The refusal is already a whole sentence naming the cause and the clipboard, so a
-            // prefix would only spend the width the footer needs to show it.
-            Err(e) => self.status = e.to_string(),
+            Err(e) => self.open_send_notice(e.to_string()),
         }
     }
 
@@ -3601,6 +4482,7 @@ impl App {
             return;
         }
         self.picker_cursor = armed_row(&rows, self.last_sent_pane.as_deref());
+        self.picker_notice = None;
         self.picker_rows = rows;
         self.picker_over = self.mode.clone();
         self.mode = Mode::Picker;
@@ -3614,6 +4496,18 @@ impl App {
         }
         self.picker_rows.clear();
         self.picker_cursor = 0;
+        self.picker_notice = None;
+    }
+
+    fn open_send_notice(&mut self, notice: String) {
+        if self.mode == Mode::Picker {
+            return;
+        }
+        self.picker_rows.clear();
+        self.picker_cursor = 0;
+        self.picker_notice = Some(notice);
+        self.picker_over = self.mode.clone();
+        self.mode = Mode::Picker;
     }
 
     pub fn picker_move(&mut self, delta: isize) {
@@ -3643,13 +4537,20 @@ impl App {
     /// `--base` flag (`specs/input.md` Base picker).
     #[must_use]
     pub fn base_pick_available(&self) -> bool {
-        self.tab.is_file_tab() && self.scope == Scope::Branch && self.base.is_none()
+        self.is_git_review()
+            && self.tab.is_file_tab()
+            && self.scope == Scope::Branch
+            && self.base.is_none()
     }
 
     /// Open the base picker: one row per branch name, the open PR's target starred first,
     /// the default branch next, the rest by commit recency (`specs/input.md` Base picker).
     /// The highlight opens on the current base, else the first row.
     pub fn open_base_picker(&mut self) {
+        if !self.is_git_review() {
+            self.files_only_unavailable();
+            return;
+        }
         if !self.base_pick_available() || self.mode != Mode::Normal {
             return;
         }
@@ -3755,6 +4656,13 @@ impl App {
     /// success. A failed export leaves all comments in place (`specs/review-model.md`).
     /// Reports whether the comments were delivered.
     pub fn export(&mut self, target: &dyn ExportTarget) -> bool {
+        if self.image_view_active() {
+            return false;
+        }
+        if !self.is_git_review() {
+            self.files_only_unavailable();
+            return false;
+        }
         if self.store.is_empty() {
             self.status = "no comments to send".to_string();
             return false;
@@ -3771,7 +4679,11 @@ impl App {
                 true
             }
             Err(e) => {
-                self.status = target.failure_message();
+                self.status = if target.label() == "agent" {
+                    format!("Agent not found — {n} comments kept")
+                } else {
+                    target.failure_message()
+                };
                 logln!("export ERR: {e:#}");
                 false
             }
@@ -3797,20 +4709,49 @@ impl App {
         })
     }
 
-    /// Whether a comment's anchor may have moved. A diff comment is stale once its file leaves
-    /// the changeset; a File-view (content) comment only once its file is gone from the
-    /// worktree, since it was never tied to the changeset (specs/review-model.md).
-    pub fn is_stale(&self, c: &Comment) -> bool {
-        if c.diff_anchored {
-            !self.changed.contains_key(&c.file)
+    /// The compact reason an immutable anchor is detached, when it is known from the active
+    /// authoritative view. This display state never mutates the stored anchor.
+    pub fn stale_reason(&self, c: &Comment) -> Option<&'static str> {
+        if c.diff_anchored && !self.changed.contains_key(&c.file) {
+            Some("file left Changes")
+        } else if !c.diff_anchored
+            && (if self.repository_mode == RepositoryMode::FilesOnly {
+                self.files_root.as_ref().is_none_or(|root| root.read_file(&c.file, 0).is_err())
+            } else {
+                !self.repo.join(&c.file).exists()
+            })
+        {
+            Some("file deleted")
+        } else if self.diff_path.as_deref() == Some(c.file.as_str())
+            && self.comment_in_view(c)
+            && resolve_comment_anchor(c, &self.visible).is_none()
+        {
+            Some("anchor no longer visible")
         } else {
-            !self.repo.join(&c.file).exists()
+            None
         }
+    }
+
+    /// Whether the immutable anchor is unavailable. Coordinates alone can never reattach a
+    /// card after a refresh.
+    pub fn is_stale(&self, c: &Comment) -> bool {
+        self.stale_reason(c).is_some()
+    }
+
+    pub fn stale_count(&self) -> usize {
+        self.store.iter().filter(|comment| self.is_stale(comment)).count()
+    }
+
+    pub fn comment_ordinal(&self, id: CommentId) -> Option<usize> {
+        self.store.position_of(id).map(|position| position + 1)
     }
 
     fn clamp_list_cursor(&mut self) {
         if self.list_cursor >= self.store.len() {
             self.list_cursor = self.store.len().saturating_sub(1);
+        }
+        if self.comment_focus.is_some_and(|id| self.store.get(id).is_none()) {
+            self.comment_focus = self.store.id_at(self.list_cursor);
         }
     }
 }
@@ -3932,6 +4873,23 @@ fn is_markdown_path(path: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
 }
 
+/// Read at most `cap` bytes from a current Git-review worktree file. This is intentionally
+/// separate from Files-only authority, whose descriptor-relative method is used above.
+fn bounded_worktree_bytes(
+    repo: &std::path::Path,
+    path: &str,
+    cap: usize,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(repo.join(path))?;
+    let mut bytes = Vec::with_capacity(cap.min(64 * 1024).saturating_add(1));
+    file.take((cap.saturating_add(1)) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(std::io::Error::other("file exceeds preview cap"));
+    }
+    Ok(bytes)
+}
+
 /// The working-tree content of `path`, lossily as UTF-8; empty when the file is
 /// absent (a deletion) or unreadable.
 fn worktree_content(repo: &std::path::Path, path: &str) -> String {
@@ -3946,6 +4904,29 @@ fn line_in(c: &Comment, row: &Row) -> bool {
         Side::Old => row.old_no(),
     };
     no.is_some_and(|n| c.start <= n && n <= c.end)
+}
+
+/// Resolve an immutable comment anchor against exactly the rows that still carry its original
+/// side/range. The reconstructed authoritative snippet must be byte-for-byte equal. This never
+/// searches elsewhere for similar text or updates coordinates: an insertion above, replacement
+/// at the same line, fold, or owner-view mismatch is unresolved rather than silently rebound.
+fn resolve_comment_anchor(c: &Comment, rows: &[Row]) -> Option<usize> {
+    let count = c.lines.lines().count();
+    if count == 0 {
+        return None;
+    }
+    // The candidate keeps the original exact coordinate range *and* exact marker/text block.
+    // Looking only at chunks of the stored length permits a new-side selection that also held
+    // preceding deletion rows, without widening the anchor to nearby context.
+    (0..=rows.len().saturating_sub(count)).find_map(|first| {
+        let last = first + count - 1;
+        let candidate = rows.get(first..=last)?;
+        if candidate.iter().any(|row| !row.is_content()) {
+            return None;
+        }
+        let (side, start, end, snippet) = anchor(candidate)?;
+        (side == c.side && start == c.start && end == c.end && snippet == c.lines).then_some(last)
+    })
 }
 
 /// Compute `(side, start, end, snippet)` for a selection of diff rows.
@@ -3975,10 +4956,209 @@ fn anchor(selected: &[Row]) -> Option<(Side, u32, u32, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Mode};
+    use super::{App, Mode, RepositoryMode, Tab};
     use crate::config::NavigatorPosition;
+    use crate::diff::{FileState, View};
+    use crate::file_list::RowKind;
     use crate::model::{Comment, Scope, Side};
     use std::path::PathBuf;
+
+    #[test]
+    fn files_only_folder_root_shows_a_tree_and_opens_nested_content() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs/guides")).unwrap();
+        std::fs::write(root.path().join("docs/guides/start.md"), "nested content\n").unwrap();
+
+        let mut app = App::new_with_mode(
+            root.path().to_path_buf(),
+            RepositoryMode::FilesOnly,
+            Scope::Uncommitted,
+            None,
+        );
+        app.reload().unwrap();
+
+        assert!(
+            matches!(app.file_rows.first().map(|row| &row.kind), Some(RowKind::Dir { path, .. }) if path == "docs"),
+            "a root containing only folders must not render as no files: {:?}",
+            app.file_rows
+        );
+        app.expand_dir();
+        assert!(app.world_request.is_some(), "expanding queues worker work");
+        assert!(
+            !app.entries.iter().any(|entry| entry.path == "docs/guides"),
+            "the event loop does not enumerate descendants"
+        );
+        app.reconcile_world(crate::world::build(&app.world_input()).unwrap());
+        app.move_cursor(1).unwrap();
+        assert!(
+            matches!(app.file_rows[app.file_cursor].kind, RowKind::Dir { ref path, .. } if path == "docs/guides")
+        );
+        app.expand_dir();
+        app.reconcile_world(crate::world::build(&app.world_input()).unwrap());
+        app.move_cursor(1).unwrap();
+
+        assert_eq!(app.diff_path.as_deref(), Some("docs/guides/start.md"));
+        assert_eq!(app.diff.view, View::File);
+        assert_eq!(app.diff.state, FileState::Normal);
+        assert_eq!(app.visible[0].text(), "nested content");
+    }
+
+    #[test]
+    fn image_views_leave_markdown_preview_toggle_inert() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# source\n").unwrap();
+        let mut app = App::new_with_mode(
+            root.path().to_path_buf(),
+            RepositoryMode::FilesOnly,
+            Scope::Uncommitted,
+            None,
+        );
+        app.reload().unwrap();
+        app.diff_path = Some("README.md".to_owned());
+        app.preview_text = "# source\n".to_owned();
+        app.visible = vec![crate::diff::Row::Context {
+            old_no: 1,
+            new_no: 1,
+            spans: vec![crate::diff::Span { text: "# source".to_owned(), color: (0, 0, 0) }],
+        }];
+        app.image_preview_note = Some("SVG preview unavailable");
+
+        app.toggle_preview();
+
+        assert!(!app.preview, "an image fallback cannot arm hidden markdown preview state");
+    }
+
+    #[test]
+    fn files_only_global_search_is_unavailable_without_creating_a_search_job() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("result.md"), "safe content\n").unwrap();
+        let mut app = App::new_with_mode(
+            root.path().to_path_buf(),
+            RepositoryMode::FilesOnly,
+            Scope::Uncommitted,
+            None,
+        );
+        app.reload().unwrap();
+
+        app.open_search();
+
+        assert!(!app.search_available());
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.search.is_none());
+        assert!(!app.search_dirty, "the event loop must not start fff-search");
+        assert_eq!(app.status, "global search unavailable in Files-only mode");
+        assert!(app.find_available(), "in-file find remains available for safe opened content");
+    }
+
+    #[test]
+    fn files_only_collapse_rejects_an_inflight_directory_listing_and_keeps_cached_subtree_on_error()
+    {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("docs/readme.md"), "cached\n").unwrap();
+        let mut app = App::new_with_mode(
+            root.path().to_path_buf(),
+            RepositoryMode::FilesOnly,
+            Scope::Uncommitted,
+            None,
+        );
+        app.reload().unwrap();
+        app.expand_dir();
+        let input = app.world_input();
+        let outcome = crate::world::build(&input).unwrap();
+        app.collapse_dir();
+        assert_ne!(app.world_input(), input, "collapse invalidates the completion tag");
+        if app.world_input() == input {
+            app.reconcile_world(outcome);
+        }
+        assert!(
+            !app.entries.iter().any(|entry| entry.path == "docs/readme.md"),
+            "a collapsed directory cannot paint a stale completion"
+        );
+
+        app.expand_dir();
+        app.reconcile_world(crate::world::build(&app.world_input()).unwrap());
+        assert!(app.entries.iter().any(|entry| entry.path == "docs/readme.md"));
+        app.apply_raw_listings(vec![crate::world::DirectoryListing {
+            path: "docs".to_string(),
+            entries: Err("permission denied".to_string()),
+        }]);
+        assert!(
+            app.raw_tree.listings.contains_key("docs"),
+            "a failed refresh retains the previous direct listing"
+        );
+        assert!(app.entries.iter().any(|entry| entry.path == "docs/readme.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_only_worker_symlink_error_cannot_materialize_stale_directory_data() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("docs/visible.md"), "visible\n").unwrap();
+        std::fs::write(outside.path().join("secret.md"), "secret\n").unwrap();
+
+        let mut app = App::new_with_mode(
+            root.path().to_path_buf(),
+            RepositoryMode::FilesOnly,
+            Scope::Uncommitted,
+            None,
+        );
+        app.reload().unwrap();
+        app.expand_dir();
+        let input = app.world_input();
+
+        std::fs::remove_dir_all(root.path().join("docs")).unwrap();
+        symlink(outside.path(), root.path().join("docs")).unwrap();
+        let snapshot = crate::world::build(&input).unwrap();
+        assert!(
+            snapshot
+                .raw_listings
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|listing| listing.path == "docs" && listing.entries.is_err()),
+            "the stale worker request must become a recoverable directory error"
+        );
+        app.reconcile_world(snapshot);
+
+        assert!(
+            !app.entries.iter().any(|entry| entry.path == "docs/secret.md"),
+            "a rejected listing cannot add data from the symlink target"
+        );
+        assert!(
+            !app.raw_tree.listings.contains_key("docs"),
+            "an invalid listing cannot become a cached subtree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_only_file_view_rejects_a_listed_file_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("report.txt"), "local\n").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside secret\n").unwrap();
+        let mut app = App::new_with_mode(
+            root.path().to_path_buf(),
+            RepositoryMode::FilesOnly,
+            Scope::Uncommitted,
+            None,
+        );
+        app.reload().unwrap();
+        assert!(app.entries.iter().any(|entry| entry.path == "report.txt"));
+
+        std::fs::remove_file(root.path().join("report.txt")).unwrap();
+        symlink(outside.path().join("secret.txt"), root.path().join("report.txt")).unwrap();
+        let (diff, content) = app.file_view("report.txt");
+        assert!(content.is_empty(), "Files-only must not read the symlink target");
+        assert!(diff.rows.is_empty(), "the rejected read paints no external bytes");
+    }
 
     #[test]
     fn the_read_pane_scroll_stops_at_the_bottom_edge() {
@@ -4164,6 +5344,72 @@ mod tests {
 
         assert!(recovered.navigator_hidden, "the hidden state survives config recovery");
         assert_eq!(recovered.focus, crate::Focus::Diff, "and focus lands on the read pane");
+    }
+
+    #[test]
+    fn config_recovery_preserves_changes_hide_unchanged_and_reconciles_the_cursor() {
+        use crate::diff::{FileDiff, FileState, Row, Span, View};
+        let text = |s: &str| vec![Span { text: s.to_string(), color: (0, 0, 0) }];
+        let rows = vec![
+            Row::Context { old_no: 1, new_no: 1, spans: text("before") },
+            Row::Insertion { new_no: 2, spans: text("changed"), emphasis: vec![] },
+            Row::Context { old_no: 3, new_no: 3, spans: text("after") },
+        ];
+        let mut old = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        // The active file tab is All files, so the Changes preference is in its stash.
+        old.active_file_tab = Tab::AllFiles;
+        old.stash.hide_unchanged = true;
+
+        // A recovery worker has already rebuilt this current file under the normal projection.
+        // Reapplying the user's Changes preference must fold its context without displacing the
+        // cursor from the changed source row.
+        let mut recovered = App::new(PathBuf::from("."), Scope::Uncommitted, None);
+        recovered.diff = FileDiff {
+            path: "a.rs".to_string(),
+            previous_path: None,
+            state: FileState::Normal,
+            view: View::Diff,
+            rows: rows.clone(),
+        };
+        recovered.visible = rows;
+        recovered.diff_cursor = 1;
+
+        recovered.carry_authored_state_from(&mut old);
+
+        assert!(recovered.hide_unchanged);
+        assert!(matches!(recovered.visible[0], Row::Fold { .. }));
+        assert!(matches!(recovered.visible[1], Row::Insertion { .. }));
+        assert!(matches!(recovered.visible[2], Row::Fold { .. }));
+        assert_eq!(recovered.diff_cursor, 1, "the changed row survives projection by identity");
+    }
+
+    #[test]
+    fn hide_unchanged_projects_context_into_expandable_folds_without_losing_rows() {
+        use crate::diff::{FileDiff, FileState, Row, Span, View};
+        let text = |s: &str| vec![Span { text: s.to_string(), color: (0, 0, 0) }];
+        let mut app = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        app.diff = FileDiff {
+            path: "a.rs".to_string(),
+            previous_path: None,
+            state: FileState::Normal,
+            view: View::Diff,
+            rows: vec![
+                Row::Context { old_no: 1, new_no: 1, spans: text("before") },
+                Row::Deletion { old_no: 2, spans: text("old"), emphasis: vec![] },
+                Row::Insertion { new_no: 2, spans: text("new"), emphasis: vec![] },
+                Row::Context { old_no: 3, new_no: 3, spans: text("after") },
+            ],
+        };
+        app.hide_unchanged = true;
+        app.rebuild_visible();
+        assert!(matches!(app.visible[0], Row::Fold { .. }));
+        assert!(matches!(app.visible[1], Row::Deletion { .. }));
+        assert!(matches!(app.visible[2], Row::Insertion { .. }));
+        assert!(matches!(app.visible[3], Row::Fold { .. }));
+        app.diff_cursor = 0;
+        app.expand_fold(&[], 1);
+        assert!(matches!(app.visible[0], Row::Context { .. }), "one fold expands locally");
+        assert_eq!(app.visible[3].hidden(), 1, "the independent trailing context stays folded");
     }
 
     #[test]

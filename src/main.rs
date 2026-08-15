@@ -7,7 +7,7 @@ fn main() -> anyhow::Result<()> {
     // transient process as a live reviewr pane.
     if std::env::args_os().skip(1).any(|arg| arg == "--resolve-plugin-config") {
         if let Err(error) = herdr_reviewr::config::print_plugin_config() {
-            eprintln!("reviewr: {error}");
+            eprintln!("Herdr Preview: {error}");
             std::process::exit(1);
         }
         return Ok(());

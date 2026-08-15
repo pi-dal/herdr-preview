@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Swap a locally built herdr-reviewr into the GitHub-installed plugin for QA.
+# Swap a locally built Herdr Preview engine into the GitHub-installed plugin for QA.
 # The full procedure and every known failure mode: docs/qa-install.md.
 set -euo pipefail
 
-NEW="target/release/herdr-reviewr"
+NEW="target/release/herdr-preview"
 [ -f "$NEW" ] || { echo "qa-install: build first (cargo build --release)" >&2; exit 1; }
 
 # Locate the managed plugin install. Exactly one is expected.
 shopt -s nullglob
-roots=("$HOME"/.config/herdr/plugins/github/persiyanov.reviewr-*)
+roots=("$HOME"/.config/herdr/plugins/github/pi-dal.herdr-preview-*)
 shopt -u nullglob
 [ ${#roots[@]} -eq 1 ] || {
   echo "qa-install: expected one installed plugin, found ${#roots[@]}:" >&2
@@ -16,7 +16,7 @@ shopt -u nullglob
   exit 1
 }
 BIN_DIR="${roots[0]}/bin"
-BIN="$BIN_DIR/herdr-reviewr"
+BIN="$BIN_DIR/herdr-preview"
 
 # Keep one pristine release for rollback. Never overwrite an existing backup.
 [ -f "$BIN.release-backup" ] || cp "$BIN" "$BIN.release-backup"
@@ -36,7 +36,7 @@ echo "installed: $BIN"
 # Running panes keep executing the old binary image. Only a pane restart picks this up.
 live=$(pgrep -f "$BIN" || true)
 if [ -n "$live" ]; then
-  echo "note: running reviewr panes still use the OLD binary (pids:" $live ")"
+  echo "note: running Preview panes still use the OLD binary (pids:" $live ")"
 fi
-echo "next: close and reopen each reviewr pane with the toggle keybinding inside herdr."
+echo "next: close and reopen each Preview pane with the toggle keybinding inside Herdr."
 echo "rollback: cp $BIN.release-backup <staging> && rm $BIN && mv <staging> $BIN"

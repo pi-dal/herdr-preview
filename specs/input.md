@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-07-17
-Last edited: 2026-08-13
+Last edited: 2026-08-15
 ---
 
 # Input
@@ -14,6 +14,12 @@ Every action has a key. The mouse-relevant ones also work by click or drag.
 
 The keymap is rebindable per action through `[keybindings]` in the plugin config (`config.md`):
 
+- **In-Preview keys** in the table are the terminal-facing defaults. Bare keys (`c`, `v`, `s`,
+  `?`) are the primary focused-pane workflow.
+- **Herdr-global Option keys** are host bindings, not a second keymap. A host plugin action routes
+  its canonical input through the active Preview pane (`herdr-host.md`). The host may bind that
+  action to a non-conflicting chord: for example, a profile whose Herdr vertical split is `alt+d`
+  binds Preview Changes to `alt+shift+d`.
 - The `action` column names the action for `[keybindings]`.
 - The keys shown are defaults: a bare character, or a `ctrl+`/`alt+` chord (`config.md`).
 - The arrows, `tab`, `esc`, `enter`, and the page keys are structural. They are fixed and never rebind.
@@ -26,16 +32,18 @@ The keymap is rebindable per action through `[keybindings]` in the plugin config
 | action                                                   | does                                        | keys                                        | mouse                         |
 | -------------------------------------------------------- | ------------------------------------------- | ------------------------------------------- | ----------------------------- |
 | `down` / `up`                                            | move the cursor in the focused pane         | `j` / `k` / `↓` / `↑`                       | click a row                   |
-| `next-hunk` / `prev-hunk`                                | jump to the next / previous hunk            | `]` / `[`                                   | —                             |
-| `next-file` / `prev-file`                                | jump to the next / previous file            | `f` / `F`                                   | —                             |
-| —                                                        | collapse / expand a directory               | `←` / `→`                                   | click the directory row       |
+| `next-hunk` / `prev-hunk`                                | jump to the next / previous change run      | `alt+right` / `alt+left`, `]` / `[`         | —                             |
+| `next-change` / `prev-change`                            | jump to the next / previous changed line    | `alt+down` / `alt+up`                       | —                             |
+| `next-file` / `prev-file`                                | jump to the next / previous file            | `alt+shift+down` / `alt+shift+up`, `f` / `F` | —                             |
+| —                                                        | navigate a directory tree                   | `←` / `→` / `enter`                         | click anywhere on a directory row |
 | —                                                        | switch focus between list and diff          | `tab`                                       | click a pane                  |
 | —                                                        | move a page                                 | `PageUp` / `PageDown` / `ctrl+u` / `ctrl+d` | —                             |
 | —                                                        | scroll the viewport, selection put          | —                                           | wheel over the pane           |
 | —                                                        | scroll the diff horizontally (wrap off)     | `←` / `→`                                   | —                             |
 | `scope-uncommitted` / `scope-branch` / `scope-last-turn` | switch scope                                | `u` / `b` / `t`                             | click the scope chip to cycle |
 | `base-pick`                                              | open the base picker                        | `B`                                         | click the base name           |
-| `tab-changes` / `tab-all-files` / `tab-pr`               | switch tab                                  | `1` / `2` / `3`                             | click a tab name              |
+| `tab-changes` / `tab-all-files` / `tab-pr`               | switch tab                                  | `alt+d` / `alt+f` / `alt+r`, `1` / `2` / `3` | click a tab name              |
+| `hide-unchanged`                                         | fold all unchanged context in Changes       | `alt+u`                                     | —                             |
 | —                                                        | expand the fold under the cursor            | `→`                                         | click the `⋯` row             |
 | —                                                        | open a link in rendered markdown            | —                                           | click the link                |
 | `wrap`                                                   | toggle line wrap                            | `w`                                         | —                             |
@@ -45,21 +53,27 @@ The keymap is rebindable per action through `[keybindings]` in the plugin config
 | `navigator-grow` / `navigator-shrink`                    | grow / shrink the navigator                 | `<` / `>`                                   | drag the divider              |
 | `select`                                                 | select a line range, removed lines included | `v` then move                               | click-drag in the diff        |
 | —                                                        | clear the selection                         | `esc`                                       | —                             |
-| `comment`                                                | comment on the selection                    | `c`, type, `enter`                          | after a drag-select           |
+| `comment`                                                | comment on the selection                    | `alt+c`, `c`, type, `enter`                 | inline `Comment` control      |
 | `edit`                                                   | edit the comment under the cursor           | `e`                                         | —                             |
 | `delete`                                                 | delete the comment under the cursor         | `d`                                         | —                             |
 | `next-comment` / `prev-comment`                          | jump to next / previous comment             | `n` / `N`                                   | —                             |
-| `comments`                                               | list and manage all comments                | `l`                                         | —                             |
+| `comments`                                               | list and manage all comments                | `alt+l`, `l`                                | —                             |
 | `search`                                                 | open the search screen (`search.md`)        | `/`                                         | —                             |
 | `find`                                                   | open in-file find (`find-in-file.md`)       | `ctrl+f`                                    | —                             |
-| `keys`                                                   | toggle the footer's full shortcut list      | `?`                                         | —                             |
-| `send`                                                   | send all comments to the agent              | `s` / `S`                                   | —                             |
+| `keys`                                                   | toggle the footer's full shortcut list      | `alt+h`, `?`                                | —                             |
+| `send`                                                   | send all comments to the agent              | `alt+s`, `s` / `S`                          | —                             |
 | `copy`                                                   | copy all comments to the clipboard          | `y` / `Y`                                   | —                             |
 | `open-pr`                                                | open the PR in the browser (`pr-tab.md`)    | `o`                                         | click the status chip         |
-| `refresh`                                                | refresh now                                 | `r`                                         | —                             |
+| `refresh`                                                | refresh now                                 | `alt+shift+r`, `r`                          | —                             |
 | `quit`                                                   | quit                                        | `q`                                         | —                             |
 
+Herdr's global Preview actions send the table's canonical default `alt+` key through the pane API (`herdr-host.md`). The key enters this keymap like an in-pane chord. It does not depend on a terminal delivering a physical Option key, and it creates no second terminal binding. A `[keybindings]` override still controls the key's resulting action.
+
+In Files-only, the `Files` tab, navigator controls, wrapping, markdown preview, find, search when available, and refresh remain active. Directory rows use the same whole-row targets and fixed tree keys as Git Files. Git scopes, Changes and PR tabs, change and hunk traversal, hide unchanged, comment actions, and send or copy are inert and identify Files-only mode.
+
 `navigator-position` cycles `right` → `bottom` → `left` → `top` → `right`.
+
+In a focused navigator, `→` expands a closed directory or moves to its first visible child. `←` collapses an open directory or moves to its visible parent. `enter` toggles a directory and opens a file. A directory's entire painted row toggles it by mouse. File rows keep their select-and-open behavior and never toggle a directory.
 
 `navigator-grow` and `navigator-shrink` change the active share by four percentage points. The allowed range clamps every change.
 
@@ -69,13 +83,15 @@ Outside the hidden-state rules above, these four navigator actions work from eit
 
 A divider drag belongs to the navigator position and split axis at mouse-down. A keypress, terminal resize, or config-driven layout change cancels it. A cancelled drag keeps its last painted share, and the cancelling keypress still performs its own action. After cancellation, drag events are consumed until mouse-up rather than becoming a selection in the read pane.
 
-Writing a comment: select a range or land on a line, press `c`, type into the inline box, `enter` saves and `esc` cancels. A saved comment renders as a read-only card spliced under its line, titled with its location, so written feedback stays on screen. `e` reopens the card as an edit box in place, hiding the card while editing. `d` deletes it. A successful send names the agent it added the comments to. A successful copy reports that they were copied. The transient status shows on the footer, pluralizes `comment`, and fades without covering the primary action.
+Writing a comment is explicit: select, inspect the anchor strip, draft, then review or send. A navigator click while a selection is live preserves that selection and reports `clear selection before opening a file`, so a mouse action never silently discards an anchor. `c` on a content row remains the fast singleton draft. `v`, mouse-down, and drag select content rows. A fold expands instead of selecting. While a selection is live, file, tab, scope, and traversal changes are inert. A dedicated row after the selected endpoint names its range, count, and old/new/mixed side, and keeps `c comment` plus `esc clear` visible. Its `Comment` button is the exact mouse target and never paints over source. The composer title names New or Edit, the elided file location, and the line count. Its footer keeps `enter save`, `shift+enter newline`, and `esc cancel`, and distinguishes saved comments from the draft. Saved cards expose their ordinal, range, current or `STALE` state, and `click/e edit`. `n`/`N` cycles exact cards, including cards sharing a line. `d` opens `enter delete · esc cancel`. A successful send says `Added N comments to <agent>, not submitted`. A successful copy reports that they were copied.
 
 ## Behavior
 
 ### Changeset traversal
 
-`next-hunk` / `prev-hunk` step the diff cursor between changes, from either pane. A step lands on the first row of a run of changed rows. A context line or a fold ends a run, so two edits three lines apart are two stops.
+`next-hunk` / `prev-hunk` keep their canonical config IDs and step between **change runs**, not hunks in user-facing copy. `next-change` / `prev-change` step each added or removed row and cross directly to the nearest changed row in the adjacent file. They are inert outside Changes source, in previews and notices, and while selecting or composing.
+
+`next-hunk` / `prev-hunk` step the diff cursor between change runs, from either pane. A step lands on the first row of a run of changed rows. A context line or a fold ends a run, so two edits three lines apart are two stops.
 
 - Each press jumps to the nearest run past the cursor: `next-hunk` below, `prev-hunk` above.
 - With no run left that way, the first press arms a crossing and holds the cursor still. The next press the same way opens the adjacent file on its nearest run. A notice diff, which has no runs at all, arms on the first press like any other file.
@@ -191,7 +207,7 @@ Row 1's primary and actions follow the cursor:
 
 ### Comment editor
 
-A plain-text field that edits at the caret, not only at the end. The search input and the base picker's filter share these controls, without the newline inserts (`search.md`). An empty box shows a dim `Leave a comment…` placeholder. `e` preloads the existing text with the caret at the end.
+A plain-text field that edits at the caret, not only at the end. The search input and the base picker's filter share these controls, without the newline inserts (`search.md`). An empty box shows a dim `Leave a comment…` placeholder. `e` preloads the exact selected card's text with the caret at the end. An unresolved anchor stays in the list as detached text and never opens an inline composer below replacement source.
 
 ```
 ┌ comment · llm_registry.py:41 ───────────┐
@@ -228,16 +244,17 @@ A plain-text field that edits at the caret, not only at the end. The search inpu
 
 ### Agent picker
 
-`Send` opens the picker (`herdr-host.md`). Every key below acts, and every other key is inert.
+`Send` always opens a confirmation sheet (`herdr-host.md`), including with one or zero agents. The sheet states the comment and stale counts, selected target, and that text is added to agent input and is not submitted. Every key below acts, and every other key is inert.
 
 | key                     | does                                        |
 | ----------------------- | ------------------------------------------- |
 | `j` / `k` / `↓` / `↑`   | move the highlight                          |
 | `1` – `9`               | move the highlight to that row              |
 | `enter`                 | send every comment to the highlighted agent |
+| `y`                     | copy when the sheet names no agent or unavailable Herdr |
 | `esc`                   | cancel, keeping every comment               |
 
-Only the unmodified `enter` sends. `Alt+Enter` and `Shift+Enter` insert a newline in the comment editor, so carrying that chord into the picker sends nothing rather than handing the whole review to the armed agent.
+Only the unmodified `enter` sends. `Alt+Enter` and `Shift+Enter` insert a newline in the comment editor, so carrying that chord into the picker sends nothing rather than handing the whole review to the armed agent. The no-target `y` path uses the ordinary consume-on-success clipboard export.
 
 - A click moves the highlight to the clicked row. A click on the highlighted row sends. The highlight is armed when the picker opens, so a first click on the armed row sends immediately. Every other gesture is inert, and none reaches the view behind.
 - The digits are literal here, whatever `tab-changes` and its siblings are bound to. A modified digit moves nothing.

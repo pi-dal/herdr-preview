@@ -1,12 +1,12 @@
 ---
 Status: Current
 Created: 2026-07-18
-Last edited: 2026-08-08
+Last edited: 2026-08-15
 ---
 
 # Search
 
-Full-screen file and code search over the worktree, opened with `/` from any tab.
+Full-screen file and code search over a Git worktree, opened with `/` from any tab.
 
 ## Overview
 
@@ -44,9 +44,14 @@ results.
   interleaves results.
 - The query matches file names fuzzily and code literally, narrowed by globs, `!`
   exclusions, and `git:` filters. The grammar is the engine's.
-- Ranking improves with use: opening a result records the access in the engine's frecency
-  store. The store lives in reviewr's cache directory, never the worktree.
+- Ranking improves with use in Git review: opening a result records the access in the engine's
+  frecency store. The store lives in reviewr's cache directory, never the worktree. Files-only
+  opens do not record an access because their paths remain descriptor-relative.
 - Search covers tracked and untracked files. Ignored files and `.git` are not searchable.
+- Files-only has **no global Search**. `/` reports `global search unavailable in Files-only mode`
+  and never starts `fff-search`, Git discovery, or any pathname-based scan. The retained
+  descriptor capability remains Files-only's sole filesystem authority; `ctrl+f` still finds
+  text in the already descriptor-opened file (`find-in-file.md`).
 
 ## The screen
 
@@ -153,7 +158,8 @@ or no matches — it shows the mode flip and `esc`.
 
 Opening is a deliberate leave: it lands in `All files` whatever tab the search left, and
 the origin tab keeps its place for `1`/`2`/`3`. A code result's line clamps into the
-file's current length. Focus lands on the read pane.
+file's current length. Focus lands on the read pane. Search is Git-review-only, so there is
+no Files-only search result or pathname re-open path.
 
 ## Failure semantics
 

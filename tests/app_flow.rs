@@ -15,6 +15,7 @@ use herdr_reviewr::herdr::{AgentChoice, AgentSample};
 use herdr_reviewr::keymap::{Action, Key, Keymap};
 use herdr_reviewr::model::{Scope, Side};
 use herdr_reviewr::turn::Status;
+use herdr_reviewr::ui;
 use herdr_reviewr::{handle_key, handle_mouse};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -124,6 +125,24 @@ fn the_file_list_decouples_viewport_scroll_from_selection() {
     app.wheel_files(100);
     app.bound_file_scroll(viewport);
     assert_eq!(app.file_scroll, 20 - viewport);
+}
+
+#[test]
+fn navigator_click_while_selecting_preserves_anchor_and_explains_the_lock() {
+    let r = edited_repo();
+    r.write("b.rs", "one\ntwo\n");
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    app.toggle_select();
+    let anchor = app.select_anchor;
+    let cursor = app.file_cursor;
+    let target = app.file_rows.iter().position(|row| row.name == "b.rs").unwrap();
+
+    app.select_file(target).unwrap();
+
+    assert_eq!(app.select_anchor, anchor, "the comment range remains authoritative");
+    assert_eq!(app.file_cursor, cursor, "the click does not partially move navigator state");
+    assert_eq!(app.status, "clear selection before opening a file");
 }
 
 /// A repo whose single file has `n` lines, all changed, so the diff has many visible rows.
@@ -913,17 +932,19 @@ fn esc_on_pr_closes_the_expansion_and_spares_the_frozen_file_tab() {
     let mut app = app_on(&r);
     let keymap = Keymap::default();
 
-    // Select on a file tab and open the expansion, then move to PR — the selection freezes in place.
+    // A live selection holds tab switching. Clear it before visiting PR.
     app.focus = Focus::Diff;
     app.toggle_select();
     assert!(app.select_anchor.is_some(), "v starts a selection on the file tab");
+    app.set_tab(Tab::Pr).unwrap();
+    assert_eq!(app.tab, Tab::Changes, "selection blocks a tab switch");
+    app.clear_selection();
     app.keys_expanded = true;
     app.set_tab(Tab::Pr).unwrap();
 
-    // `esc` on PR closes the expansion and never disturbs the frozen file-tab selection.
+    // `esc` on PR closes the expansion without touching stashed file-tab place state.
     press(&mut app, &keymap, KeyCode::Esc);
     assert!(!app.keys_expanded, "esc closes the expansion on PR");
-    assert!(app.select_anchor.is_some(), "the frozen file-tab selection is spared");
 }
 
 #[test]
@@ -1805,7 +1826,95 @@ fn a_comment_can_be_edited_then_deleted() {
 
     app.open_list();
     app.delete_comment();
+    app.confirm_delete_comment();
     assert!(app.store.is_empty());
+}
+
+#[test]
+fn image_view_blocks_keyboard_edit_and_delete_of_hidden_comments() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "hidden under image");
+    app.focus = Focus::Diff;
+    app.image_preview_note = Some("SVG preview unavailable");
+    let area = Rect::new(0, 0, 120, 40);
+    let keymap = Keymap::default();
+
+    handle_key(&mut app, KeyEvent::from(KeyCode::Char('e')), area, &keymap).unwrap();
+    assert!(!app.composing(), "edit cannot open over an image fallback");
+    handle_key(&mut app, KeyEvent::from(KeyCode::Char('d')), area, &keymap).unwrap();
+    assert_eq!(app.mode, Mode::Normal, "delete cannot confirm an invisible comment");
+    assert_eq!(app.store.len(), 1, "image-mode keys never consume hidden comments");
+}
+
+#[test]
+fn image_view_leaves_horizontal_scroll_inert() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    app.image_preview_note = Some("SVG preview unavailable");
+    let area = Rect::new(0, 0, 120, 40);
+    let keymap = Keymap::default();
+
+    handle_key(&mut app, KeyEvent::from(KeyCode::Right), area, &keymap).unwrap();
+    handle_key(&mut app, KeyEvent::from(KeyCode::Left), area, &keymap).unwrap();
+
+    assert_eq!(app.h_scroll, 0, "image views never mutate hidden horizontal source state");
+}
+
+#[test]
+fn image_view_is_a_no_source_row_state_for_footer_mouse_and_pending_delete() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "must remain untouched");
+    app.focus = Focus::Diff;
+    app.diff_cursor = row_with(&app, '+');
+    app.delete_comment();
+    assert!(matches!(app.mode, Mode::ConfirmDelete { .. }));
+    let source_cursor = app.diff_cursor;
+    app.image_preview_note = Some("SVG preview unavailable");
+    let footer = app.footer_bands();
+    assert!(footer.iter().all(|(action, _)| !matches!(
+        action,
+        herdr_reviewr::app::FooterAction::Comment
+            | herdr_reviewr::app::FooterAction::EditComment
+            | herdr_reviewr::app::FooterAction::DeleteComment
+            | herdr_reviewr::app::FooterAction::Send
+            | herdr_reviewr::app::FooterAction::MoveHunk
+            | herdr_reviewr::app::FooterAction::MoveChange
+    )));
+    let keymap = Keymap::default();
+    mouse(&mut app, &keymap, MouseEventKind::Down(MouseButton::Left));
+    assert_eq!(app.select_anchor, None, "image clicks cannot create a hidden selection");
+    assert_eq!(app.diff_cursor, source_cursor, "image clicks cannot move a hidden cursor");
+    app.confirm_delete_comment();
+    assert_eq!(app.mode, Mode::Normal, "a stale delete confirmation is cancelled");
+    assert_eq!(app.store.len(), 1, "image mode never consumes a hidden comment");
+}
+
+#[test]
+fn image_preview_stays_with_its_visited_file_tab() {
+    use herdr_reviewr::app::Tab;
+    use image::{ImageFormat, Rgba, RgbaImage};
+
+    let r = Repo::init();
+    let image = RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255]));
+    let mut bytes = Vec::new();
+    image.write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png).unwrap();
+    std::fs::write(r.path().join("photo.png"), bytes).unwrap();
+    r.write("note.txt", "text\n");
+    r.commit_all("initial");
+
+    let mut app = app_on(&r);
+    enter_tab(&mut app, Tab::AllFiles);
+    let image_row = app.file_rows.iter().position(|row| row.name == "photo.png").unwrap();
+    app.select_file(image_row).unwrap();
+    assert!(app.image_view_active(), "the selected raster owns the All files read pane");
+
+    enter_tab(&mut app, Tab::Changes);
+    assert!(!app.image_view_active(), "a visited sibling tab never inherits the raster");
+    enter_tab(&mut app, Tab::AllFiles);
+    assert!(app.image_view_active(), "returning restores only the owning tab's raster state");
 }
 
 #[test]
@@ -1816,6 +1925,7 @@ fn deleting_the_last_comment_closes_the_list_overlay() {
     app.open_list();
     assert_eq!(app.mode, Mode::List);
     app.delete_comment();
+    app.confirm_delete_comment();
     assert!(app.store.is_empty());
     assert_eq!(app.mode, Mode::Normal, "an emptied overlay closes instead of stranding the user");
 }
@@ -1875,6 +1985,27 @@ fn editing_from_the_list_navigates_to_the_comments_file() {
     assert_eq!(app.diff_path.as_deref(), Some("b.rs"), "edit switched to the comment's file");
     let dl = &app.diff.rows[app.diff_cursor];
     assert!(dl.new_no().is_some() || dl.old_no().is_some(), "cursor sits on a real diff line");
+}
+
+#[test]
+fn an_anchor_mismatch_after_refresh_stays_stored_and_never_reattaches() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "review the replacement");
+    let id = app.store.id_at(0).unwrap();
+
+    // Keep the same file and a changed row at the same new-side line, but replace the exact
+    // authoritative snippet. Coordinates must not make this card look attached.
+    r.write("a.rs", "alpha\nREPLACED\ngamma\ndelta\nepsilon\n");
+    app.reload().unwrap();
+
+    assert_eq!(app.store.len(), 1, "refresh never consumes authored comments");
+    assert!(app.is_stale(app.store.get(id).unwrap()));
+    assert!(app.comment_cards().iter().all(Vec::is_empty), "no card attaches to replacement code");
+    app.open_list();
+    app.start_edit();
+    assert_eq!(app.mode, Mode::List, "a stale anchor never opens under a replacement row");
+    assert!(app.status.contains("STALE"));
 }
 
 #[test]
@@ -2222,7 +2353,8 @@ fn deleting_the_last_listed_comment_clamps_the_list_cursor() {
     app.list_move(1); // cursor on the last comment (index 1)
     assert_eq!(app.list_cursor, 1);
 
-    app.delete_comment(); // removes index 1
+    app.delete_comment(); // asks before removing exact card 1
+    app.confirm_delete_comment();
     assert_eq!(app.store.len(), 1);
     assert_eq!(app.list_cursor, 0, "list cursor clamps back into range");
 }
@@ -2623,7 +2755,7 @@ fn all_files_tab_browses_the_whole_worktree_and_renders_content() {
     assert!(app.file_rows.iter().any(|row| row.dir_path() == Some("src")), "src/ is a dir row");
     assert!(file_row_of(&app, "src/ui.rs").is_none(), "a collapsed dir hides its children");
 
-    // Expanding src/ (a click on the directory) then opening a file shows its full content.
+    // A broad directory-row click selects and expands src/.
     let src_row = app.file_rows.iter().position(|row| row.dir_path() == Some("src")).unwrap();
     app.select_file(src_row).unwrap();
     let ui_row = file_row_of(&app, "src/ui.rs").expect("src/ui.rs visible once src/ is expanded");
@@ -3634,7 +3766,8 @@ fn the_comments_list_acts_through_the_same_bindings() {
     press(&mut app, &keymap, KeyCode::Char('d'));
     assert_eq!(app.store.len(), 1, "the replaced default is inert in the list too");
     press(&mut app, &keymap, KeyCode::Char('x'));
-    assert!(app.store.is_empty(), "the rebound `delete` acts on the highlighted row");
+    press(&mut app, &keymap, KeyCode::Enter);
+    assert!(app.store.is_empty(), "the rebound `delete` confirms the highlighted row");
 }
 
 #[test]
@@ -5437,4 +5570,310 @@ fn the_base_picker_owns_the_whole_footer_bar_and_survives_a_config_error() {
     app.set_config_error("theme = \"not-a-theme\"".to_string());
     assert_eq!(app.mode, Mode::BasePick);
     assert_eq!(app.base_picker.as_ref().unwrap().query, "d");
+}
+
+#[test]
+fn files_only_directory_rows_toggle_by_mouse_and_follow_tree_keys_at_every_position() {
+    let area = Rect::new(0, 0, 120, 40);
+    let keymap = Keymap::default();
+    for position in [
+        NavigatorPosition::Right,
+        NavigatorPosition::Bottom,
+        NavigatorPosition::Left,
+        NavigatorPosition::Top,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/guides")).unwrap();
+        std::fs::write(dir.path().join("docs/guides/start.md"), "nested content\n").unwrap();
+        std::fs::write(dir.path().join("root.txt"), "root content\n").unwrap();
+        let mut app = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
+        app.reload().unwrap();
+        app.navigator_position = position;
+        let original = app.diff_path.clone();
+        let docs = app.file_rows.iter().position(|row| row.dir_path() == Some("docs")).unwrap();
+
+        // Use the far edge of the painted row, not its leading disclosure cells. This shared
+        // coordinate contract covers side and stacked navigator layouts alike.
+        let (column, row) = (0..area.height)
+            .flat_map(|row| (0..area.width).map(move |column| (column, row)))
+            .filter(|&(column, row)| {
+                herdr_reviewr::ui::hit_file(
+                    area,
+                    &app,
+                    column,
+                    row,
+                    app.file_rows.len(),
+                    app.file_scroll,
+                ) == Some(docs)
+            })
+            .max_by_key(|&(column, _)| column)
+            .expect("the whole directory row is a mouse target");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &[],
+            &keymap,
+        )
+        .unwrap();
+        assert_eq!(app.file_cursor, docs, "{position:?}: click keeps the directory selected");
+        assert!(app.world_request.is_some(), "{position:?}: click queues a listing");
+        app.reconcile_world(herdr_reviewr::world::build(&app.world_input()).unwrap());
+        assert!(
+            app.file_rows.iter().any(|row| row.dir_path() == Some("docs/guides")),
+            "{position:?}: broad row click expands docs"
+        );
+        assert_eq!(app.diff_path, original, "{position:?}: directory click opens no file");
+
+        press(&mut app, &keymap, KeyCode::Right); // open docs → first child
+        assert_eq!(app.file_rows[app.file_cursor].dir_path(), Some("docs/guides"));
+        press(&mut app, &keymap, KeyCode::Right); // expand guides
+        app.reconcile_world(herdr_reviewr::world::build(&app.world_input()).unwrap());
+        press(&mut app, &keymap, KeyCode::Right); // select start.md
+        assert_eq!(app.diff_path.as_deref(), Some("docs/guides/start.md"));
+        press(&mut app, &keymap, KeyCode::Left); // file → parent
+        assert_eq!(app.file_rows[app.file_cursor].dir_path(), Some("docs/guides"));
+        press(&mut app, &keymap, KeyCode::Left); // collapse guides
+        press(&mut app, &keymap, KeyCode::Left); // closed guides → docs
+        assert_eq!(app.file_rows[app.file_cursor].dir_path(), Some("docs"));
+        press(&mut app, &keymap, KeyCode::Left); // collapse docs
+        press(&mut app, &keymap, KeyCode::Enter); // enter toggles docs back open
+        app.reload().unwrap();
+        assert_eq!(app.file_rows[app.file_cursor].dir_path(), Some("docs"));
+        assert!(
+            app.file_rows.iter().any(|row| row.dir_path() == Some("docs/guides")),
+            "{position:?}: refresh preserves the expanded path"
+        );
+    }
+}
+
+#[test]
+fn git_file_directory_row_toggles_without_file_click_side_effects() {
+    let r = Repo::init();
+    r.write("src/app.rs", "old\n");
+    r.write("src/ui.rs", "old\n");
+    r.commit_all("init");
+    r.write("src/app.rs", "old\nnew\n");
+    r.write("src/ui.rs", "old\nnew\n");
+    let mut app = app_on(&r);
+    let area = Rect::new(0, 0, 120, 40);
+    let keymap = Keymap::default();
+    let docs = app.file_rows.iter().position(|row| row.dir_path() == Some("src")).unwrap();
+    let (column, row) = (0..area.height)
+        .flat_map(|row| (0..area.width).map(move |column| (column, row)))
+        .filter(|&(column, row)| {
+            herdr_reviewr::ui::hit_file(
+                area,
+                &app,
+                column,
+                row,
+                app.file_rows.len(),
+                app.file_scroll,
+            ) == Some(docs)
+        })
+        .max_by_key(|&(column, _)| column)
+        .unwrap();
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &[],
+        &keymap,
+    )
+    .unwrap();
+    assert!(
+        !app.file_rows.iter().any(|row| row.name == "app.rs"),
+        "the broad Git directory click collapses its children"
+    );
+    press(&mut app, &keymap, KeyCode::Enter);
+    let app_file = app.file_rows.iter().position(|row| row.name == "app.rs").unwrap();
+    let (column, row) = (0..area.height)
+        .flat_map(|row| (0..area.width).map(move |column| (column, row)))
+        .filter(|&(column, row)| {
+            herdr_reviewr::ui::hit_file(
+                area,
+                &app,
+                column,
+                row,
+                app.file_rows.len(),
+                app.file_scroll,
+            ) == Some(app_file)
+        })
+        .max_by_key(|&(column, _)| column)
+        .unwrap();
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &[],
+        &keymap,
+    )
+    .unwrap();
+    assert_eq!(app.diff_path.as_deref(), Some("src/app.rs"));
+    assert!(
+        app.file_rows.iter().any(|row| row.name == "ui.rs"),
+        "a file click opens only the file and does not collapse its parent"
+    );
+}
+
+#[test]
+fn a_non_git_directory_opens_a_files_only_read_only_browser() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+    std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+    std::fs::write(dir.path().join("plain.txt"), "plain content\n").unwrap();
+    std::fs::write(dir.path().join("ignored.log"), "still visible\n").unwrap();
+    std::fs::write(dir.path().join("nested/readme.md"), "# Raw directory\n").unwrap();
+    std::fs::write(dir.path().join(".git/config"), "must not list\n").unwrap();
+
+    let mut app = App::new(dir.path().to_path_buf(), Scope::Branch, None);
+    app.reload().unwrap();
+
+    assert!(!app.is_git_review());
+    assert_eq!(app.repo, dir.path(), "Files-only keeps the exact launch root");
+    assert_eq!(app.tab, herdr_reviewr::app::Tab::AllFiles);
+    let paths: Vec<_> = app.entries.iter().map(|entry| entry.path.as_str()).collect();
+    assert_eq!(paths, ["ignored.log", "nested", "plain.txt"]);
+    assert!(!paths.iter().any(|path| path.starts_with(".git")));
+
+    app.file_cursor = app.file_rows.iter().position(|row| row.name == "nested").unwrap();
+    app.expand_dir();
+    assert!(app.world_request.is_some(), "expansion queues a worker refresh after paint");
+    assert!(
+        !app.entries.iter().any(|entry| entry.path == "nested/readme.md"),
+        "expansion does not synchronously traverse descendants"
+    );
+    let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    app.reconcile_world(snapshot);
+    assert!(app.entries.iter().any(|entry| entry.path == "nested/readme.md"));
+
+    app.select_file(file_row(&app, "plain.txt")).unwrap();
+    assert_eq!(app.diff_path.as_deref(), Some("plain.txt"));
+    assert!(app.visible.iter().any(|row| row.text() == "plain content"));
+    assert!(app.find_available(), "the raw content reader still supports find");
+
+    let keymap = Keymap::default();
+    press(&mut app, &keymap, KeyCode::Char('1'));
+    assert_eq!(app.tab, herdr_reviewr::app::Tab::AllFiles);
+    assert_eq!(app.status, "unavailable in Files-only mode");
+    press(&mut app, &keymap, KeyCode::Char('c'));
+    assert!(!app.composing());
+    assert_eq!(app.status, "unavailable in Files-only mode");
+    app.next_hunk();
+    assert_eq!(app.status, "unavailable in Files-only mode");
+    assert!(app.store.is_empty());
+    assert!(
+        !app.footer_bands().iter().any(|(action, _)| matches!(
+            action,
+            FooterAction::Scope | FooterAction::Send | FooterAction::Comment
+        )),
+        "Files-only footer must not advertise Git review actions"
+    );
+}
+
+#[test]
+fn selection_strip_click_starts_a_new_comment_and_each_card_row_edits_its_card() {
+    fn app_with_endpoint_cards(r: &Repo) -> App {
+        let mut app = app_on(r);
+        let endpoint = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+        app.focus = Focus::Diff;
+        app.diff_cursor = endpoint;
+        for text in [
+            "first saved card has enough text to occupy several painted rows",
+            "second saved card proves every card keeps its own exact mouse target",
+        ] {
+            app.start_comment();
+            app.input = text.to_string();
+            app.submit_comment();
+            app.diff_cursor = endpoint;
+        }
+        // Saving clears the selection. Recreate the same endpoint selection so its dedicated
+        // Comment strip is directly before the two saved cards.
+        app.select_anchor = Some(endpoint);
+        app
+    }
+
+    let r = Repo::init();
+    r.write("a.rs", "alpha\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nbeta\n");
+    let area = Rect::new(0, 0, 120, 40);
+    let keymap = Keymap::default();
+    let app = app_with_endpoint_cards(&r);
+    let heights = ui::diff_row_heights(&app, area);
+    let strip = ui::comment_affordance_rect(area, &app, &heights, app.diff_scroll)
+        .expect("an endpoint selection paints its Comment strip");
+
+    // This was the regression: the card hit-test assigned the newly rendered strip to the first
+    // card on its endpoint, so clicking Comment edited that card instead of starting a draft.
+    let mut strip_app = app_with_endpoint_cards(&r);
+    let strip_heights = ui::diff_row_heights(&strip_app, area);
+    handle_mouse(
+        &mut strip_app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: strip.x,
+            row: strip.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &strip_heights,
+        &keymap,
+    )
+    .unwrap();
+    assert!(
+        matches!(strip_app.mode, Mode::Composing { editing: None }),
+        "the explicit Comment strip starts a new composer"
+    );
+    assert_eq!(strip_app.store.len(), 2, "starting a draft does not alter saved cards");
+
+    // Pick one point from every painted card row. Rebuilding the identical app for each click
+    // keeps a prior edit from hiding its card, so every rendered row is dispatched end to end.
+    let mut card_rows = Vec::new();
+    for row in 0..area.height {
+        if let Some((column, id)) = (0..area.width).find_map(|column| {
+            ui::hit_comment_card(area, &app, column, row, &heights, app.diff_scroll)
+                .map(|id| (column, id))
+        }) {
+            card_rows.push((column, row, id));
+        }
+    }
+    assert!(card_rows.len() >= 6, "both multi-row cards paint clickable rows: {card_rows:?}");
+    for (column, row, expected) in card_rows {
+        let mut card_app = app_with_endpoint_cards(&r);
+        let card_heights = ui::diff_row_heights(&card_app, area);
+        handle_mouse(
+            &mut card_app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &card_heights,
+            &keymap,
+        )
+        .unwrap();
+        assert_eq!(
+            card_app.mode,
+            Mode::Composing { editing: Some(expected) },
+            "card point ({column}, {row}) edits its exact card"
+        );
+    }
 }

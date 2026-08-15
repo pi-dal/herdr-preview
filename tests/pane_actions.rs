@@ -1,17 +1,25 @@
 #![cfg(unix)]
 
+use herdr_reviewr::keymap::{Action, Key, Keymap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard};
 
-fn reviewr_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_herdr-reviewr")
+static ACTION_RUN_LOCK: Mutex<()> = Mutex::new(());
+
+fn action_run_lock() -> MutexGuard<'static, ()> {
+    ACTION_RUN_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// A fake herdr, answering in the live 0.7.5 envelope shapes (docs/herdr-api-notes.md).
+fn preview_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_herdr-preview")
+}
+
+/// A fake herdr, answering in the envelope shapes required from Herdr 0.8.0.
 /// `pane list` serves `panes.json` (else one plain pane), `pane process-info` serves the
-/// per-pane `procinfo-<id>.json` (else a plain shell, which is not a reviewr pane) or fails
+/// per-pane `procinfo-<id>.json` (else a plain shell, which is not a Preview pane) or fails
 /// with `procfail-<id>.json` on stderr, `pane close` succeeds unless `closefail-<id>`
 /// exists (whose content becomes the failure's stderr), `plugin config-dir` names the
 /// fixture dir itself (after a 5s hang when `configdir-hang` exists), and everything else
@@ -40,6 +48,12 @@ fn fake_herdr(dir: &Path) -> (PathBuf, PathBuf) {
                 "  'plugin config-dir '*)\n",
                 "    if [ -f \"$dir/configdir-hang\" ]; then sleep 5; fi\n",
                 "    printf '%s\\n' \"$dir\" ;;\n",
+                "  'plugin pane focus '*)\n",
+                "    if [ -f \"$dir/focusfail-$4\" ]; then cat \"$dir/focusfail-$4\" >&2; exit 1; fi\n",
+                "    printf '%s\\n' '{{\"result\":{{}}}}' ;;\n",
+                "  'pane send-keys '*)\n",
+                "    if [ -f \"$dir/sendfail-$3\" ]; then cat \"$dir/sendfail-$3\" >&2; exit 1; fi\n",
+                "    printf '%s\\n' '{{\"result\":{{}}}}' ;;\n",
                 "  *) printf '%s\\n' '{{\"result\":{{\"plugin_pane\":{{\"pane\":{{\"pane_id\":\"w1:p9\",\"tab_id\":\"w1:t9\"}}}}}}}}' ;;\n",
                 "esac\n",
             ),
@@ -86,6 +100,17 @@ fn init_repo(dir: &Path, name: &str) -> PathBuf {
     repo
 }
 
+fn git_root(path: &Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 /// One `pane list` answer: a single pane whose entry carries a live `foreground_cwd`,
 /// in the live envelope shape (docs/herdr-api-notes.md).
 fn pane_with_cwd(dir: &Path, pane: &str, foreground_cwd: &Path) {
@@ -100,10 +125,11 @@ fn pane_with_cwd(dir: &Path, pane: &str, foreground_cwd: &Path) {
 }
 
 fn run(mode: &str, config_dir: &Path, herdr: &Path) -> Output {
+    let _guard = action_run_lock();
     Command::new("bash")
         .arg("herdr/pane.sh")
         .arg(mode)
-        .env("HERDR_REVIEWR_BIN", reviewr_bin())
+        .env("HERDR_PREVIEW_BIN", preview_bin())
         .env("HERDR_PLUGIN_CONFIG_DIR", config_dir)
         .env("HERDR_BIN_PATH", herdr)
         .env("HERDR_WORKSPACE_ID", "workspace-1")
@@ -120,10 +146,25 @@ fn run_open(config_dir: &Path, herdr: &Path) -> Output {
 
 /// Any mode with a caller-shaped action context.
 fn run_with_context(mode: &str, config_dir: &Path, herdr: &Path, context: &str) -> Output {
+    let _guard = action_run_lock();
     Command::new("bash")
         .arg("herdr/pane.sh")
         .arg(mode)
-        .env("HERDR_REVIEWR_BIN", reviewr_bin())
+        .env("HERDR_PREVIEW_BIN", preview_bin())
+        .env("HERDR_PLUGIN_CONFIG_DIR", config_dir)
+        .env("HERDR_BIN_PATH", herdr)
+        .env("HERDR_WORKSPACE_ID", "workspace-1")
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env("HERDR_PLUGIN_CONTEXT_JSON", context)
+        .output()
+        .unwrap()
+}
+
+fn run_forward_with_context(key: &str, config_dir: &Path, herdr: &Path, context: &str) -> Output {
+    let _guard = action_run_lock();
+    Command::new("bash")
+        .args(["herdr/pane.sh", "forward", key])
+        .env("HERDR_PREVIEW_BIN", preview_bin())
         .env("HERDR_PLUGIN_CONFIG_DIR", config_dir)
         .env("HERDR_BIN_PATH", herdr)
         .env("HERDR_WORKSPACE_ID", "workspace-1")
@@ -139,7 +180,7 @@ fn invalid_config_refuses_manual_action_before_herdr_side_effects() {
     fs::write(dir.path().join("config.toml"), "theme = \"not-a-theme\"\n").unwrap();
     let (herdr, log) = fake_herdr(dir.path());
 
-    for mode in ["open", "close", "toggle"] {
+    for mode in ["open", "close", "toggle", "peek"] {
         let output = run(mode, dir.path(), &herdr);
         assert_eq!(output.status.code(), Some(1), "{mode}");
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -201,7 +242,7 @@ fn valid_auto_open_runtime_refusal_remains_silent() {
     let output = Command::new("bash")
         .arg("herdr/pane.sh")
         .arg("auto-open")
-        .env("HERDR_REVIEWR_BIN", reviewr_bin())
+        .env("HERDR_PREVIEW_BIN", preview_bin())
         .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())
         .env("HERDR_BIN_PATH", &herdr)
         .env_remove("HERDR_WORKSPACE_ID")
@@ -231,7 +272,7 @@ fn a_pane_running_the_review_ui_counts_however_it_was_launched() {
         concat!(
             r#"{"pid":7,"name":"cargo","argv0":"cargo","argv":["cargo","run"],"cwd":"/w"},"#,
             // The child's title (`name`) is rewritten, so only the executable identifies it.
-            r#"{"pid":8,"name":"some-title","argv0":"target/debug/herdr-reviewr","argv":["target/debug/herdr-reviewr"],"cwd":"/w"}"#
+            r#"{"pid":8,"name":"some-title","argv0":"target/debug/herdr-preview","argv":["target/debug/herdr-preview"],"cwd":"/w"}"#
         ),
     );
 
@@ -267,7 +308,7 @@ fn close_sweeps_every_reviewr_pane_and_a_close_that_lost_the_race_still_converge
         r#"{"result":{"panes":[{"pane_id":"w1:p1"},{"pane_id":"w1:p2","label":"reviewr"},{"pane_id":"w1:p3"}]}}"#,
     )
     .unwrap();
-    let ui = r#"{"pid":8,"name":"herdr-reviewr","argv0":"herdr-reviewr","argv":["/plugin/bin/herdr-reviewr"],"cwd":"/w"}"#;
+    let ui = r#"{"pid":8,"name":"herdr-preview","argv0":"herdr-preview","argv":["/plugin/bin/herdr-preview"],"cwd":"/w"}"#;
     procinfo(dir.path(), "w1:p1", ui);
     procinfo(dir.path(), "w1:p3", ui);
     // w1:p3's close fails with the pane gone: it exited between the read and the close.
@@ -307,7 +348,7 @@ fn a_close_that_fails_for_a_live_pane_sweeps_the_rest_then_refuses() {
         r#"{"result":{"panes":[{"pane_id":"w1:p1"},{"pane_id":"w1:p3"}]}}"#,
     )
     .unwrap();
-    let ui = r#"{"pid":8,"name":"herdr-reviewr","argv0":"herdr-reviewr","argv":["/plugin/bin/herdr-reviewr"],"cwd":"/w"}"#;
+    let ui = r#"{"pid":8,"name":"herdr-preview","argv0":"herdr-preview","argv":["/plugin/bin/herdr-preview"],"cwd":"/w"}"#;
     procinfo(dir.path(), "w1:p1", ui);
     procinfo(dir.path(), "w1:p3", ui);
     // w1:p1's close fails with the pane still there — a wedged herdr, not the benign
@@ -344,14 +385,14 @@ fn a_gone_pane_skips_and_an_unreadable_read_refuses() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("close: nothing open"));
 
-    // Any other read failure refuses, never reads as "no reviewr pane": an open would
+    // Any other read failure refuses, never reads as "no Preview pane": an open would
     // stack a duplicate and a close would false-succeed (specs/herdr-host.md).
     fs::write(
         dir.path().join("procfail-w1:p1.json"),
         r#"{"error":{"code":"internal","message":"boom"},"id":"cli:request"}"#,
     )
     .unwrap();
-    for mode in ["open", "close", "toggle"] {
+    for mode in ["open", "close", "toggle", "peek"] {
         let output = run(mode, dir.path(), &herdr);
         assert_eq!(output.status.code(), Some(1), "{mode}");
         assert!(
@@ -372,16 +413,16 @@ fn an_action_repoints_the_stable_launch_paths_at_the_live_plugin_root() {
     let home = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     fs::create_dir_all(root.path().join("bin")).unwrap();
-    fs::write(root.path().join("bin/herdr-reviewr"), "#!/bin/sh\n").unwrap();
+    fs::write(root.path().join("bin/herdr-preview"), "#!/bin/sh\n").unwrap();
     let mut permissions =
-        fs::metadata(root.path().join("bin/herdr-reviewr")).unwrap().permissions();
+        fs::metadata(root.path().join("bin/herdr-preview")).unwrap().permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(root.path().join("bin/herdr-reviewr"), permissions).unwrap();
+    fs::set_permissions(root.path().join("bin/herdr-preview"), permissions).unwrap();
     let run_close = |home: &Path| {
         Command::new("bash")
             .arg("herdr/pane.sh")
             .arg("close")
-            .env("HERDR_REVIEWR_BIN", reviewr_bin())
+            .env("HERDR_PREVIEW_BIN", preview_bin())
             .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())
             .env("HERDR_BIN_PATH", &herdr)
             .env("HERDR_WORKSPACE_ID", "workspace-1")
@@ -395,9 +436,9 @@ fn an_action_repoints_the_stable_launch_paths_at_the_live_plugin_root() {
 
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let state_link =
-        home.path().join(".local/state/herdr/plugins/persiyanov.reviewr/bin/herdr-reviewr");
-    assert_eq!(fs::read_link(&state_link).unwrap(), root.path().join("bin/herdr-reviewr"));
-    let bin_link = home.path().join(".local/bin/herdr-reviewr");
+        home.path().join(".local/state/herdr/plugins/pi-dal.herdr-preview/bin/herdr-preview");
+    assert_eq!(fs::read_link(&state_link).unwrap(), root.path().join("bin/herdr-preview"));
+    let bin_link = home.path().join(".local/bin/herdr-preview");
     assert!(!bin_link.exists(), "~/.local/bin must not be created for the link");
 
     // With `~/.local/bin` present, the second link lands too — and an existing symlink
@@ -406,7 +447,7 @@ fn an_action_repoints_the_stable_launch_paths_at_the_live_plugin_root() {
     std::os::unix::fs::symlink("/nonexistent/old", &bin_link).unwrap();
     let output = run_close(home.path());
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(fs::read_link(&bin_link).unwrap(), root.path().join("bin/herdr-reviewr"));
+    assert_eq!(fs::read_link(&bin_link).unwrap(), root.path().join("bin/herdr-preview"));
 }
 
 #[test]
@@ -414,13 +455,13 @@ fn a_process_info_answer_missing_its_shape_refuses() {
     let dir = tempfile::tempdir().unwrap();
     let (herdr, _log) = fake_herdr(dir.path());
     // Exit 0 with an error envelope — no `.result.process_info.foreground_processes`. A
-    // shape failure must refuse like a failed pane list, never read as "no reviewr pane".
+    // shape failure must refuse like a failed pane list, never read as "no Preview pane".
     fs::write(
         dir.path().join("procinfo-w1:p1.json"),
         r#"{"error":{"code":"internal","message":"boom"},"id":"cli:request"}"#,
     )
     .unwrap();
-    for mode in ["open", "close", "toggle"] {
+    for mode in ["open", "close", "toggle", "peek"] {
         let output = run(mode, dir.path(), &herdr);
         assert_eq!(output.status.code(), Some(1), "{mode}");
         assert!(
@@ -436,7 +477,7 @@ fn a_failed_pane_list_refuses_rather_than_reading_as_no_pane() {
     let dir = tempfile::tempdir().unwrap();
     let (herdr, _log) = fake_herdr(dir.path());
     // `pane list` answering an error envelope (exit 0, no `.result.panes`) must refuse:
-    // read as "no reviewr pane", an open would stack a duplicate and a close would
+    // read as "no Preview pane", an open would stack a duplicate and a close would
     // false-succeed with panes still running.
     fs::write(
         dir.path().join("panes.json"),
@@ -462,9 +503,10 @@ fn the_cli_fallback_resolves_the_config_dir_when_the_env_names_none() {
     // the unit tests drive the resolver with an injected closure.
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("config.toml"), "theme = \"gruvbox\"\n").unwrap();
-    let (herdr, _log) = fake_herdr(dir.path());
+    let (herdr, log) = fake_herdr(dir.path());
 
-    let output = Command::new(reviewr_bin())
+    let _guard = action_run_lock();
+    let output = Command::new(preview_bin())
         .arg("--resolve-plugin-config")
         .env_remove("HERDR_PLUGIN_CONFIG_DIR")
         .env("HERDR_BIN_PATH", &herdr)
@@ -474,6 +516,11 @@ fn the_cli_fallback_resolves_the_config_dir_when_the_env_names_none() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("gruvbox"), "expected the CLI-named dir's config: {stdout}");
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(
+        calls.contains("plugin config-dir pi-dal.herdr-preview"),
+        "config fallback must use the fork plugin id: {calls}"
+    );
 }
 
 #[test]
@@ -486,7 +533,8 @@ fn a_wedged_config_dir_lookup_degrades_to_the_defaults_inside_the_bound() {
     fs::write(dir.path().join("configdir-hang"), "").unwrap();
     let (herdr, _log) = fake_herdr(dir.path());
 
-    let output = Command::new(reviewr_bin())
+    let _guard = action_run_lock();
+    let output = Command::new(preview_bin())
         .arg("--resolve-plugin-config")
         .env_remove("HERDR_PLUGIN_CONFIG_DIR")
         .env("HERDR_BIN_PATH", &herdr)
@@ -509,7 +557,7 @@ fn a_flag_run_never_counts_as_the_review_ui() {
     procinfo(
         dir.path(),
         "w1:p1",
-        r#"{"pid":7,"name":"herdr-reviewr","argv0":"herdr-reviewr","argv":["herdr-reviewr","--resolve-plugin-config"],"cwd":"/w"}"#,
+        r#"{"pid":7,"name":"herdr-preview","argv0":"herdr-preview","argv":["herdr-preview","--resolve-plugin-config"],"cwd":"/w"}"#,
     );
 
     let output = run_open(dir.path(), &herdr);
@@ -528,7 +576,7 @@ fn the_flag_dispatch_matches_the_actions_anywhere_in_argv() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("config.toml"), "theme = \"gruvbox\"\n").unwrap();
 
-    let output = Command::new(reviewr_bin())
+    let output = Command::new(preview_bin())
         .args(["--some-future-arg", "--resolve-plugin-config"])
         .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())
         .output()
@@ -576,7 +624,7 @@ fn tab_placement_open_names_its_fresh_tab() {
 
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let calls = fs::read_to_string(&log).unwrap();
-    assert!(calls.contains("tab rename w1:t9 reviewr"), "{calls}");
+    assert!(calls.contains("tab rename w1:t9 Preview"), "{calls}");
 }
 
 // --- Open cwd: the focused pane's live foreground cwd, then the context's launch cwd.
@@ -662,13 +710,9 @@ fn open_keeps_the_context_cwd_without_a_live_foreground_cwd() {
 }
 
 #[test]
-fn a_toggle_open_falls_back_when_the_live_cwd_is_not_a_repo() {
+fn toggle_uses_the_focused_non_git_cwd_exactly() {
     let dir = tempfile::tempdir().unwrap();
     let (herdr, log) = fake_herdr(dir.path());
-    // The live foreground cwd sits outside any git repo — a shell that wandered off. The
-    // live cwd wins only inside a repo; here it yields to the context cwd rather than
-    // refusing an open the context alone could place (specs/herdr-host.md, Repo
-    // discovery). Run as a toggle, so the opening toggle exercises the same block.
     let context = serde_json::json!({
         "focused_pane_id": "w1:p1",
         "focused_pane_cwd": env!("CARGO_MANIFEST_DIR"),
@@ -677,13 +721,11 @@ fn a_toggle_open_falls_back_when_the_live_cwd_is_not_a_repo() {
     pane_with_cwd(dir.path(), "w1:p1", dir.path());
 
     let output = run_with_context("toggle", dir.path(), &herdr, &context);
-
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let calls = fs::read_to_string(&log).unwrap();
-    assert!(
-        calls.contains(&format!("--cwd {}", env!("CARGO_MANIFEST_DIR"))),
-        "a non-repo live cwd must fall back to the context cwd: {calls}"
-    );
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains(&format!("--cwd {}", dir.path().display())), "{calls}");
+    assert!(calls.contains("--focus"), "{calls}");
+    assert!(!calls.contains(env!("CARGO_MANIFEST_DIR")), "{calls}");
 }
 
 #[test]
@@ -720,24 +762,111 @@ fn open_takes_the_focused_panes_cwd_not_another_panes() {
 }
 
 #[test]
-fn a_refusal_names_the_rejected_live_cwd_too() {
+fn a_non_git_focused_cwd_opens_instead_of_refusing() {
     let dir = tempfile::tempdir().unwrap();
-    let (herdr, _log) = fake_herdr(dir.path());
-    // No context cwd and a non-repo live cwd: the open refuses, and the one stderr line
-    // names the live directory it inspected and rejected — a refusal that hid it would
-    // read as if no directory was ever tried.
-    let context = serde_json::json!({"focused_pane_id": "w1:p1"}).to_string();
+    let (herdr, log) = fake_herdr(dir.path());
+    let context =
+        serde_json::json!({"focused_pane_id": "w1:p1", "focused_pane_cwd": dir.path()}).to_string();
+    pane_with_cwd(dir.path(), "w1:p1", dir.path());
+    let output = run_with_context("open", dir.path(), &herdr, &context);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(fs::read_to_string(log).unwrap().contains(&format!("--cwd {}", dir.path().display())));
+}
+
+#[test]
+fn open_uses_the_focused_non_git_cwd_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    let context = serde_json::json!({
+        "focused_pane_id": "w1:p1",
+        "focused_pane_cwd": env!("CARGO_MANIFEST_DIR"),
+    })
+    .to_string();
     pane_with_cwd(dir.path(), "w1:p1", dir.path());
 
     let output = run_with_context("open", dir.path(), &herdr, &context);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains(&format!("--cwd {}", dir.path().display())), "{calls}");
+    assert!(calls.contains("--focus"), "{calls}");
+    assert!(!calls.contains(env!("CARGO_MANIFEST_DIR")), "{calls}");
+}
 
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not a git repo"), "{stderr}");
-    assert!(
-        stderr.contains(dir.path().to_str().unwrap()),
-        "the refusal must name the rejected live cwd: {stderr}"
-    );
+#[test]
+fn open_ignores_unrelated_pane_repositories() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    let context = serde_json::json!({
+        "focused_pane_id": "w1:p1",
+        "focused_pane_cwd": env!("CARGO_MANIFEST_DIR"),
+    })
+    .to_string();
+    pane_with_cwd(dir.path(), "w1:p1", dir.path());
+
+    let output = run_with_context("open", dir.path(), &herdr, &context);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains(&format!("--cwd {}", dir.path().display())), "{calls}");
+    assert!(calls.contains("--focus"), "{calls}");
+    assert!(!calls.contains(env!("CARGO_MANIFEST_DIR")), "{calls}");
+}
+
+#[test]
+fn peek_uses_the_focused_non_git_cwd_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    let context = serde_json::json!({
+        "focused_pane_id": "w1:p1",
+        "focused_pane_cwd": env!("CARGO_MANIFEST_DIR"),
+    })
+    .to_string();
+    pane_with_cwd(dir.path(), "w1:p1", dir.path());
+
+    let output = run_with_context("peek", dir.path(), &herdr, &context);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains(&format!("--cwd {}", dir.path().display())), "{calls}");
+    assert!(calls.contains("--no-focus"), "{calls}");
+    assert!(!calls.contains(env!("CARGO_MANIFEST_DIR")), "{calls}");
+}
+
+#[test]
+fn forward_opens_files_only_from_the_focused_non_git_cwd_without_cross_pane_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    let first = init_repo(dir.path(), "first");
+    let second = init_repo(dir.path(), "second");
+    fs::write(dir.path().join("panes.json"), format!(
+        r#"{{"result":{{"panes":[{{"pane_id":"w1:p1","foreground_cwd":"{}"}},{{"pane_id":"w1:p2","foreground_cwd":"{}"}},{{"pane_id":"w1:p3","foreground_cwd":"{}"}}]}}}}"#,
+        dir.path().display(), first.display(), second.display())).unwrap();
+    let context =
+        serde_json::json!({"focused_pane_id": "w1:p1", "focused_pane_cwd": dir.path()}).to_string();
+    let output = run_forward_with_context("alt+d", dir.path(), &herdr, &context);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains(&format!("--cwd {}", dir.path().display())), "{calls}");
+    assert!(!calls.contains(&format!("--cwd {}", git_root(&first))), "{calls}");
+    assert!(!calls.contains(&format!("--cwd {}", git_root(&second))), "{calls}");
+    assert!(calls.contains("pane send-keys w1:p9 alt+d"), "{calls}");
+}
+
+#[test]
+fn toggle_ignores_upstream_and_unrelated_repositories() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    let context = serde_json::json!({
+        "focused_pane_id": "w1:p1",
+        "focused_pane_cwd": env!("CARGO_MANIFEST_DIR"),
+    })
+    .to_string();
+    pane_with_cwd(dir.path(), "w1:p1", dir.path());
+
+    let output = run_with_context("toggle", dir.path(), &herdr, &context);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains(&format!("--cwd {}", dir.path().display())), "{calls}");
+    assert!(calls.contains("--focus"), "{calls}");
+    assert!(!calls.contains(env!("CARGO_MANIFEST_DIR")), "{calls}");
 }
 
 #[test]
@@ -765,7 +894,7 @@ fn auto_open_takes_the_event_payload_cwd_over_the_live_one() {
     let output = Command::new("bash")
         .arg("herdr/pane.sh")
         .arg("auto-open")
-        .env("HERDR_REVIEWR_BIN", reviewr_bin())
+        .env("HERDR_PREVIEW_BIN", preview_bin())
         .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())
         .env("HERDR_BIN_PATH", &herdr)
         .env("HERDR_PLUGIN_CONTEXT_JSON", &context)
@@ -813,7 +942,7 @@ fn auto_open_passes_no_focus() {
     let output = Command::new("bash")
         .arg("herdr/pane.sh")
         .arg("auto-open")
-        .env("HERDR_REVIEWR_BIN", reviewr_bin())
+        .env("HERDR_PREVIEW_BIN", preview_bin())
         .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())
         .env("HERDR_BIN_PATH", &herdr)
         .env("HERDR_PLUGIN_EVENT_JSON", &event)
@@ -838,4 +967,279 @@ fn split_placement_open_renames_no_tab() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let calls = fs::read_to_string(&log).unwrap();
     assert!(!calls.contains("tab rename"), "{calls}");
+}
+
+#[test]
+fn peek_ignores_upstream_reviewr_then_finds_preview_without_focus_or_close() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        "toggle_placement = \"overlay\"\ntoggle_direction = \"down\"\n",
+    )
+    .unwrap();
+    let launch_repo = init_repo(dir.path(), "launch-repo");
+    let (herdr, log) = fake_herdr(dir.path());
+    // The workspace contains the upstream plugin pane that triggered this regression. Its
+    // shared review engine must not make Preview's `peek` no-op or close it.
+    fs::write(
+        dir.path().join("panes.json"),
+        format!(
+            r#"{{"result":{{"panes":[{{"pane_id":"w1:p6"}},{{"pane_id":"w1:p7","foreground_cwd":"{}"}}]}}}}"#,
+            env!("CARGO_MANIFEST_DIR"),
+        ),
+    )
+    .unwrap();
+    procinfo(
+        dir.path(),
+        "w1:p6",
+        r#"{"pid":6,"name":"reviewr","argv0":"/upstream/bin/herdr-reviewr","argv":["/upstream/bin/herdr-reviewr"],"cwd":"/w"}"#,
+    );
+    let context = serde_json::json!({
+        "focused_pane_id": "w1:p7",
+        "focused_pane_cwd": launch_repo,
+    })
+    .to_string();
+
+    let output = run_with_context("peek", dir.path(), &herdr, &context);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let calls = fs::read_to_string(&log).unwrap();
+    let opens: Vec<&str> =
+        calls.lines().filter(|line| line.starts_with("plugin pane open ")).collect();
+    assert_eq!(opens.len(), 1, "peek must open exactly once: {calls}");
+    assert_eq!(
+        opens[0],
+        format!(
+            "plugin pane open --plugin pi-dal.herdr-preview --entrypoint pane --placement split --target-pane w1:p7 --direction right --cwd {} --no-focus",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+        "peek must use live cwd and ignore configurable human placement: {calls}"
+    );
+
+    procinfo(
+        dir.path(),
+        "w1:p7",
+        r#"{"pid":8,"name":"renamed","argv0":"/plugin/bin/herdr-preview","argv":["/plugin/bin/herdr-preview"],"cwd":"/w"}"#,
+    );
+    let output = run_with_context("peek", dir.path(), &herdr, &context);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Preview already open"));
+
+    let calls = fs::read_to_string(log).unwrap();
+    assert_eq!(
+        calls.lines().filter(|line| line.starts_with("plugin pane open ")).count(),
+        1,
+        "present peek must not open again: {calls}"
+    );
+    assert!(
+        !calls.lines().any(|line| line.starts_with("pane close ")),
+        "peek never closes: {calls}"
+    );
+    assert!(
+        !calls.split_whitespace().any(|token| token == "--focus"),
+        "peek never focuses: {calls}"
+    );
+}
+
+#[test]
+fn host_forwarding_keys_match_the_existing_tui_keymap() {
+    // `pane send-keys` receives these canonical Herdr spellings. They must stay in the one
+    // existing keymap rather than acquire a second terminal-only dispatch path.
+    let keymap = Keymap::default();
+    let expected = [
+        (Key::alt('d'), Action::TabChanges),
+        (Key::alt('f'), Action::TabAllFiles),
+        (Key::alt('r'), Action::TabPr),
+        (Key::alt('c'), Action::Comment),
+        (Key::alt('l'), Action::Comments),
+        (Key::alt('s'), Action::Send),
+        (Key::alt_shift('r'), Action::Refresh),
+        (Key::alt('u'), Action::HideUnchanged),
+        (Key::alt_named('↑'), Action::PrevChange),
+        (Key::alt_named('↓'), Action::NextChange),
+        (Key::alt_named('⇧'), Action::PrevFile),
+        (Key::alt_named('⇩'), Action::NextFile),
+        (Key::alt_named('←'), Action::PrevHunk),
+        (Key::alt_named('→'), Action::NextHunk),
+    ];
+    for (key, action) in expected {
+        assert_eq!(keymap.action_for(key), Some(action), "{key}");
+    }
+}
+
+#[test]
+fn forward_ignores_upstream_then_opens_preview_without_focus_and_sends_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    fs::write(
+        dir.path().join("panes.json"),
+        format!(
+            r#"{{"result":{{"panes":[{{"pane_id":"w1:p6"}},{{"pane_id":"w1:p7","foreground_cwd":"{}"}}]}}}}"#,
+            env!("CARGO_MANIFEST_DIR"),
+        ),
+    )
+    .unwrap();
+    procinfo(
+        dir.path(),
+        "w1:p6",
+        r#"{"pid":6,"name":"reviewr","argv0":"/upstream/bin/herdr-reviewr","argv":["/upstream/bin/herdr-reviewr"],"cwd":"/w"}"#,
+    );
+    let context = serde_json::json!({
+        "focused_pane_id": "w1:p7",
+        "focused_pane_cwd": env!("CARGO_MANIFEST_DIR"),
+    })
+    .to_string();
+
+    let output = run_forward_with_context("alt+d", dir.path(), &herdr, &context);
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains("plugin pane open"), "{calls}");
+    assert!(calls.contains("--target-pane w1:p7"), "{calls}");
+    assert!(calls.contains("--direction right"), "{calls}");
+    assert!(calls.contains("--no-focus"), "{calls}");
+    assert!(calls.lines().any(|line| line == "pane send-keys w1:p9 alt+d"), "{calls}");
+    assert!(!calls.contains("w1:p6 alt+d"), "an upstream pane must never receive a key: {calls}");
+    assert!(!calls.contains("plugin pane focus"), "a tab route preserves agent focus: {calls}");
+}
+
+#[test]
+fn forward_sends_to_an_existing_preview_without_opening_or_focusing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    procinfo(
+        dir.path(),
+        "w1:p1",
+        r#"{"pid":8,"name":"renamed","argv0":"/plugin/bin/herdr-preview","argv":["/plugin/bin/herdr-preview"],"cwd":"/w"}"#,
+    );
+    let context = serde_json::json!({"focused_pane_cwd": env!("CARGO_MANIFEST_DIR")}).to_string();
+
+    let output = run_forward_with_context("alt+f", dir.path(), &herdr, &context);
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.lines().any(|line| line == "pane send-keys w1:p1 alt+f"), "{calls}");
+    assert!(!calls.contains("plugin pane open"), "{calls}");
+    assert!(!calls.contains("plugin pane focus"), "{calls}");
+}
+
+#[test]
+fn forward_comment_and_comments_focus_preview_before_sending() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    procinfo(
+        dir.path(),
+        "w1:p1",
+        r#"{"pid":8,"name":"herdr-preview","argv0":"herdr-preview","argv":["/plugin/bin/herdr-preview"],"cwd":"/w"}"#,
+    );
+    let context = serde_json::json!({"focused_pane_cwd": env!("CARGO_MANIFEST_DIR")}).to_string();
+
+    for key in ["alt+c", "alt+l"] {
+        let _ = fs::remove_file(&log);
+        let output = run_forward_with_context(key, dir.path(), &herdr, &context);
+        assert!(output.status.success(), "{key}: {}", String::from_utf8_lossy(&output.stderr));
+        let calls = fs::read_to_string(&log).unwrap();
+        let focus = calls.find("plugin pane focus w1:p1").unwrap_or_else(|| panic!("{calls}"));
+        let send =
+            calls.find(&format!("pane send-keys w1:p1 {key}")).unwrap_or_else(|| panic!("{calls}"));
+        assert!(focus < send, "focus must precede the interactive key: {calls}");
+    }
+}
+
+#[test]
+fn forward_refuses_without_sending_when_identity_or_focus_is_unreadable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    fs::write(
+        dir.path().join("procfail-w1:p1.json"),
+        r#"{"error":{"code":"internal","message":"boom"},"id":"cli:request"}"#,
+    )
+    .unwrap();
+    let context = serde_json::json!({"focused_pane_cwd": env!("CARGO_MANIFEST_DIR")}).to_string();
+
+    let output = run_forward_with_context("alt+d", dir.path(), &herdr, &context);
+    assert_eq!(output.status.code(), Some(1));
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(
+        !calls.contains("pane send-keys"),
+        "an unreadable identity must not receive input: {calls}"
+    );
+
+    let _ = fs::remove_file(dir.path().join("procfail-w1:p1.json"));
+    procinfo(
+        dir.path(),
+        "w1:p1",
+        r#"{"pid":8,"name":"herdr-preview","argv0":"herdr-preview","argv":["/plugin/bin/herdr-preview"],"cwd":"/w"}"#,
+    );
+    fs::write(dir.path().join("focusfail-w1:p1"), "focus failed").unwrap();
+    let _ = fs::remove_file(&log);
+
+    let output = run_forward_with_context("alt+c", dir.path(), &herdr, &context);
+    assert_eq!(output.status.code(), Some(1));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains("plugin pane focus w1:p1"), "{calls}");
+    assert!(!calls.contains("pane send-keys"), "a failed focus must not forward input: {calls}");
+}
+
+#[test]
+fn peek_refuses_without_workspace_but_opens_files_only_in_a_non_git_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    let output = Command::new("bash")
+        .arg("herdr/pane.sh")
+        .arg("peek")
+        .env("HERDR_PREVIEW_BIN", preview_bin())
+        .env("HERDR_PLUGIN_CONFIG_DIR", dir.path())
+        .env("HERDR_BIN_PATH", &herdr)
+        .env_remove("HERDR_WORKSPACE_ID")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no workspace context"));
+    assert!(!log.exists());
+
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    let context =
+        serde_json::json!({"focused_pane_id": "w1:p1", "focused_pane_cwd": dir.path()}).to_string();
+    pane_with_cwd(dir.path(), "w1:p1", dir.path());
+    let output = run_with_context("peek", dir.path(), &herdr, &context);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains(&format!("--cwd {}", dir.path().display())), "{calls}");
+    assert!(calls.contains("--no-focus"), "{calls}");
+}
+
+#[test]
+fn forward_does_not_reuse_a_preview_with_a_known_different_non_git_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    fs::write(
+        dir.path().join("panes.json"),
+        format!(
+            r#"{{"result":{{"panes":[{{"pane_id":"w1:p1","foreground_cwd":"{}"}},{{"pane_id":"w1:p2","foreground_cwd":"{}"}}]}}}}"#,
+            other.path().display(),
+            dir.path().display(),
+        ),
+    )
+    .unwrap();
+    procinfo(
+        dir.path(),
+        "w1:p1",
+        r#"{"pid":8,"name":"herdr-preview","argv0":"herdr-preview","argv":["/plugin/bin/herdr-preview"],"cwd":"/w"}"#,
+    );
+    let context = serde_json::json!({
+        "focused_pane_id": "w1:p2",
+        "focused_pane_cwd": dir.path(),
+    })
+    .to_string();
+
+    let output = run_forward_with_context("alt+d", dir.path(), &herdr, &context);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains(&format!("--cwd {}", dir.path().display())), "{calls}");
+    assert!(calls.contains("--target-pane w1:p2"), "{calls}");
+    assert!(calls.lines().any(|line| line == "pane send-keys w1:p9 alt+d"), "{calls}");
+    assert!(!calls.lines().any(|line| line == "pane send-keys w1:p1 alt+d"), "{calls}");
 }

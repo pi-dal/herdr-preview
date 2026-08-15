@@ -58,9 +58,13 @@ pub struct Entry {
     pub annotation: Option<Annotation>,
     /// Whether git ignores this path — drives dimming in `All files` (file-list.md).
     pub ignored: bool,
-    /// A wholly-ignored directory placeholder whose children load lazily on expand; never
-    /// set on a `Changes` entry.
+    /// A directory entry. Git review uses this for a wholly-ignored directory placeholder;
+    /// Files-only uses it for every readable real directory.
     pub is_dir: bool,
+    /// Whether this directory must remain an explicit navigator row rather than compressing
+    /// into a lone descendant. Files-only sets it so empty folders are visible; Git review
+    /// keeps its pre-existing inferred-tree behavior.
+    pub explicit_dir: bool,
 }
 
 impl Entry {
@@ -72,6 +76,7 @@ impl Entry {
             annotation: Some(Annotation::from(f)),
             ignored: false,
             is_dir: false,
+            explicit_dir: false,
         }
     }
 }
@@ -100,6 +105,10 @@ impl Row {
 struct Dir {
     dirs: BTreeMap<String, Dir>,
     files: BTreeMap<String, usize>,
+    /// Set when an explicit directory entry created this node. Parents inferred from a file
+    /// path may compress into that file; real Files-only directories must remain rows so empty
+    /// directories and their expansion controls remain visible.
+    explicit: bool,
     /// Set when a wholly-ignored directory placeholder created this node — its row renders
     /// dimmed (file-list.md). A directory derived from tracked file paths stays `false`.
     ignored: bool,
@@ -134,6 +143,7 @@ fn insert(root: &mut Dir, entry: &Entry, index: usize) {
         for seg in segments {
             cur = cur.dirs.entry(seg.to_string()).or_default();
         }
+        cur.explicit = entry.explicit_dir;
         cur.ignored = entry.ignored;
         return;
     }
@@ -157,8 +167,12 @@ fn flatten<S: BuildHasher>(
 ) {
     for (name, sub) in &dir.dirs {
         let (display, path, node) = compress(name, join(prefix, name), sub);
-        if let Some((fname, &index)) = lone_file(node) {
-            // A single-child chain ending in one file folds into a file row, e.g. `a/b/x.rs`.
+        if !node.explicit
+            && let Some((fname, &index)) = lone_file(node)
+        {
+            // A single-child chain ending in one implicit file parent folds into a file row,
+            // e.g. `a/b/x.rs`. Explicit directories, including Files-only empty directories,
+            // remain rows and keep their disclosure control.
             rows.push(file_row(depth, format!("{display}/{fname}"), index, entries));
         } else {
             let expanded = default_expanded ^ toggled.contains(&path);
@@ -185,7 +199,7 @@ fn compress<'a>(name: &str, path: String, start: &'a Dir) -> (String, String, &'
     let mut display = name.to_string();
     let mut path = path;
     let mut node = start;
-    while node.files.is_empty() && node.dirs.len() == 1 {
+    while !node.explicit && node.files.is_empty() && node.dirs.len() == 1 {
         let (child_name, child) = node.dirs.iter().next().expect("len == 1");
         display = format!("{display}/{child_name}");
         path = format!("{path}/{child_name}");
@@ -307,6 +321,52 @@ mod tests {
     }
 
     #[test]
+    fn explicit_directories_remain_expandable_tree_rows() {
+        // Files-only supplies every real directory as an explicit entry, including empty
+        // directories. Unlike implicit Git path parents, those must not compress into a file.
+        let entries = vec![
+            Entry {
+                path: "docs".into(),
+                previous_path: None,
+                annotation: None,
+                ignored: false,
+                is_dir: true,
+                explicit_dir: true,
+            },
+            Entry {
+                path: "docs/guides".into(),
+                previous_path: None,
+                annotation: None,
+                ignored: false,
+                is_dir: true,
+                explicit_dir: true,
+            },
+            Entry {
+                path: "docs/guides/start.md".into(),
+                previous_path: None,
+                annotation: None,
+                ignored: false,
+                is_dir: false,
+                explicit_dir: false,
+            },
+            Entry {
+                path: "docs/empty".into(),
+                previous_path: None,
+                annotation: None,
+                ignored: false,
+                is_dir: true,
+                explicit_dir: true,
+            },
+        ];
+        let expanded: HashSet<String> =
+            ["docs".to_string(), "docs/guides".to_string()].into_iter().collect();
+        assert_eq!(
+            shape_rows(&build(&entries, &expanded, false)),
+            ["0:dir:docs", "1:dir:empty", "1:dir:guides", "2:file:start.md"]
+        );
+    }
+
+    #[test]
     fn an_unannotated_entry_renders_without_a_marker() {
         // An `All files` entry from a bare path renders without a marker or stats.
         let entry = Entry {
@@ -315,6 +375,7 @@ mod tests {
             annotation: None,
             ignored: false,
             is_dir: false,
+            explicit_dir: false,
         };
         let rows = build(&[entry], &HashSet::new(), false);
         assert!(matches!(rows[0].kind, RowKind::File { annotation: None, .. }));
@@ -327,6 +388,7 @@ mod tests {
             annotation: None,
             ignored: true,
             is_dir: true,
+            explicit_dir: false,
         }
     }
 
@@ -348,6 +410,7 @@ mod tests {
             annotation: None,
             ignored: true,
             is_dir: false,
+            explicit_dir: false,
         };
         let rows = build(&[entry], &HashSet::new(), false);
         assert!(rows[0].ignored, "an ignored file row is dimmed");

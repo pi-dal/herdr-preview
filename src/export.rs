@@ -128,7 +128,7 @@ impl ExportTarget for Agent {
     /// Names the agent it addressed. The send is irreversible and consumes the whole set, so
     /// this line is the reviewer's only record of where the review went (`specs/input.md`).
     fn success_message(&self, count: usize) -> String {
-        format!("added {} to {}", counted_comments(count), self.name)
+        format!("Added {} to {}, not submitted", counted_comments(count), self.name)
     }
 
     /// The pane was resolved before the send and closed in between, which is the only way this
@@ -175,8 +175,8 @@ mod tests {
         // The agent line names the pane it addressed, so a mis-send is visible the moment it
         // lands (`specs/input.md`).
         let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into() };
-        assert_eq!(agent.success_message(1), "added 1 comment to release-bot");
-        assert_eq!(agent.success_message(2), "added 2 comments to release-bot");
+        assert_eq!(agent.success_message(1), "Added 1 comment to release-bot, not submitted");
+        assert_eq!(agent.success_message(2), "Added 2 comments to release-bot, not submitted");
         assert_eq!(Clipboard.success_message(1), "copied 1 comment");
         assert_eq!(Clipboard.success_message(2), "copied 2 comments");
     }

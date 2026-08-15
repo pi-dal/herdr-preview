@@ -1,7 +1,7 @@
 name: release
 
-# Build prebuilt binaries for each supported platform and attach them to the GitHub Release
-# whenever a v* tag is pushed. herdr/install.sh downloads the matching asset on plugin install.
+# Build standalone binaries for each supported platform and attach them to the GitHub Release.
+# Managed Herdr plugin installs build the tagged checkout from source through herdr/build.sh.
 on:
   push:
     tags: ["v*"]
@@ -29,7 +29,7 @@ jobs:
       - uses: taiki-e/create-gh-release-action@v1
         with:
           changelog: CHANGELOG.md
-          title: herdr-reviewr $version
+          title: Herdr Preview $version
           draft: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -48,12 +48,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Builds herdr-reviewr for the target (cross-compiling aarch64 Linux via `cross` as needed),
-      # archives it as herdr-reviewr-<target>.tar.gz with a .sha256 sidecar, and uploads both to
+      # Builds herdr-preview for the target (cross-compiling aarch64 Linux via `cross` as needed),
+      # archives it as herdr-preview-<target>.tar.gz with a .sha256 sidecar, and uploads both to
       # the release for this tag. The toolchain is pinned by rust-toolchain.toml.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: herdr-reviewr
+          bin: herdr-preview
           target: ${{ matrix.target }}
           archive: $bin-$target
           checksum: sha256
@@ -62,7 +62,7 @@ jobs:
       # The archive the step above built and uploaded gets a signed provenance attestation.
       - uses: actions/attest-build-provenance@v4
         with:
-          subject-path: herdr-reviewr-${{ matrix.target }}.tar.gz
+          subject-path: herdr-preview-${{ matrix.target }}.tar.gz
 
   # Publish once every target's assets are attached. Publishing seals an immutable release,
   # so this runs last; a failed target leaves the draft for inspection instead of shipping a

@@ -1,6 +1,6 @@
 //! herdr host integration: resolve the agent pane to send to, sample the agents turn
 //! tracking watches, ask herdr for the plugin config directory, and stamp/clear the
-//! pane's cosmetic `reviewr` label.
+//! pane's cosmetic `Preview` label.
 //!
 //! See `specs/herdr-host.md`. Uses the herdr CLI via `$HERDR_BIN_PATH`. The two agent readers
 //! ask different questions and neither narrows the other: [`send_target`] resolves candidates
@@ -122,10 +122,10 @@ fn herdr_on_thread(args: Vec<String>) -> mpsc::Receiver<Result<String>> {
     rx
 }
 
-/// Stamp our own pane's cosmetic `reviewr` label — but only when the pane carries no label,
-/// so a name the user gave their pane survives running reviewr in it (`specs/herdr-host.md`
-/// Pane identity: reviewr supplies the default name, never overrides one). Display only:
-/// the actions and the event identify a reviewr pane by its foreground process, never this
+/// Stamp our own pane's cosmetic `Preview` label — but only when the pane carries no label,
+/// so a name the user gave their pane survives running the review UI in it
+/// (`specs/herdr-host.md` Pane identity). Display only: the actions and the event identify a
+/// Preview pane by its foreground process, never this
 /// label, so a failed read or write just logs — and nothing waits on it, so a hung herdr
 /// cannot sit between the first paint and the event loop. Without a pane id — outside
 /// herdr — a no-op.
@@ -137,12 +137,12 @@ pub fn label_pane() {
         // An unreadable listing stamps anyway: with herdr wedged the rename fails too,
         // and both failures land in the log.
         if current_label(&ws, &pane).is_none() {
-            let _ = herdr(&["pane", "rename", &pane, "reviewr"]);
+            let _ = herdr(&["pane", "rename", &pane, "Preview"]);
         }
     });
 }
 
-/// Clear the cosmetic label on a normal exit — but only a `reviewr` label, so a name the
+/// Clear the cosmetic label on a normal exit — but only a `Preview` label, so a name the
 /// user set is never deleted (`specs/herdr-host.md` Pane identity). The wait is bounded:
 /// this runs after the terminal is restored, and a hung herdr must not hold the shell
 /// prompt hostage for a label a stale copy of which changes nothing.
@@ -152,7 +152,7 @@ pub fn clear_pane_label() {
     };
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        if current_label(&ws, &pane).as_deref() == Some("reviewr") {
+        if current_label(&ws, &pane).as_deref() == Some("Preview") {
             let _ = herdr(&["pane", "rename", &pane, "--clear"]);
         }
         let _ = tx.send(());
@@ -209,7 +209,7 @@ pub fn plugin_config_dir() -> Option<String> {
 /// visible pane to the defaults instead of holding the blank grid issue #4 fixed.
 pub fn plugin_config_dir_with(on_slow: impl FnOnce()) -> Option<String> {
     let rx =
-        herdr_on_thread(vec!["plugin".into(), "config-dir".into(), "persiyanov.reviewr".into()]);
+        herdr_on_thread(vec!["plugin".into(), "config-dir".into(), "pi-dal.herdr-preview".into()]);
     let answer = if let Ok(answer) = rx.recv_timeout(SIGNAL_DELAY) {
         answer
     } else {
@@ -250,7 +250,7 @@ pub fn send_target() -> Result<SendTarget> {
             // A refusal is the whole status line, so it says the clipboard rather than herdr's
             // own wording. The cause is already in the log, with the argv `herdr` kept out of it.
             logln!("agent list failed: {e:#}");
-            bail!("herdr did not answer — copy to the clipboard instead")
+            bail!("Herdr unavailable — comments kept · y copy")
         }
     };
     // Candidacy is decided once, here: an `agent` field, our workspace, not our own pane.
@@ -258,7 +258,7 @@ pub fn send_target() -> Result<SendTarget> {
     // tracking does not come through here: it asks where each agent works instead.
     let picked = candidates(&agents, ws.as_deref(), me.as_deref());
     match picked.len() {
-        0 => bail!("no agent here — copy to the clipboard instead"),
+        0 => bail!("No agent in this workspace — comments kept · y copy"),
         // The sole-agent send shows no row, so only the picker pays for the tab-label call.
         1 => Ok(SendTarget::One(picked[0].choice(&HashMap::new()))),
         _ => {

@@ -14,12 +14,14 @@ pub mod browser;
 pub mod config;
 pub mod diff;
 pub mod export;
+pub mod file_icon;
 pub mod file_list;
 pub mod forge;
 pub mod git;
 pub mod gitlab;
 pub mod herdr;
 pub mod highlight;
+pub mod image_preview;
 pub mod keymap;
 #[macro_use]
 pub mod log;
@@ -50,9 +52,9 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::supports_keyboard_enhancement;
 use ratatui::layout::Rect;
 
-use crate::app::{App, Focus, Mode};
+use crate::app::{App, Focus, Mode, RepositoryMode};
 use crate::config::{Config, PluginConfig};
-use crate::export::Clipboard;
+use crate::export::{Clipboard, ExportTarget};
 use crate::keymap::Keymap;
 use crate::model::Scope;
 
@@ -71,6 +73,15 @@ pub fn run() -> Result<()> {
     cfg.plugin_config_dir = config::resolve_config_dir(|| None);
     let mut initial_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
     let mut app = app_for(&cfg, &initial_config);
+    // A Files-only root is one bounded direct `read_dir`, not a worktree walk. Build it before
+    // the first paint so an ordinary directory opens with useful rows rather than an empty pane;
+    // every descendant remains worker-dispatched after a later expansion.
+    if initial_config.is_ok()
+        && app.repository_mode == RepositoryMode::FilesOnly
+        && let Err(error) = app.reload()
+    {
+        app.status = format!("load failed: {error}");
+    }
 
     let mut terminal = ratatui::init();
     // Bracketed paste so a multi-line paste arrives as one event, not raw keystrokes whose
@@ -119,6 +130,12 @@ pub fn run() -> Result<()> {
         cfg.plugin_config_dir = Some(dir.into());
         initial_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
         app = app_for(&cfg, &initial_config);
+        if initial_config.is_ok()
+            && app.repository_mode == RepositoryMode::FilesOnly
+            && let Err(error) = app.reload()
+        {
+            app.status = format!("load failed: {error}");
+        }
         if let Err(error) = terminal.draw(|f| ui::render(f, &app)) {
             restore_terminal(kbd);
             herdr::clear_pane_label();
@@ -150,15 +167,14 @@ fn restore_terminal(kbd: bool) {
     ratatui::restore();
 }
 
-/// The reviewed repository, resolved to its git top level. Every `App` goes through this,
-/// blocked or ready, so the app and the worker's `TurnHost` hold the same spelling: they key
-/// the baseline ref off it independently, and turn membership compares resolved top levels
-/// against it (`specs/herdr-host.md`).
-///
-/// A non-repo path is not an error — the pane opens to an empty state and starts showing
-/// changes if the directory becomes a repo.
-fn repo_root(cfg: &Config) -> std::path::PathBuf {
-    git::toplevel(&cfg.repo).unwrap_or_else(|| cfg.repo.clone())
+/// Classify the launch directory once. A Git worktree normalizes to its top level. Any other
+/// readable directory remains its exact launch root and enters Files-only mode; no pane or child
+/// repository discovery participates (`specs/herdr-host.md`).
+fn repository_domain(cfg: &Config) -> (std::path::PathBuf, RepositoryMode) {
+    match git::toplevel(&cfg.repo) {
+        Some(root) => (root, RepositoryMode::GitReview),
+        None => (cfg.repo.clone(), RepositoryMode::FilesOnly),
+    }
 }
 
 /// The startup app for one config snapshot: ready on `Ok`, blocked with the error on
@@ -168,7 +184,8 @@ fn app_for(cfg: &Config, initial_config: &Result<PluginConfig, config::PluginCon
     match initial_config {
         Ok(plugin_config) => ready_app(cfg, plugin_config.clone()),
         Err(error) => {
-            let mut app = App::blocked(repo_root(cfg), Scope::Uncommitted, cfg.base.clone());
+            let (repo, mode) = repository_domain(cfg);
+            let mut app = App::blocked_with_mode(repo, mode, Scope::Uncommitted, cfg.base.clone());
             app.set_config_error(error.to_string());
             app
         }
@@ -177,16 +194,27 @@ fn app_for(cfg: &Config, initial_config: &Result<PluginConfig, config::PluginCon
 
 /// Build a fresh working reviewr pane only after the plugin configuration has validated.
 fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
-    let repo = repo_root(cfg);
+    let (repo, mode) = repository_domain(cfg);
+    ready_app_in_domain(cfg, repo, mode, plugin_config)
+}
+
+/// Build a ready pane in an already classified domain. Recovery must use this rather than
+/// [`ready_app`]: the original root and mode are pane identity, not fresh derived inputs.
+fn ready_app_in_domain(
+    cfg: &Config,
+    repo: std::path::PathBuf,
+    mode: RepositoryMode,
+    plugin_config: PluginConfig,
+) -> App {
     let scope = plugin_config.default_scope();
     logln!(
-        "start repo={} poll={:?} base={:?} scope={}",
+        "start repo={} mode={mode:?} poll={:?} base={:?} scope={}",
         repo.display(),
         cfg.poll,
         cfg.base,
         scope.name()
     );
-    let mut app = App::new(repo, scope, cfg.base.clone());
+    let mut app = App::new_with_mode(repo, mode, scope, cfg.base.clone());
     app.set_plugin_config(plugin_config);
     app.set_cli_theme(cfg.theme.clone());
     if let Some(wrap) = cfg.wrap {
@@ -690,13 +718,17 @@ fn event_loop(
     let (recovery_tx, recovery_rx) = mpsc::channel::<(u64, PluginConfig, App)>();
     let mut recovery_inflight = false;
     let (pr_tx, pr_rx) = mpsc::channel::<TaggedPr>();
-    let mut pr = PrCoordinator::new(app.plugin_config().is_some());
+    let mut pr = PrCoordinator::new(app.plugin_config().is_some() && app.is_git_review());
     // The world worker owns every refresh build and the turn tracker; the loop sends
     // input-tagged jobs and reconciles the completions (specs/tui.md).
     let (world_tx, world_job_rx) = mpsc::channel::<crate::world::WorldJob>();
     let (world_res_tx, world_rx) = mpsc::channel::<crate::world::WorldCompletion>();
     let _world_worker = crate::world::spawn(
-        crate::world::TurnHost::open(app.repo.clone()),
+        if app.is_git_review() {
+            crate::world::TurnHost::open(app.repo.clone())
+        } else {
+            crate::world::TurnHost::open_files_only(app.repo.clone())
+        },
         world_job_rx,
         world_res_tx,
     );
@@ -727,7 +759,11 @@ fn event_loop(
                         Ok(current) if current == target => {
                             recovered.carry_authored_state_from(app);
                             *app = recovered;
-                            pr.recover();
+                            if app.is_git_review() {
+                                pr.recover();
+                            } else {
+                                pr.stop();
+                            }
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -862,6 +898,7 @@ fn event_loop(
             // input speed and the results land behind it (specs/search.md).
             if std::mem::take(&mut app.search_dirty)
                 && app.mode == crate::app::Mode::Search
+                && app.search_available()
                 && app.config_error().is_none()
             {
                 let (tx, _) = search_worker.get_or_insert_with(|| {
@@ -1319,10 +1356,19 @@ fn apply_plugin_config_observation(
                 if !*recovery_inflight {
                     *epoch = epoch.wrapping_add(1);
                     *recovery_inflight = true;
-                    let (tx, cfg, target, recovery_epoch) =
-                        (recovery_tx.clone(), cfg.clone(), next, *epoch);
+                    // The launch classification is durable pane identity. In particular, a
+                    // Files-only root may gain a `.git` directory while config is blocked;
+                    // recovery must not re-probe and turn that pane into Git review.
+                    let (tx, cfg, root, mode, target, recovery_epoch) = (
+                        recovery_tx.clone(),
+                        cfg.clone(),
+                        app.repo.clone(),
+                        app.repository_mode,
+                        next,
+                        *epoch,
+                    );
                     thread::spawn(move || {
-                        let mut recovered = ready_app(&cfg, target.clone());
+                        let mut recovered = ready_app_in_domain(&cfg, root, mode, target.clone());
                         if let Err(error) = recovered.reload() {
                             recovered.status = format!("load failed: {error}");
                         }
@@ -1388,6 +1434,18 @@ fn apply_text_edit(app: &mut App, code: KeyCode, ctrl: bool, alt: bool, word: bo
 /// stale hint never dispatches a different action than it advertised (`specs/config.md`).
 /// Public for the dispatch tests; the event loop is the runtime caller.
 pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Result<()> {
+    handle_key_with_clipboard(app, key, area, keymap, &Clipboard)
+}
+
+/// Dispatch one key with an explicit clipboard destination. The runtime passes [`Clipboard`];
+/// tests use this seam to prove picker fallback consumption without touching the system clipboard.
+pub fn handle_key_with_clipboard(
+    app: &mut App,
+    key: KeyEvent,
+    area: Rect,
+    keymap: &Keymap,
+    clipboard: &dyn ExportTarget,
+) -> Result<()> {
     use crate::keymap::Action as K;
     use KeyCode::{Char, Down, Enter, Esc, Left, PageDown, PageUp, Right, Tab, Up};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1458,8 +1516,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
     // folded in here so every context pairs them exactly once. The other fixed keys (`tab`, `esc`,
     // the page keys, `←`/`→`) stay hardcoded per context below (`specs/input.md`).
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // Named arrows are decoded separately from printable bindings. Preserve every modifier the
+    // terminal reported: `ctrl+alt+↓` is not the default `alt+↓`, though a resolved keymap can
+    // explicitly bind the former. Shift has its own named sentinel for the file steps.
+    let named_modifiers = KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+    let named_arrow = |plain, shifted: Option<char>| {
+        if key.modifiers.difference(named_modifiers).is_empty() {
+            let ch = if key.modifiers.contains(KeyModifiers::SHIFT) { shifted? } else { plain };
+            keymap.action_for(crate::keymap::Key { ctrl, alt, ch })
+        } else {
+            None
+        }
+    };
     let action = match key.code {
         Char(c) => keymap.action_for(crate::keymap::Key { ctrl, alt, ch: c }),
+        Down if alt => named_arrow('↓', Some('⇩')),
+        Up if alt => named_arrow('↑', Some('⇧')),
+        Right if alt => named_arrow('→', None),
+        Left if alt => named_arrow('←', None),
         Down => Some(K::Down),
         Up => Some(K::Up),
         _ => None,
@@ -1489,6 +1563,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
         match (action, key.code) {
             (_, Esc) => app.close_picker(),
             (_, Enter) if bare => app.picker_pick(),
+            // A no-agent/unavailable sheet explicitly offers the existing clipboard fallback.
+            // Copy retains its consume-on-confirmed-success semantics.
+            (Some(K::Copy), _) if app.picker_notice.is_some() => {
+                app.close_picker();
+                app.export(clipboard);
+            }
             // The digits outrank the movement bindings, so a reviewer who bound `down` to a
             // digit still gets the row that digit names (`specs/input.md`).
             (_, Char(c @ '1'..='9')) if bare => {
@@ -1496,6 +1576,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             }
             (Some(K::Down), _) => app.picker_move(1),
             (Some(K::Up), _) => app.picker_move(-1),
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // Exact-comment deletion is its own modal. Nothing else can turn a habitual key into a
+    // destructive action; Enter names the only confirmation and Esc restores the review.
+    if let Mode::ConfirmDelete { .. } = app.mode {
+        match key.code {
+            Esc => app.cancel_delete_comment(),
+            Enter if key.modifiers.is_empty() => app.confirm_delete_comment(),
             _ => {}
         }
         return Ok(());
@@ -1555,16 +1646,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
     if app.mode == Mode::List {
         match (action, key.code) {
             (Some(K::Comments), _) | (_, Esc) => app.close_list(),
+            (_, Enter) => app.open_list_item(),
             (Some(K::Down), _) => app.list_move(1),
             (Some(K::Up), _) => app.list_move(-1),
             (Some(K::Send), _) => app.send_to_agent(),
             (Some(K::Copy), _) => {
-                app.export(&Clipboard);
+                app.export(clipboard);
             }
             (Some(K::Edit), _) => app.start_edit(),
             (Some(K::Delete), _) => app.delete_comment(),
             _ => {}
         }
+        return Ok(());
+    }
+
+    // An unbound modified named arrow is not also a fixed arrow. In particular,
+    // `ctrl+alt+→` must not fall through to horizontal scrolling after failing to match the
+    // default `alt+→`; only an exact resolved binding may give that chord a meaning.
+    if alt && matches!(key.code, Down | Up | Left | Right) && action.is_none() {
         return Ok(());
     }
 
@@ -1582,6 +1681,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::Up => app.move_cursor(-1)?,
             K::NextHunk => app.next_hunk(),
             K::PrevHunk => app.prev_hunk(),
+            K::NextChange => app.step_change(true),
+            K::PrevChange => app.step_change(false),
             K::NextFile => app.next_file(),
             K::PrevFile => app.prev_file(),
             K::Wrap => app.toggle_wrap(),
@@ -1590,6 +1691,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::NavigatorHide => app.toggle_navigator_hidden(),
             K::NavigatorGrow => app.resize_navigator(4),
             K::NavigatorShrink => app.resize_navigator(-4),
+            K::HideUnchanged => app.toggle_hide_unchanged(),
             K::ScopeUncommitted => app.set_scope(Scope::Uncommitted)?,
             K::ScopeBranch => app.set_scope(Scope::Branch)?,
             K::ScopeLastTurn => app.set_scope(Scope::LastTurn)?,
@@ -1603,7 +1705,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::Delete if app.focus == Focus::Diff => app.delete_comment(),
             K::Send => app.send_to_agent(),
             K::Copy => {
-                app.export(&Clipboard);
+                app.export(clipboard);
             }
             K::NextComment => app.jump_comment(1),
             K::PrevComment => app.jump_comment(-1),
@@ -1627,8 +1729,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
         // `←`/`→` expand/collapse the collapsible under the cursor — a directory in the file
         // list, a fold in the diff (expand-only); otherwise they scroll the diff sideways
         // (`scroll_h` is a no-op while wrapping, so it only acts when h-scroll is meaningful).
-        Right if app.on_folder() => app.expand_dir(),
-        Left if app.on_folder() => app.collapse_dir(),
+        Right if app.focus == Focus::Files => app.right_dir(),
+        Left if app.focus == Focus::Files => app.left_dir(),
+        Enter if app.focus == Focus::Files => app.activate_file_row(),
         Right if app.on_fold() => {
             let heights = ui::diff_row_heights(app, area);
             app.expand_fold(&heights, ui::diff_viewport_height(area, app));
@@ -1709,6 +1812,14 @@ pub fn handle_mouse(
     // opened it still owns its remaining drag and mouse-up events.
     if app.mode.is_modal() {
         match m.kind {
+            // A list click selects; a second click opens that exact stable comment identity.
+            MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::List => {
+                match ui::hit_comment_list_row(area, app, m.column, m.row) {
+                    Some(i) if i == app.list_cursor => app.open_list_item(),
+                    Some(i) => app.list_select(i),
+                    None => {}
+                }
+            }
             // A click moves the highlight; a click on the already-highlighted row sends. The
             // highlight is armed when the picker opens, so a first click on the armed row
             // sends straight away (`specs/input.md`). Every other gesture is inert.
@@ -1823,30 +1934,52 @@ pub fn handle_mouse(
             } else if let Some(i) =
                 ui::hit_file(area, app, m.column, m.row, app.file_rows.len(), app.file_scroll)
             {
+                // The whole directory row is its generous disclosure target. File rows keep
+                // their selection/open behavior and never alter directory expansion.
                 app.select_file(i)?;
             } else if let Some(url) = app.painted_link_at(m.column, m.row) {
                 // A link click resolves against the painted frame (specs/markdown.md).
                 app.open_link(&url);
-            } else if app.preview_active() {
-                // The preview has no cursor or selection: a click in the pane only
-                // focuses it. The pane-rect test, not the source-row hit test — the
-                // rendered preview can be taller than the source has rows.
+            } else if app.preview_active() || app.image_view_active() {
+                // Rendered markdown and image views have no source cursor or selection. A click
+                // in their pane only focuses it; source/card hit-testing is deliberately inert.
                 if ui::in_diff_pane(area, app, m.column, m.row) {
                     app.focus = Focus::Diff;
                 }
+            } else if let Some(comment) =
+                ui::hit_comment_card(area, app, m.column, m.row, heights, app.diff_scroll)
+            {
+                app.start_edit_comment(comment);
+            } else if ui::hit_comment_affordance(
+                area,
+                app,
+                m.column,
+                m.row,
+                heights,
+                app.diff_scroll,
+            ) {
+                // Only the painted inline control opens the composer. A content-row click,
+                // including elsewhere on the selected endpoint, remains selection-first.
+                app.start_comment();
             } else if let Some(i) =
                 ui::hit_diff(area, app, m.column, m.row, heights, app.diff_scroll)
             {
                 app.focus = Focus::Diff;
                 app.diff_cursor = i;
-                app.select_anchor = None;
-                // A click on a fold marker expands it, keeping the viewport still.
-                app.expand_fold(heights, ui::diff_viewport_height(area, app));
+                if app.on_fold() {
+                    // A fold is not selectable. Its click is the local expand affordance.
+                    app.expand_fold(heights, ui::diff_viewport_height(area, app));
+                } else if app.is_git_review() && app.visible[i].is_content() {
+                    // Mouse-down starts or re-anchors a range. Files-only remains a read-only
+                    // browser, so it never enters comment-selection state.
+                    app.select_anchor = Some(i);
+                    app.reveal_diff = true;
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if app.preview_active() {
-                // No drag-selection in the read-only preview.
+            if app.preview_active() || app.image_view_active() {
+                // No drag-selection in a read-only rendered view.
             } else if let Some(i) =
                 ui::hit_diff(area, app, m.column, m.row, heights, app.diff_scroll)
             {
@@ -1879,7 +2012,7 @@ mod refresh_tests {
         glyph_clears, handle_blocked_event, handle_resize, ready_app, schedule_poll_probe,
         world_indicator, world_wake,
     };
-    use crate::app::{App, Tab};
+    use crate::app::{App, RepositoryMode, Tab};
 
     #[test]
     fn the_indicator_lights_only_for_a_building_job_past_the_delay() {
@@ -2625,7 +2758,8 @@ mod refresh_tests {
         let mut app = ready_app(&cfg, plugin_config_in(config_dir.path()).unwrap());
         assert_eq!(app.scope, Scope::Branch, "startup seeds the configured scope");
 
-        // The user switches in-session; a reread with a different default must not move it.
+        // Files-only intentionally ignores Git scopes; a reread with a different default must
+        // likewise leave the initial scope untouched.
         app.set_scope(Scope::LastTurn).unwrap();
         std::fs::write(&path, "default_scope = \"uncommitted\"\n").unwrap();
         let (tx, _rx) = mpsc::channel();
@@ -2639,7 +2773,7 @@ mod refresh_tests {
             &mut recovery_inflight,
             plugin_config_in(config_dir.path()),
         ));
-        assert_eq!(app.scope, Scope::LastTurn, "a reread never switches the active scope");
+        assert_eq!(app.scope, Scope::Branch, "Files-only never enters a Git scope");
         assert_eq!(epoch, 0, "a default_scope change invalidates no running work");
     }
 
@@ -2680,5 +2814,212 @@ mod refresh_tests {
         assert_eq!(recovery_epoch, epoch);
         assert_eq!(target.theme(), "gruvbox");
         assert_eq!(recovered.plugin_config().unwrap().theme(), "gruvbox");
+    }
+
+    #[test]
+    fn config_recovery_keeps_a_files_only_root_after_it_becomes_a_git_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+        let config_dir = tempfile::tempdir().unwrap();
+        let path = config_dir.path().join("config.toml");
+        let cfg = Config::parse([root.display().to_string()]);
+        let mut app = App::new(root.clone(), Scope::Uncommitted, None);
+        assert_eq!(app.repository_mode, RepositoryMode::FilesOnly);
+        assert_eq!(app.repo, root, "Files-only preserves its exact launch root");
+
+        let (tx, rx) = mpsc::channel();
+        let mut epoch = 0;
+        let mut recovery_inflight = false;
+        std::fs::write(&path, "unknown = true\n").unwrap();
+        assert!(!apply_plugin_config_observation(
+            &mut app,
+            &cfg,
+            &mut epoch,
+            &tx,
+            &mut recovery_inflight,
+            plugin_config_in(config_dir.path()),
+        ));
+
+        // If recovery classified through `repository_domain`, this makes its Git probe turn
+        // the pane into Git review. The recovery interface instead receives this existing
+        // Files-only root and mode, so no reclassification probe can affect the result.
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(&path, "theme = \"gruvbox\"\n").unwrap();
+        assert!(!apply_plugin_config_observation(
+            &mut app,
+            &cfg,
+            &mut epoch,
+            &tx,
+            &mut recovery_inflight,
+            plugin_config_in(config_dir.path()),
+        ));
+
+        let (recovery_epoch, target, mut recovered) =
+            rx.recv_timeout(Duration::from_secs(5)).expect("recovery worker");
+        assert_eq!(recovery_epoch, epoch);
+        assert_eq!(target.theme(), "gruvbox");
+        recovered.carry_authored_state_from(&mut app);
+        app = recovered;
+        assert_eq!(app.repository_mode, RepositoryMode::FilesOnly);
+        assert_eq!(app.repo, root, "recovery keeps the exact original Files-only root");
+    }
+}
+
+#[cfg(test)]
+mod input_dispatch_tests {
+    use std::path::PathBuf;
+
+    use ratatui::crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::layout::Rect;
+
+    use super::{handle_key, handle_mouse};
+    use crate::app::{App, Focus, Mode};
+    use crate::diff::{FileDiff, FileState, Row, Span, View};
+    use crate::keymap::{Action, Key, Keymap, default_keymap};
+    use crate::model::Scope;
+    use crate::ui;
+
+    fn rows() -> Vec<Row> {
+        let span = |text: &str| vec![Span { text: text.to_string(), color: (0, 0, 0) }];
+        vec![
+            Row::Context { old_no: 1, new_no: 1, spans: span("one") },
+            Row::Insertion { new_no: 2, spans: span("two"), emphasis: vec![] },
+            Row::Context { old_no: 3, new_no: 3, spans: span("three") },
+        ]
+    }
+
+    fn app_with_rows() -> App {
+        let rows = rows();
+        let mut app = App::new(PathBuf::from("."), Scope::Uncommitted, None);
+        app.focus = Focus::Diff;
+        app.diff = FileDiff {
+            path: "sample.rs".to_string(),
+            previous_path: None,
+            state: FileState::Normal,
+            view: View::Diff,
+            rows: rows.clone(),
+        };
+        app.visible = rows;
+        app
+    }
+
+    #[test]
+    fn named_alt_arrows_require_an_exact_modifier_match_or_explicit_binding() {
+        let area = Rect::new(0, 0, 100, 20);
+        let mut app = app_with_rows();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+            area,
+            default_keymap(),
+        )
+        .unwrap();
+        assert_eq!(app.diff_cursor, 1, "the decoded default alt+down still steps changes");
+
+        app.diff_cursor = 0;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::CONTROL),
+            area,
+            default_keymap(),
+        )
+        .unwrap();
+        assert_eq!(app.diff_cursor, 0, "ctrl+alt+down does not inherit alt+down");
+
+        let explicit =
+            Keymap::resolve(&[(Action::NextChange, vec![Key { ctrl: true, alt: true, ch: '↓' }])])
+                .unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::CONTROL),
+            area,
+            &explicit,
+        )
+        .unwrap();
+        assert_eq!(app.diff_cursor, 1, "an explicitly resolved ctrl+alt chord still works");
+    }
+
+    #[test]
+    fn only_the_inline_comment_target_opens_the_composer() {
+        let area = Rect::new(0, 0, 100, 20);
+        let keymap = default_keymap();
+        let mut app = app_with_rows();
+        app.select_anchor = Some(0);
+        app.diff_cursor = 2;
+        let heights = ui::diff_row_heights(&app, area);
+        let target = ui::comment_affordance_rect(area, &app, &heights, app.diff_scroll)
+            .expect("a live selection paints its inline comment target");
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: target.x,
+                row: target.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &heights,
+            keymap,
+        )
+        .unwrap();
+        assert!(matches!(app.mode, Mode::Composing { editing: None }));
+    }
+
+    #[test]
+    fn content_click_reanchors_and_drag_extends_a_live_selection_without_composing() {
+        let area = Rect::new(0, 0, 100, 20);
+        let keymap = default_keymap();
+        let mut app = app_with_rows();
+        app.select_anchor = Some(0);
+        app.diff_cursor = 2;
+        let heights = ui::diff_row_heights(&app, area);
+        let endpoint = ui::comment_affordance_rect(area, &app, &heights, app.diff_scroll)
+            .expect("a live selection paints its inline comment target");
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: endpoint.x,
+                // The action strip is now below the endpoint source row, so this targets row 0.
+                row: endpoint.y - 3,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &heights,
+            keymap,
+        )
+        .unwrap();
+        assert_eq!(app.select_anchor, Some(0));
+        assert_eq!(app.diff_cursor, 0);
+        assert_eq!(app.mode, Mode::Normal, "a content click never implicitly composes");
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: endpoint.x,
+                row: endpoint.y - 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &heights,
+            keymap,
+        )
+        .unwrap();
+        assert_eq!(app.select_anchor, Some(0));
+        assert_eq!(app.diff_cursor, 1, "drag extends from the re-anchored content row");
+        assert_eq!(app.mode, Mode::Normal);
     }
 }

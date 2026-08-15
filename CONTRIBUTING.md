@@ -1,6 +1,11 @@
 # Contributing
 
-Thanks for wanting to make reviewr better. This page gets you from clone to merged PR.
+Thanks for wanting to make Herdr Preview better. This page gets you from clone to a reviewed change.
+
+Herdr Preview is a fork of `persiyanov/herdr-reviewr`. The Rust crate retains the
+`herdr-reviewr` name to preserve the upstream engine and minimize divergence. The installed
+`herdr-preview` executable keeps Preview panes distinct from upstream panes. User-visible plugin,
+action, pane, and config identities use `pi-dal.herdr-preview` and Herdr Preview.
 
 ## Setup
 
@@ -8,11 +13,10 @@ You need Rust (the exact toolchain is pinned by `rust-toolchain.toml` and instal
 first build) and [`just`](https://github.com/casey/just).
 
 ```bash
-git clone https://github.com/persiyanov/herdr-reviewr
-cd herdr-reviewr
-just test          # the test suite
-just run           # run reviewr against this repo
-cargo run -- ~/some/repo   # or against any repo
+git clone https://github.com/pi-dal/herdr-preview
+cd herdr-preview
+mise exec rust@1.97.1 -- cargo test --all-features
+mise exec rust@1.97.1 -- cargo run -- ~/some/repo
 ```
 
 `just ci` runs exactly what CI runs: format check, clippy with warnings as errors, tests, and a
@@ -36,7 +40,7 @@ reading the release page.
 painted frame:
 
 ```bash
-python3 scripts/bench_tui.py --binary target/release/herdr-reviewr --fixture
+python3 scripts/bench_tui.py --binary target/release/herdr-preview --fixture
 ```
 
 Baselines live in `scripts/bench-results/`. For anything touching the reload, render, git, or
