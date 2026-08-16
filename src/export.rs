@@ -190,6 +190,7 @@ mod tests {
             lines: lines.into(),
             text: text.into(),
             diff_anchored: true,
+            assignment: None,
         }
     }
 

@@ -42,6 +42,7 @@ pub enum Action {
     Find,
     Keys,
     Send,
+    Assign,
     Copy,
     OpenPr,
     Refresh,
@@ -113,7 +114,7 @@ impl std::fmt::Display for Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 37] = [
+const ACTIONS: [(Action, &str, &[Key]); 38] = [
     (Action::Down, "down", &[Key::plain('j')]),
     (Action::Up, "up", &[Key::plain('k')]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']'), Key::alt_named('→')]),
@@ -147,6 +148,7 @@ const ACTIONS: [(Action, &str, &[Key]); 37] = [
     (Action::Find, "find", &[Key::ctrl('f')]),
     (Action::Keys, "keys", &[Key::plain('?'), Key::alt('h')]),
     (Action::Send, "send", &[Key::plain('s'), Key::plain('S'), Key::alt('s')]),
+    (Action::Assign, "assign", &[Key::plain('a')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
     (Action::Refresh, "refresh", &[Key::plain('r'), Key::alt_shift('r')]),

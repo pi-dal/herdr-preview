@@ -19,7 +19,7 @@ use crate::herdr::{self, AgentChoice, SendTarget};
 use crate::highlight::Highlighter;
 use crate::image_preview::{self, ImagePreview, ImagePreviewError};
 use crate::logln;
-use crate::model::{Comment, CommentId, CommentStore, Scope, Side};
+use crate::model::{Comment, CommentId, CommentStore, DeliveryReceipt, Scope, Side};
 use crate::theme::{self, Palette};
 
 /// Navigator shares and bounds, as percentages of the body's split axis.
@@ -212,6 +212,10 @@ pub enum Mode {
     /// Choosing which agent a `Send` goes to (`specs/herdr-host.md`). Its rows and highlight
     /// live in [`App::picker_rows`] and [`App::picker_cursor`].
     Picker,
+    /// Choosing an agent for one exact comment.
+    AssignPicker {
+        id: CommentId,
+    },
     /// Choosing the `branch` scope's base (`specs/input.md` Base picker). Its state lives in
     /// [`App::base_picker`].
     BasePick,
@@ -239,6 +243,7 @@ impl Mode {
                 | Mode::ConfirmDelete { .. }
                 | Mode::List
                 | Mode::Picker
+                | Mode::AssignPicker { .. }
                 | Mode::BasePick
         )
     }
@@ -1018,7 +1023,8 @@ impl App {
             // before the mode is stored, so none reaches recovery; the search query is not
             // restored and the picker's frozen rows are not either (specs/search.md,
             // specs/find-in-file.md, specs/herdr-host.md).
-            Mode::Normal | Mode::Search | Mode::Find | Mode::Picker => {}
+            Mode::Normal | Mode::Search | Mode::Find | Mode::Picker | Mode::AssignPicker { .. } => {
+            }
             Mode::List | Mode::Composing { .. } | Mode::ConfirmDelete { .. } | Mode::BasePick => {
                 self.scope = old.scope;
                 self.tab = old.tab;
@@ -3299,7 +3305,11 @@ impl App {
             Mode::Search => self.search.as_mut().map(|s| (&mut s.query, &mut s.caret)),
             Mode::Find => self.find.as_mut().map(|f| (&mut f.query, &mut f.caret)),
             Mode::BasePick => self.base_picker.as_mut().map(|b| (&mut b.query, &mut b.caret)),
-            Mode::Normal | Mode::ConfirmDelete { .. } | Mode::List | Mode::Picker => None,
+            Mode::Normal
+            | Mode::ConfirmDelete { .. }
+            | Mode::List
+            | Mode::Picker
+            | Mode::AssignPicker { .. } => None,
         }
     }
 
@@ -3529,7 +3539,7 @@ impl App {
         // The File view marks every comment as content-anchored, so it ages by file existence,
         // not changeset membership (specs/review-model.md).
         let diff_anchored = self.diff.view == View::Diff;
-        Some(Comment { file, side, start, end, lines, text, diff_anchored })
+        Some(Comment { file, side, start, end, lines, text, diff_anchored, assignment: None })
     }
 
     /// The `path:line` the composer is anchored to (selection for a new comment,
@@ -3549,6 +3559,7 @@ impl App {
                     lines: String::new(),
                     text: String::new(),
                     diff_anchored: true,
+                    assignment: None,
                 };
                 Some(c.location())
             }
@@ -3556,6 +3567,7 @@ impl App {
             | Mode::ConfirmDelete { .. }
             | Mode::List
             | Mode::Picker
+            | Mode::AssignPicker { .. }
             | Mode::BasePick
             | Mode::Search
             | Mode::Find => None,
@@ -4147,7 +4159,7 @@ impl App {
                     (A::DeleteComment, Do),
                 ];
             }
-            Mode::Picker => {
+            Mode::Picker | Mode::AssignPicker { .. } => {
                 return vec![(A::PickAgent, Primary), (A::ClosePicker, Do), (A::MovePickerRow, Do)];
             }
             Mode::BasePick => {
@@ -4491,7 +4503,7 @@ impl App {
     /// Close the picker back onto the view it opened over, so a reviewer who sent from the
     /// comments list or with the find band open is not dropped into `Normal` (`specs/input.md`).
     pub fn close_picker(&mut self) {
-        if self.mode == Mode::Picker {
+        if matches!(self.mode, Mode::Picker | Mode::AssignPicker { .. }) {
             self.mode = std::mem::replace(&mut self.picker_over, Mode::Normal);
         }
         self.picker_rows.clear();
@@ -4511,7 +4523,9 @@ impl App {
     }
 
     pub fn picker_move(&mut self, delta: isize) {
-        if self.mode == Mode::Picker && !self.picker_rows.is_empty() {
+        if matches!(self.mode, Mode::Picker | Mode::AssignPicker { .. })
+            && !self.picker_rows.is_empty()
+        {
             self.picker_cursor = step(self.picker_cursor, delta, self.picker_rows.len());
         }
     }
@@ -4519,7 +4533,9 @@ impl App {
     /// Move the highlight to `row`, for a digit key or a click. A row past the end is inert
     /// rather than clamped, so a mistyped digit never arms a neighbour (`specs/input.md`).
     pub fn picker_goto(&mut self, row: usize) {
-        if self.mode == Mode::Picker && row < self.picker_rows.len() {
+        if matches!(self.mode, Mode::Picker | Mode::AssignPicker { .. })
+            && row < self.picker_rows.len()
+        {
             self.picker_cursor = row;
         }
     }
@@ -4531,6 +4547,72 @@ impl App {
         let Some(agent) = self.picker_rows.get(self.picker_cursor).cloned() else { return };
         self.close_picker();
         self.export_to_agent(&agent);
+    }
+
+    /// Assign the focused comment to one Herdr agent without consuming the review note.
+    pub fn assign_comment_to_agent(&mut self) {
+        let Some(id) = self.target_comment() else {
+            self.status = "select a comment to assign".into();
+            return;
+        };
+        if self.image_view_active() || !self.is_git_review() {
+            return;
+        }
+        match herdr::send_target() {
+            Ok(SendTarget::One(agent)) => self.open_assign_picker(id, vec![agent]),
+            Ok(SendTarget::Many(rows)) => self.open_assign_picker(id, rows),
+            Err(e) => {
+                self.status = format!("agent assignment unavailable: {e}");
+            }
+        }
+    }
+
+    fn open_assign_picker(&mut self, id: CommentId, rows: Vec<AgentChoice>) {
+        // The comments list is a browse modal and is a valid assignment origin. Preserve it in
+        // `picker_over` so Esc/delivery returns to the same selected card; other modals own
+        // their input and cannot safely be nested.
+        if rows.is_empty() || (self.mode.is_modal() && self.mode != Mode::List) {
+            return;
+        }
+        self.picker_cursor = 0;
+        self.picker_rows = rows;
+        self.picker_notice = None;
+        self.picker_over = self.mode.clone();
+        self.mode = Mode::AssignPicker { id };
+    }
+
+    pub fn assign_picker_pick(&mut self) {
+        let Mode::AssignPicker { id } = self.mode.clone() else {
+            return;
+        };
+        let Some(agent) = self.picker_rows.get(self.picker_cursor).cloned() else {
+            return;
+        };
+        let Some(comment) = self.store.get(id).cloned() else {
+            self.close_picker();
+            return;
+        };
+        let payload = format!(
+            "## Review task from Herdr Preview\n\n**Target:** {}\n\n**Review note:** {}\n\n```diff\n{}\n```\n\nPlease inspect this exact code, implement a fix if appropriate, and report validation. Do not submit a GitHub review on my behalf.\n",
+            comment.location(),
+            comment.text,
+            comment.lines
+        );
+        let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone() };
+        let delivered = target.export(&payload).is_ok();
+        if let Some(stored) = self.store.get_mut(id) {
+            stored.assignment = Some(if delivered {
+                DeliveryReceipt::Delivered { agent: agent.name.clone(), tab: agent.tab.clone() }
+            } else {
+                DeliveryReceipt::Failed { agent: agent.name.clone() }
+            });
+        }
+        self.status = if delivered {
+            format!("Assigned comment to {} · {} — not submitted", agent.name, agent.tab)
+        } else {
+            "Agent not found — comment assignment kept".to_string()
+        };
+        self.close_picker();
     }
 
     /// Whether the base picker can open here: a file tab, the `branch` scope, and no
@@ -5263,6 +5345,7 @@ mod tests {
             lines: "+line".to_string(),
             text: "saved".to_string(),
             diff_anchored: true,
+            assignment: None,
         });
         old.mode = Mode::Composing { editing: None };
         old.resume_list = true;

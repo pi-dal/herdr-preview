@@ -1552,7 +1552,7 @@ pub fn handle_key_with_clipboard(
     // quit here and `y` must not copy, or a habitual keystroke destroys or consumes the whole
     // review while the picker is up (`specs/input.md`). It is checked before the tab handlers,
     // like every other modal, so no tab can ever eat the modal's keys.
-    if app.mode == Mode::Picker {
+    if matches!(app.mode, Mode::Picker | Mode::AssignPicker { .. }) {
         // The send is irreversible and consumes every comment, so only the bare key fires it:
         // `alt+enter` and `shift+enter` mean "newline, not submit" in the comment editor the
         // reviewer was in moments ago, and that muscle memory must not send a review. The digits
@@ -1562,7 +1562,13 @@ pub fn handle_key_with_clipboard(
         let bare = key.modifiers.is_empty();
         match (action, key.code) {
             (_, Esc) => app.close_picker(),
-            (_, Enter) if bare => app.picker_pick(),
+            (_, Enter) if bare => {
+                if matches!(app.mode, Mode::AssignPicker { .. }) {
+                    app.assign_picker_pick();
+                } else {
+                    app.picker_pick();
+                }
+            }
             // A no-agent/unavailable sheet explicitly offers the existing clipboard fallback.
             // Copy retains its consume-on-confirmed-success semantics.
             (Some(K::Copy), _) if app.picker_notice.is_some() => {
@@ -1650,6 +1656,7 @@ pub fn handle_key_with_clipboard(
             (Some(K::Down), _) => app.list_move(1),
             (Some(K::Up), _) => app.list_move(-1),
             (Some(K::Send), _) => app.send_to_agent(),
+            (Some(K::Assign), _) => app.assign_comment_to_agent(),
             (Some(K::Copy), _) => {
                 app.export(clipboard);
             }
@@ -1704,6 +1711,9 @@ pub fn handle_key_with_clipboard(
             K::Edit if app.focus == Focus::Diff => app.start_edit(),
             K::Delete if app.focus == Focus::Diff => app.delete_comment(),
             K::Send => app.send_to_agent(),
+            // Assignment, like edit/delete, acts on the comment under the *focused* diff
+            // cursor. The comments-list overlay above is the explicit alternate target.
+            K::Assign if app.focus == Focus::Diff => app.assign_comment_to_agent(),
             K::Copy => {
                 app.export(clipboard);
             }
@@ -1714,7 +1724,7 @@ pub fn handle_key_with_clipboard(
             K::Find => app.open_find(),
             K::Keys => app.toggle_keys(),
             // `edit`/`delete` off the diff, and `open-pr` off the `PR` tab, are inert.
-            K::Edit | K::Delete | K::OpenPr => {}
+            K::Edit | K::Delete | K::Assign | K::OpenPr => {}
         }
         return Ok(());
     }
@@ -1823,9 +1833,17 @@ pub fn handle_mouse(
             // A click moves the highlight; a click on the already-highlighted row sends. The
             // highlight is armed when the picker opens, so a first click on the armed row
             // sends straight away (`specs/input.md`). Every other gesture is inert.
-            MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::Picker => {
+            MouseEventKind::Down(MouseButton::Left)
+                if matches!(app.mode, Mode::Picker | Mode::AssignPicker { .. }) =>
+            {
                 match ui::hit_picker_row(area, app, m.column, m.row) {
-                    Some(i) if i == app.picker_cursor => app.picker_pick(),
+                    Some(i) if i == app.picker_cursor => {
+                        if matches!(app.mode, Mode::AssignPicker { .. }) {
+                            app.assign_picker_pick();
+                        } else {
+                            app.picker_pick();
+                        }
+                    }
                     Some(i) => app.picker_goto(i),
                     None => {}
                 }

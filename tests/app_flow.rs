@@ -2851,6 +2851,7 @@ fn changed_count_and_staleness_stay_scope_based_on_all_files() {
         lines: " two".into(),
         text: "?".into(),
         diff_anchored: true,
+        assignment: None,
     };
     app.store.add(comment.clone());
 
@@ -5127,6 +5128,31 @@ fn the_picker_moves_by_key_and_a_digit_past_the_last_row_is_inert() {
     // A mistyped digit must not arm a neighbour the reviewer would then send to.
     handle_key(&mut app, KeyEvent::from(KeyCode::Char('7')), area, &keymap).unwrap();
     assert_eq!(app.picker_cursor, 2, "a row past the end is inert, not clamped");
+}
+
+#[test]
+fn assignment_picker_navigates_and_cancels_back_to_its_comment_list() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "one");
+    comment_on(&mut app, '-', "two");
+    app.open_list();
+    let id = app.store.id_at(app.list_cursor).expect("selected comment");
+    // Construct the assignment modal with a stable comment identity, as the assign action does.
+    app.picker_rows = three_agents();
+    app.picker_over = Mode::List;
+    app.mode = Mode::AssignPicker { id };
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 80, 24);
+
+    handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')), area, &keymap).unwrap();
+    assert_eq!(app.picker_cursor, 1, "assignment picker accepts normal picker navigation");
+    handle_key(&mut app, KeyEvent::from(KeyCode::Char('3')), area, &keymap).unwrap();
+    assert_eq!(app.picker_cursor, 2, "assignment picker accepts literal agent digits");
+    handle_key(&mut app, KeyEvent::from(KeyCode::Esc), area, &keymap).unwrap();
+    assert_eq!(app.mode, Mode::List, "cancel returns to the list origin");
+    assert_eq!(app.store.len(), 2, "cancel retains every comment");
+    assert!(app.picker_rows.is_empty(), "cancel drops frozen assignment rows");
 }
 
 #[test]

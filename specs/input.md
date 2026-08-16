@@ -304,3 +304,8 @@ The filter is a text field with the comment editor's controls, above. `↑` and 
 - [pr-tab](./pr-tab.md)
 - [search](./search.md)
 - [find-in-file](./find-in-file.md)
+
+
+### Assign a comment to an agent
+
+`a` targets the focused comment (or selected comments-list card) and opens an agent picker. The picker accepts `↑`/`↓` or `j`/`k`, `1`–`9`, bare `Enter` to deliver, and `Esc` to cancel. Delivery uses bracketed paste into the chosen Herdr agent tab and never submits it. The comment remains in the review and records its latest delivery receipt.

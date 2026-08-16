@@ -11,8 +11,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use common::{Repo, app_on};
-use herdr_reviewr::app::{App, Focus, Mode};
+use herdr_reviewr::app::{App, Focus, Mode, RepositoryMode};
 use herdr_reviewr::keymap::Keymap;
+use herdr_reviewr::model::DeliveryReceipt;
 use herdr_reviewr::ui;
 use herdr_reviewr::{handle_key, handle_mouse};
 use ratatui::crossterm::event::{
@@ -381,4 +382,171 @@ fn no_target_and_unavailable_picker_copy_uses_only_the_clipboard_seam() {
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     press(&mut app, KeyCode::Esc, area, &keymap);
     assert_eq!(app.store.len(), 1, "cancelling an unavailable picker retains drafts");
+}
+
+/// Assignment is a non-consuming, per-comment delivery. Drive the real key dispatch and the
+/// fake Herdr command seam so the test proves both the selected tab and the absence of submit.
+#[test]
+fn assignment_delivers_one_comment_without_consuming_or_submitting() {
+    if env::var("ASSIGNMENT_FLOW_CHILD").is_err() {
+        let staging = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fake_herdr(staging.path());
+        let out = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "assignment_delivers_one_comment_without_consuming_or_submitting",
+                "--nocapture",
+            ])
+            .env("ASSIGNMENT_FLOW_CHILD", "1")
+            .env("FAKE_HERDR_DIR", staging.path())
+            .env("HERDR_BIN_PATH", &script)
+            .env("HERDR_WORKSPACE_ID", "w8")
+            .env("HERDR_PANE_ID", "w8:p9")
+            .output()
+            .expect("re-exec assignment test with fake herdr");
+        assert!(
+            out.status.success(),
+            "child run failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(log(staging.path()).contains("pane send-text"), "assignment child sent nothing");
+        return;
+    }
+
+    let r = Repo::init();
+    r.write("a.rs", "alpha\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nbeta\n");
+    let fake_dir = PathBuf::from(env::var("FAKE_HERDR_DIR").unwrap());
+    fs::write(fake_dir.join("agents.json"), TWO_AGENTS).unwrap();
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 80, 24);
+    let mut app = app_on(&r);
+    write_comment(&mut app, "fix the beta regression");
+    let id = app.store.id_at(0).expect("comment id");
+
+    // A normal-mode `a` must not act on an off-screen diff cursor while Files owns focus.
+    app.focus = Focus::Files;
+    press(&mut app, KeyCode::Char('a'), area, &keymap);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(log(&fake_dir).is_empty(), "unfocused a must not enumerate or send an agent");
+
+    // A diff cursor that has no attached comment must refuse without asking Herdr for agents.
+    app.focus = Focus::Diff;
+    app.comment_focus = None;
+    app.diff_cursor = app.visible.iter().position(|r| r.marker() != '+').unwrap();
+    press(&mut app, KeyCode::Char('a'), area, &keymap);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.status, "select a comment to assign");
+    assert!(log(&fake_dir).is_empty(), "a cursor without a comment must not enumerate agents");
+
+    // Image and Files-only views have no assignable review anchor, even if a local draft exists.
+    app.diff_cursor = app.visible.iter().position(|r| r.marker() == '+').unwrap();
+    app.image_preview_note = Some("SVG preview unavailable");
+    press(&mut app, KeyCode::Char('a'), area, &keymap);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.status, "select a comment to assign");
+    assert!(log(&fake_dir).is_empty(), "image assignment must not enumerate agents");
+    app.image_preview_note = None;
+    app.repository_mode = RepositoryMode::FilesOnly;
+    press(&mut app, KeyCode::Char('a'), area, &keymap);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(log(&fake_dir).is_empty(), "Files-only assignment must not enumerate agents");
+    app.repository_mode = RepositoryMode::GitReview;
+
+    // Zero agents and an unavailable Herdr leave the comment untouched and open no modal.
+    fs::write(fake_dir.join("agents.json"), r#"{"result":{"agents":[]}}"#).unwrap();
+    press(&mut app, KeyCode::Char('a'), area, &keymap);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.status.starts_with("agent assignment unavailable:"));
+    assert_eq!(app.store.get(id).unwrap().assignment, None);
+    fail_on(&fake_dir, "agent list");
+    press(&mut app, KeyCode::Char('a'), area, &keymap);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.status.starts_with("agent assignment unavailable:"));
+    assert_eq!(app.store.get(id).unwrap().assignment, None);
+    fail_on_nothing(&fake_dir);
+    fs::write(fake_dir.join("agents.json"), TWO_AGENTS).unwrap();
+
+    press(&mut app, KeyCode::Char('a'), area, &keymap);
+    assert!(matches!(app.mode, Mode::AssignPicker { id: picked } if picked == id));
+    press(&mut app, KeyCode::Down, area, &keymap);
+    assert_eq!(app.picker_cursor, 1, "arrow keys move the assignment highlight");
+    press(&mut app, KeyCode::Char('2'), area, &keymap);
+    assert_eq!(app.picker_cursor, 1, "digit picks the exact second agent");
+    press(&mut app, KeyCode::Enter, area, &keymap);
+
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.store.len(), 1, "assignment never consumes its comment");
+    assert_eq!(
+        app.store.get(id).unwrap().assignment,
+        Some(DeliveryReceipt::Delivered { agent: "codex".into(), tab: "Grip".into() })
+    );
+    let sent = log(&fake_dir);
+    assert!(sent.contains("pane send-text w8:p2"), "assignment addressed selected tab: {sent}");
+    assert!(
+        sent.contains("\u{1b}[200~"),
+        "assignment must use bracketed-paste start framing: {sent:?}"
+    );
+    assert!(
+        sent.contains("\u{1b}[201~"),
+        "assignment must use bracketed-paste end framing: {sent:?}"
+    );
+    assert!(sent.contains("## Review task from Herdr Preview"));
+    assert!(
+        sent.contains("**Target:** a.rs:2"),
+        "task envelope needs the anchored location: {sent}"
+    );
+    assert!(sent.contains("**Review note:** fix the beta regression"));
+    assert!(
+        sent.contains("```diff\n+beta\n```"),
+        "task envelope needs the fenced authoritative diff: {sent}"
+    );
+    assert!(
+        sent.contains("Please inspect this exact code, implement a fix if appropriate, and report validation. Do not submit a GitHub review on my behalf."),
+        "task envelope needs its non-publishing closing instruction: {sent}"
+    );
+    assert!(!sent.contains("send-keys"), "assignment must write text, never submit a key: {sent}");
+
+    // A failed re-delivery remains attached to the same local comment and updates its receipt.
+    fail_on(&fake_dir, "pane send-text w8:p2");
+    press(&mut app, KeyCode::Char('a'), area, &keymap);
+    press(&mut app, KeyCode::Char('2'), area, &keymap);
+    press(&mut app, KeyCode::Enter, area, &keymap);
+    assert_eq!(app.store.len(), 1, "a failed assignment also keeps its comment");
+    assert_eq!(
+        app.store.get(id).unwrap().assignment,
+        Some(DeliveryReceipt::Failed { agent: "codex".into() })
+    );
+
+    // The comments list is the sole non-diff `a` exception. Its chosen card becomes the stable
+    // target, and click-to-pick follows the same picker contract as the keyboard.
+    fail_on_nothing(&fake_dir);
+    app.open_list();
+    press(&mut app, KeyCode::Char('a'), area, &keymap);
+    assert!(matches!(app.mode, Mode::AssignPicker { id: picked } if picked == id));
+    let (col, row) = (0..area.height)
+        .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| ui::hit_picker_row(area, &app, x, y) == Some(0))
+        .expect("assignment picker row is clickable");
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &[],
+        &keymap,
+    )
+    .unwrap();
+    assert_eq!(app.mode, Mode::List, "delivery returns to its comments-list origin");
+    assert_eq!(app.store.len(), 1, "list-origin assignment remains non-consuming");
+    assert_eq!(
+        app.store.get(id).unwrap().assignment,
+        Some(DeliveryReceipt::Delivered { agent: "claude".into(), tab: "Grip".into() })
+    );
 }

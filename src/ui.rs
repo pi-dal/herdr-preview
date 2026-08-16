@@ -27,7 +27,7 @@ use crate::forge;
 use crate::herdr::AgentChoice;
 use crate::keymap::Keymap;
 use crate::markdown::{hostile_char, sanitize_terminal_text};
-use crate::model::Comment;
+use crate::model::{Comment, DeliveryReceipt};
 use crate::theme::Palette;
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -79,7 +79,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let popup: Option<fn(&mut Frame, &App, Rect)> = match app.mode {
         Mode::List => Some(render_comments_list),
         Mode::ConfirmDelete { .. } => Some(render_delete_confirmation),
-        Mode::Picker => Some(render_agent_picker),
+        Mode::Picker | Mode::AssignPicker { .. } => Some(render_agent_picker),
         Mode::BasePick => Some(render_base_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
     };
@@ -1230,9 +1230,10 @@ fn comment_card_lines(
 
     let stale_label = stale_reason
         .map_or_else(String::new, |reason| format!(" · STALE: {}", sanitize_one_line(reason)));
+    let assignment_label = receipt_label(c.assignment.as_ref());
     let label = truncate_width(
         &format!(
-            " ● {ordinal}/{total} comment · {}{stale_label} · click/e edit ",
+            " ● {ordinal}/{total} comment · {}{stale_label}{assignment_label} · click/e edit ",
             sanitize_one_line(&c.location())
         ),
         box_w.saturating_sub(3),
@@ -1271,6 +1272,20 @@ fn comment_card_lines(
 /// model for identity, editing, and export; only this painted copy is flattened.
 fn sanitize_one_line(text: &str) -> String {
     sanitize_terminal_text(text).replace('\n', " ")
+}
+
+/// A retained agent-handoff receipt. Values come from Herdr and are sanitized only for paint;
+/// the raw pane identity remains in the delivery path.
+fn receipt_label(receipt: Option<&DeliveryReceipt>) -> String {
+    match receipt {
+        Some(DeliveryReceipt::Delivered { agent, tab }) => {
+            format!(" · assigned: {} · {}", sanitize_one_line(agent), sanitize_one_line(tab))
+        }
+        Some(DeliveryReceipt::Failed { agent }) => {
+            format!(" · assignment failed: {}", sanitize_one_line(agent))
+        }
+        None => String::new(),
+    }
 }
 
 fn truncate_width(s: &str, max: usize) -> String {
@@ -2565,10 +2580,11 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
             );
             let preview = sanitize_one_line(c.text.lines().next().unwrap_or_default().trim());
             let fixed = format!(
-                " {}/{}  {}  {state}  ",
+                " {}/{}  {}  {state}{}  ",
                 i + 1,
                 app.store.len(),
-                sanitize_one_line(&c.location())
+                sanitize_one_line(&c.location()),
+                receipt_label(c.assignment.as_ref())
             );
             let room = width.saturating_sub(fixed.width());
             let spans = vec![
@@ -2703,6 +2719,9 @@ fn picker_trail(app: &App, row: &AgentChoice) -> String {
 }
 
 fn picker_title(app: &App) -> String {
+    if matches!(app.mode, Mode::AssignPicker { .. }) {
+        return "Assign comment to agent".into();
+    }
     let n = app.store.len();
     let noun = if n == 1 { "comment" } else { "comments" };
     format!("Send {n} {noun} to · {} stale", app.stale_count())

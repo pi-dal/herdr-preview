@@ -95,6 +95,12 @@ impl CommentId {
 
 /// A reviewer comment anchored to a run of diff lines, carrying the snippet.
 #[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DeliveryReceipt {
+    Delivered { agent: String, tab: String },
+    Failed { agent: String },
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Comment {
     pub file: String,
     pub side: Side,
@@ -105,6 +111,8 @@ pub struct Comment {
     pub text: String,
     /// True when anchored to a diff (the `Changes` tab); false for a File-view content comment.
     pub diff_anchored: bool,
+    /// Per-comment agent handoff; session-local and never consumes the review note.
+    pub assignment: Option<DeliveryReceipt>,
 }
 
 impl Comment {
@@ -215,6 +223,10 @@ impl CommentStore {
         }
     }
 
+    pub fn get_mut(&mut self, id: CommentId) -> Option<&mut Comment> {
+        self.items.iter_mut().find(|item| item.id == id).map(|item| &mut item.comment)
+    }
+
     pub fn take(&mut self, id: CommentId) -> Option<Comment> {
         self.position_of(id).map(|position| self.items.remove(position).comment)
     }
@@ -237,6 +249,7 @@ mod tests {
             lines: "+x".into(),
             text: text.into(),
             diff_anchored: true,
+            assignment: None,
         }
     }
 

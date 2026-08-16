@@ -109,7 +109,7 @@ A comment renders and is acted on only in the view it belongs to: a content comm
 
 ## Behavior
 
-Comments are a review pass, not a durable record.
+Comments are a review pass, not a durable record. A comment may also retain a session-local agent delivery receipt; assignment never removes it.
 
 - Comments live in memory.
 - A comment is removed only by export or delete. Never by a refresh or an agent's edits.

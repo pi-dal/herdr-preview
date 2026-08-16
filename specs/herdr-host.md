@@ -155,6 +155,10 @@ The send addresses the pane on the chosen row. A pane that closed while the pick
 
 A configuration error closes the picker and drops its frozen rows. Every comment survives, and so does the last-sent agent that arms the next picker (`config.md`).
 
+## Per-comment agent assignment
+
+The `a` action opens the same frozen workspace-agent picker for one stable comment ID. A bare Enter writes a structured task envelope through the existing bracketed-paste pane path and never submits it. Success or failure is retained on that comment; it is never consumed.
+
 ## Turn tracking
 
 Two agents editing one worktree produce one turn (→ HH-TURN-PER-WORKTREE), so a second agent starting mid-turn never re-baselines the first one's work out of the diff.
