@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::process::Command;
 
 use anyhow::Result;
 
@@ -19,7 +20,7 @@ use crate::herdr::{self, AgentChoice, SendTarget};
 use crate::highlight::Highlighter;
 use crate::image_preview::{self, ImagePreview, ImagePreviewError};
 use crate::logln;
-use crate::model::{Comment, CommentId, CommentStore, DeliveryReceipt, Scope, Side};
+use crate::model::{Comment, CommentId, CommentStore, DeliveryReceipt, GitHubReceipt, Scope, Side};
 use crate::theme::{self, Palette};
 
 /// Navigator shares and bounds, as percentages of the body's split axis.
@@ -207,6 +208,10 @@ pub enum Mode {
     ConfirmDelete {
         id: CommentId,
     },
+    /// Explicitly confirm publishing one eligible local comment into a GitHub pending review.
+    ConfirmPublish {
+        id: CommentId,
+    },
     /// Browsing the comments-list overlay.
     List,
     /// Choosing which agent a `Send` goes to (`specs/herdr-host.md`). Its rows and highlight
@@ -241,6 +246,7 @@ impl Mode {
             self,
             Mode::Composing { .. }
                 | Mode::ConfirmDelete { .. }
+                | Mode::ConfirmPublish { .. }
                 | Mode::List
                 | Mode::Picker
                 | Mode::AssignPicker { .. }
@@ -443,6 +449,8 @@ pub enum FooterAction {
     Wrap,
     Scope,
     Send,
+    /// Publish one eligible local comment to Preview's pending GitHub review.
+    Publish,
     List,
     Copy,
     Save,
@@ -634,6 +642,15 @@ pub struct App {
     /// The agent this session last sent to, which arms the picker's highlight. Only a
     /// successful send sets it (`specs/herdr-host.md`).
     pub last_sent_pane: Option<String>,
+    /// Preview-owned pending GitHub reviews, keyed by the complete PR identity for this pane
+    /// session. Retaining every exact head key means an A→B→A force-push sequence reuses A's
+    /// own pending review instead of creating a duplicate.
+    pub pending_github_reviews:
+        HashMap<(String, String, String, u64, String), forge::PendingReviewBinding>,
+    /// Cached exact anchors that can be published to the currently cached, open GitHub PR.
+    /// The renderer reads this immutable snapshot; refreshes rebuild it from each comment's
+    /// own diff so a footer never advertises an action that the entry gate will refuse.
+    github_publishable_comments: HashSet<CommentId>,
     /// The base picker's rows, filter, and highlight while `Mode::BasePick` is open
     /// (`specs/input.md` Base picker).
     pub base_picker: Option<BasePicker>,
@@ -856,6 +873,8 @@ impl App {
             picker_notice: None,
             picker_over: Mode::Normal,
             last_sent_pane: None,
+            pending_github_reviews: HashMap::new(),
+            github_publishable_comments: HashSet::new(),
             base_picker: None,
             mode: Mode::Normal,
             input: String::new(),
@@ -1025,7 +1044,11 @@ impl App {
             // specs/find-in-file.md, specs/herdr-host.md).
             Mode::Normal | Mode::Search | Mode::Find | Mode::Picker | Mode::AssignPicker { .. } => {
             }
-            Mode::List | Mode::Composing { .. } | Mode::ConfirmDelete { .. } | Mode::BasePick => {
+            Mode::List
+            | Mode::Composing { .. }
+            | Mode::ConfirmDelete { .. }
+            | Mode::ConfirmPublish { .. }
+            | Mode::BasePick => {
                 self.scope = old.scope;
                 self.tab = old.tab;
                 self.active_file_tab = old.active_file_tab;
@@ -1652,6 +1675,7 @@ impl App {
             .collect();
         if !self.hide_unchanged || self.tab != Tab::Changes {
             self.visible = normal;
+            self.refresh_github_publishable_comments();
             return;
         }
         let mut projected = Vec::new();
@@ -1677,6 +1701,7 @@ impl App {
         }
         flush(&mut projected, &mut context, &self.expanded_folds);
         self.visible = projected;
+        self.refresh_github_publishable_comments();
     }
 
     /// Expand the fold under the cursor, revealing its hidden lines. Expansion is
@@ -3307,6 +3332,7 @@ impl App {
             Mode::BasePick => self.base_picker.as_mut().map(|b| (&mut b.query, &mut b.caret)),
             Mode::Normal
             | Mode::ConfirmDelete { .. }
+            | Mode::ConfirmPublish { .. }
             | Mode::List
             | Mode::Picker
             | Mode::AssignPicker { .. } => None,
@@ -3502,6 +3528,7 @@ impl App {
                 }
             }
         }
+        self.refresh_github_publishable_comments();
         self.select_anchor = None;
         self.leave_compose();
     }
@@ -3539,7 +3566,17 @@ impl App {
         // The File view marks every comment as content-anchored, so it ages by file existence,
         // not changeset membership (specs/review-model.md).
         let diff_anchored = self.diff.view == View::Diff;
-        Some(Comment { file, side, start, end, lines, text, diff_anchored, assignment: None })
+        Some(Comment {
+            file,
+            side,
+            start,
+            end,
+            lines,
+            text,
+            diff_anchored,
+            assignment: None,
+            github: None,
+        })
     }
 
     /// The `path:line` the composer is anchored to (selection for a new comment,
@@ -3560,11 +3597,13 @@ impl App {
                     text: String::new(),
                     diff_anchored: true,
                     assignment: None,
+                    github: None,
                 };
                 Some(c.location())
             }
             Mode::Normal
             | Mode::ConfirmDelete { .. }
+            | Mode::ConfirmPublish { .. }
             | Mode::List
             | Mode::Picker
             | Mode::AssignPicker { .. }
@@ -4150,14 +4189,21 @@ impl App {
             Mode::ConfirmDelete { .. } => {
                 return vec![(A::DeleteComment, Primary), (A::Cancel, Do)];
             }
+            Mode::ConfirmPublish { .. } => {
+                return vec![(A::Publish, Primary), (A::Cancel, Do)];
+            }
             Mode::List => {
-                return vec![
+                let mut actions = vec![
                     (A::Send, Primary),
                     (A::CloseList, Do),
                     (A::Copy, Do),
                     (A::EditComment, Do),
                     (A::DeleteComment, Do),
                 ];
+                if self.github_publish_cached_available() {
+                    actions.push((A::Publish, Do));
+                }
+                return actions;
             }
             Mode::Picker | Mode::AssignPicker { .. } => {
                 return vec![(A::PickAgent, Primary), (A::ClosePicker, Do), (A::MovePickerRow, Do)];
@@ -4312,6 +4358,9 @@ impl App {
         } else if self.comment_under_cursor().is_some() {
             out.push((A::EditComment, Primary));
             out.push((A::DeleteComment, Do));
+            if self.github_publish_cached_available() {
+                out.push((A::Publish, Do));
+            }
             out.push((A::JumpComment, Do));
         } else {
             out.push((A::Comment, Primary));
@@ -4550,6 +4599,241 @@ impl App {
     }
 
     /// Assign the focused comment to one Herdr agent without consuming the review note.
+    /// Whether a cached, open GitHub PR can accept publishing this exact local comment. This is
+    /// non-mutating but intentionally matches the entry gate, so footers never advertise a
+    /// publish action that the confirmation path will reject.
+    fn github_publish_cached_available_for(&self, id: Option<CommentId>) -> bool {
+        self.is_git_review()
+            && self.pr_forge == git::Forge::GitHub
+            && self.pr_snapshot().is_some_and(|pr| {
+                pr.state == forge::PrState::Open
+                    && !pr.head_oid.is_empty()
+                    && !pr.base_oid.is_empty()
+            })
+            && id.is_some_and(|id| self.github_publishable_comments.contains(&id))
+    }
+
+    fn github_publish_cached_available(&self) -> bool {
+        self.github_publish_cached_available_for(self.target_comment())
+    }
+
+    /// Rebuild the render-safe eligibility snapshot from authoritative per-comment diffs.
+    /// This is called whenever a file diff refreshes; it deliberately performs no forge or
+    /// mutation work, and is the only expensive path behind the immutable footer predicate.
+    fn refresh_github_publishable_comments(&mut self) {
+        self.github_publishable_comments.clear();
+        if !self.is_git_review() {
+            return;
+        }
+        let comments: Vec<(CommentId, Comment)> =
+            self.store.iter_with_ids().map(|(id, c)| (id, c.clone())).collect();
+        for (id, comment) in comments {
+            if comment.diff_anchored
+                && comment.side == Side::New
+                && comment.start == comment.end
+                && self.comment_anchor_is_current(&comment)
+            {
+                self.github_publishable_comments.insert(id);
+            }
+        }
+    }
+
+    /// Open the explicit confirmation for publishing the focused local comment. Publishing is
+    /// deliberately unavailable from stale/non-diff/all-files anchors: Phase 2B only maps one
+    /// exact current-side diff line to GitHub's unambiguous RIGHT/line anchor.
+    pub fn request_publish_comment(&mut self) {
+        if self.image_view_active()
+            || !self.is_git_review()
+            || self.mode.is_modal() && self.mode != Mode::List
+        {
+            return;
+        }
+        if !self.github_publish_cached_available() {
+            self.status = "GitHub publish unavailable: no open GitHub PR".into();
+            return;
+        }
+        let Some(id) = self.target_comment() else {
+            self.status = "select a resolved diff comment to publish".into();
+            return;
+        };
+        let Some(comment) = self.store.get(id).cloned() else { return };
+        if !comment.diff_anchored || comment.side != Side::New || comment.start != comment.end {
+            self.status = "GitHub publish requires one current-side diff line".into();
+            return;
+        }
+        if !self.comment_anchor_is_current(&comment) {
+            self.status = "GitHub publish requires a resolved current diff anchor".into();
+            return;
+        }
+        self.comment_focus = Some(id);
+        self.mode = Mode::ConfirmPublish { id };
+    }
+
+    /// Confirm the one-comment GitHub pending-review mutation. This never submits a review and
+    /// never removes the local note; the binding is session-only and exact-head keyed.
+    pub fn confirm_publish_comment(&mut self) {
+        let Mode::ConfirmPublish { id } = self.mode else { return };
+        self.mode = Mode::Normal;
+        let Some(comment) = self.store.get(id).cloned() else { return };
+        let Some(pr) = self.pr_snapshot().cloned() else {
+            self.status = "GitHub publish unavailable: no open PR".into();
+            return;
+        };
+        if self.pr_forge != git::Forge::GitHub
+            || pr.state != forge::PrState::Open
+            || pr.head_oid.is_empty()
+            || pr.base_oid.is_empty()
+        {
+            self.status = "GitHub publish unavailable: no open GitHub PR".into();
+            return;
+        }
+        if !comment.diff_anchored || comment.side != Side::New || comment.start != comment.end {
+            self.status = "GitHub publish requires one current-side diff line".into();
+            return;
+        }
+        if !self.github_publish_worktree_clean() {
+            self.status =
+                "GitHub publish unavailable: commit or stash local changes before publishing"
+                    .into();
+            return;
+        }
+        let input =
+            match forge::fetch_input(&self.repo, self.base.as_deref(), self.config_snapshot()) {
+                Ok(input) => input,
+                Err(error) => {
+                    self.status = format!("GitHub publish unavailable: {error:?}");
+                    return;
+                }
+            };
+        let git::RepositoryIdentity::Repository(ref target) = input.repository else {
+            self.status = "GitHub publish unavailable: no GitHub remote".into();
+            return;
+        };
+        if target.forge() != git::Forge::GitHub {
+            self.status = "GitHub publish unavailable: remote is not GitHub".into();
+            return;
+        }
+        if input.local.head_oid.as_deref() != Some(pr.head_oid.as_str()) {
+            self.status = "GitHub publish unavailable: PR head changed; refresh and retry".into();
+            if let Some(stored) = self.store.get_mut(id) {
+                stored.github = Some(GitHubReceipt::Failed {
+                    message: "PR head changed; refresh and retry".into(),
+                });
+            }
+            return;
+        }
+        // Probe the provider immediately before the mutation. The cached PR tab snapshot is not
+        // sufficient: a force-push can replace the remote head while local HEAD stays unchanged.
+        let forge::PrView::Pr(fresh_pr) = forge::fetch(&self.repo, &input) else {
+            self.status = "GitHub publish unavailable: refresh PR and retry".into();
+            if let Some(stored) = self.store.get_mut(id) {
+                stored.github = Some(GitHubReceipt::Failed {
+                    message: "PR changed or could not be refreshed; retry".into(),
+                });
+            }
+            return;
+        };
+        if fresh_pr.number != pr.number
+            || fresh_pr.head_oid != pr.head_oid
+            || fresh_pr.base_oid.is_empty()
+            || fresh_pr.base_oid != pr.base_oid
+            || fresh_pr.state != forge::PrState::Open
+        {
+            self.status = "GitHub publish unavailable: PR changed; refresh and retry".into();
+            if let Some(stored) = self.store.get_mut(id) {
+                stored.github = Some(GitHubReceipt::Failed {
+                    message: "PR changed or could not be refreshed; retry".into(),
+                });
+            }
+            return;
+        }
+        // The provider probe can block while another agent commits. Re-read local HEAD at the
+        // mutation boundary: a clean worktree alone does not prove it still names this PR head.
+        let local_after_probe =
+            match forge::fetch_input(&self.repo, self.base.as_deref(), self.config_snapshot()) {
+                Ok(input) => input.local.head_oid,
+                Err(error) => {
+                    self.status = format!("GitHub publish unavailable: {error:?}");
+                    return;
+                }
+            };
+        if local_after_probe.as_deref() != Some(fresh_pr.head_oid.as_str()) {
+            self.status =
+                "GitHub publish unavailable: local HEAD changed; refresh and retry".into();
+            if let Some(stored) = self.store.get_mut(id) {
+                stored.github = Some(GitHubReceipt::Failed {
+                    message: "local HEAD changed; refresh and retry".into(),
+                });
+            }
+            return;
+        }
+        // The provider probe and final HEAD read can both block. Recheck every worktree/index/
+        // untracked condition at the write boundary, immediately before deriving a position or
+        // invoking the GitHub mutation.
+        if !self.github_publish_worktree_clean() {
+            self.status =
+                "GitHub publish unavailable: commit or stash local changes before publishing"
+                    .into();
+            return;
+        }
+        // Use the same base/head pair that the just-confirmed provider snapshot reports.
+        let Some(position) = self.github_position_for_comment(&comment, &fresh_pr) else {
+            self.status =
+                "GitHub publish unavailable: current diff has no stable GitHub position".into();
+            return;
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let result = forge::publish_pending_comment(
+            &self.repo,
+            target.host(),
+            target.owner(),
+            target.name(),
+            pr.number,
+            &pr.head_oid,
+            self.pending_github_reviews.get(&(
+                target.host().to_owned(),
+                target.owner().to_owned(),
+                target.name().to_owned(),
+                pr.number,
+                pr.head_oid.clone(),
+            )),
+            forge::PendingReviewComment { path: &comment.file, position, body: &comment.text },
+            &cancel,
+        );
+        match result {
+            Ok(binding) => {
+                let receipt = GitHubReceipt::Pending {
+                    review_id: binding.review_id.clone(),
+                    url: binding.comment_url.clone(),
+                };
+                let key = (
+                    binding.host.clone(),
+                    binding.owner.clone(),
+                    binding.repository.clone(),
+                    binding.number,
+                    binding.head_oid.clone(),
+                );
+                self.pending_github_reviews.insert(key, binding);
+                if let Some(stored) = self.store.get_mut(id) {
+                    stored.github = Some(receipt);
+                }
+                self.status = "Added comment to GitHub pending review — not submitted".into();
+            }
+            Err(error) => {
+                if let Some(stored) = self.store.get_mut(id) {
+                    stored.github = Some(GitHubReceipt::Failed { message: format!("{error:?}") });
+                }
+                self.status = "GitHub publish failed — local comment kept".into();
+            }
+        }
+    }
+
+    pub fn cancel_publish_comment(&mut self) {
+        if matches!(self.mode, Mode::ConfirmPublish { .. }) {
+            self.mode = Mode::Normal;
+        }
+    }
+
     pub fn assign_comment_to_agent(&mut self) {
         let Some(id) = self.target_comment() else {
             self.status = "select a comment to assign".into();
@@ -4816,6 +5100,48 @@ impl App {
 
     /// Whether the immutable anchor is unavailable. Coordinates alone can never reattach a
     /// card after a refresh.
+    /// Rebuild a diff for the comment's own file before publishing. This is intentionally
+    /// independent of the currently open read pane, so a Comments-list selection cannot publish
+    /// coordinates that became stale while another file is displayed.
+    fn comment_anchor_is_current(&mut self, c: &Comment) -> bool {
+        if !c.diff_anchored || c.side != Side::New || c.start != c.end {
+            return false;
+        }
+        let (old, new) = self.content_sides(&c.file, None);
+        let rebuilt = self.cache.get(c.file.clone(), None, &old, &new, &self.highlighter);
+        resolve_comment_anchor(c, &rebuilt.rows).is_some()
+    }
+
+    /// GitHub positions are meaningful only when the tree and index exactly match PR head.
+    /// Reject staged, unstaged, and untracked files before any forge mutation.
+    fn github_publish_worktree_clean(&self) -> bool {
+        Command::new("git")
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .current_dir(&self.repo)
+            .output()
+            .is_ok_and(|output| output.status.success() && output.stdout.is_empty())
+    }
+
+    fn github_position_for_comment(&mut self, c: &Comment, pr: &forge::PrSnapshot) -> Option<u32> {
+        if !c.diff_anchored || c.side != Side::New || c.start != c.end {
+            return None;
+        }
+        // Keep the local stale-anchor gate, but derive the GitHub position only from the
+        // immutable base..head patch. The rendered worktree diff is never a publish source.
+        if !self.comment_anchor_is_current(c) {
+            return None;
+        }
+        let marked = c.lines.lines().next()?;
+        forge::canonical_patch_position(
+            &self.repo,
+            &pr.base_oid,
+            &pr.head_oid,
+            &c.file,
+            c.start,
+            marked,
+        )
+    }
+
     pub fn is_stale(&self, c: &Comment) -> bool {
         self.stale_reason(c).is_some()
     }
@@ -5346,6 +5672,7 @@ mod tests {
             text: "saved".to_string(),
             diff_anchored: true,
             assignment: None,
+            github: None,
         });
         old.mode = Mode::Composing { editing: None };
         old.resume_list = true;

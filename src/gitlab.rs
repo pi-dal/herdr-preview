@@ -554,6 +554,7 @@ fn build_snapshot(
         head_ref: mr["source_branch"].as_str().unwrap_or_default().to_string(),
         head_is_fork: is_cross_project(mr),
         head_oid: mr["sha"].as_str().unwrap_or_default().to_string(),
+        base_oid: String::new(),
         base_ref: mr["target_branch"].as_str().unwrap_or_default().to_string(),
         merge: derive_merge(mr),
         sync,

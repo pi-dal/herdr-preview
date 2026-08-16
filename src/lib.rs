@@ -1597,6 +1597,14 @@ pub fn handle_key_with_clipboard(
         }
         return Ok(());
     }
+    if let Mode::ConfirmPublish { .. } = app.mode {
+        match key.code {
+            Esc => app.cancel_publish_comment(),
+            Enter if key.modifiers.is_empty() => app.confirm_publish_comment(),
+            _ => {}
+        }
+        return Ok(());
+    }
 
     // The base picker: every printable narrows the filter — the bound shortcuts included, so
     // a branch named `qa` is typable — and the filter edits with the comment editor's
@@ -1657,6 +1665,7 @@ pub fn handle_key_with_clipboard(
             (Some(K::Up), _) => app.list_move(-1),
             (Some(K::Send), _) => app.send_to_agent(),
             (Some(K::Assign), _) => app.assign_comment_to_agent(),
+            (Some(K::Publish), _) => app.request_publish_comment(),
             (Some(K::Copy), _) => {
                 app.export(clipboard);
             }
@@ -1714,6 +1723,7 @@ pub fn handle_key_with_clipboard(
             // Assignment, like edit/delete, acts on the comment under the *focused* diff
             // cursor. The comments-list overlay above is the explicit alternate target.
             K::Assign if app.focus == Focus::Diff => app.assign_comment_to_agent(),
+            K::Publish if app.focus == Focus::Diff => app.request_publish_comment(),
             K::Copy => {
                 app.export(clipboard);
             }
@@ -1724,7 +1734,7 @@ pub fn handle_key_with_clipboard(
             K::Find => app.open_find(),
             K::Keys => app.toggle_keys(),
             // `edit`/`delete` off the diff, and `open-pr` off the `PR` tab, are inert.
-            K::Edit | K::Delete | K::Assign | K::OpenPr => {}
+            K::Edit | K::Delete | K::Assign | K::Publish | K::OpenPr => {}
         }
         return Ok(());
     }

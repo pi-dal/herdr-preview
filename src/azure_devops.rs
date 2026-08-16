@@ -478,6 +478,7 @@ fn build_snapshot(
         head_ref: head_ref_of(pr),
         head_is_fork: pr["forkSource"].is_object(),
         head_oid: source_tip(pr).to_string(),
+        base_oid: String::new(),
         base_ref: bare_ref(pr["targetRefName"].as_str().unwrap_or_default()),
         merge: derive_merge(pr, evaluations),
         sync,

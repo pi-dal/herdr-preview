@@ -100,6 +100,14 @@ pub enum DeliveryReceipt {
     Failed { agent: String },
 }
 
+/// The session-local outcome of publishing a local comment into Preview's pending GitHub review.
+/// It deliberately does not replace the snippet-authoritative local anchor or agent receipt.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GitHubReceipt {
+    Pending { review_id: String, url: Option<String> },
+    Failed { message: String },
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Comment {
     pub file: String,
@@ -113,6 +121,8 @@ pub struct Comment {
     pub diff_anchored: bool,
     /// Per-comment agent handoff; session-local and never consumes the review note.
     pub assignment: Option<DeliveryReceipt>,
+    /// Per-comment GitHub pending-review receipt. A publish never consumes this local comment.
+    pub github: Option<GitHubReceipt>,
 }
 
 impl Comment {
@@ -250,6 +260,7 @@ mod tests {
             text: text.into(),
             diff_anchored: true,
             assignment: None,
+            github: None,
         }
     }
 

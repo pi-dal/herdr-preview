@@ -713,12 +713,12 @@ fn a_hidden_navigator_gives_the_read_pane_the_whole_body() {
     app.toggle_keys();
     let out = render(&app);
     assert!(out.contains("z show"), "row 1 keeps the way back in the expansion");
-    assert!(!out.contains("p position"), "`p position` drops while hidden");
+    assert!(!out.contains("P position"), "`P position` drops while hidden");
 
     app.toggle_navigator_hidden();
     let out = render(&app);
     assert!(out.contains("z hide"), "visible, the `go` band lists the hide key");
-    assert!(out.contains("p position"), "`p position` returns with the navigator");
+    assert!(out.contains("P position"), "`P position` returns with the navigator");
 }
 
 #[test]

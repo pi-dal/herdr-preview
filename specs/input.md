@@ -85,6 +85,8 @@ A divider drag belongs to the navigator position and split axis at mouse-down. A
 
 Writing a comment is explicit: select, inspect the anchor strip, draft, then review or send. A navigator click while a selection is live preserves that selection and reports `clear selection before opening a file`, so a mouse action never silently discards an anchor. `c` on a content row remains the fast singleton draft. `v`, mouse-down, and drag select content rows. A fold expands instead of selecting. While a selection is live, file, tab, scope, and traversal changes are inert. A dedicated row after the selected endpoint names its range, count, and old/new/mixed side, and keeps `c comment` plus `esc clear` visible. Its `Comment` button is the exact mouse target and never paints over source. The composer title names New or Edit, the elided file location, and the line count. Its footer keeps `enter save`, `shift+enter newline`, and `esc cancel`, and distinguishes saved comments from the draft. Saved cards expose their ordinal, range, current or `STALE` state, and `click/e edit`. `n`/`N` cycles exact cards, including cards sharing a line. `d` opens `enter delete · esc cancel`. A successful send says `Added N comments to <agent>, not submitted`. A successful copy reports that they were copied.
 
+GitHub pending-review publishing is explicit: `p` opens a confirmation only for a resolved, current-side, single-line diff comment. Bare `enter` publishes it into a Preview-owned pending review; `esc` cancels, and no path submits, approves, or requests changes. Before the mutation Preview rebuilds the comment's exact anchor and derives GitHub's one-based unified-diff `position` inside its current hunk. When that position cannot be reconstructed, publishing is disabled rather than guessing an API anchor. Preview rechecks that the provider still reports the same open PR and head immediately before the mutation. A failed publish keeps the local comment and its failure receipt.
+
 ## Behavior
 
 ### Changeset traversal
@@ -309,3 +311,9 @@ The filter is a text field with the comment editor's controls, above. `↑` and 
 ### Assign a comment to an agent
 
 `a` targets the focused comment (or selected comments-list card) and opens an agent picker. The picker accepts `↑`/`↓` or `j`/`k`, `1`–`9`, bare `Enter` to deliver, and `Esc` to cancel. Delivery uses bracketed paste into the chosen Herdr agent tab and never submits it. The comment remains in the review and records its latest delivery receipt.
+
+### Publish a comment to GitHub pending review
+
+`p` targets the focused current-side, single-line Diff comment (or selected comments-list card) and opens a confirmation sheet. Bare `Enter` creates or appends exactly that one comment to Preview's session-owned GitHub pending review; `Esc` cancels. It never submits, approves, requests changes, or removes the local comment. Publish is disabled outside Git review, in Files-only/image view, for stale, old-side, All-files, or multi-line anchors, and when no open GitHub PR with a head OID is available.
+
+The pending review binding is keyed by exact `{host, owner, repository, PR number, head SHA}`. Preview reuses only a binding it created in this pane session with that complete key; it never discovers or adopts a pending review created elsewhere. A remote failure leaves the local comment in place with a retryable failed receipt. Successful cards show that they are pending on GitHub and, when returned, the remote URL.

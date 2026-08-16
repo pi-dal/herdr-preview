@@ -5,8 +5,9 @@
 //! inline here through explicitly hosted `gh` GraphQL calls, GitLab and Azure DevOps through
 //! their own modules (`crate::gitlab`, `crate::azure_devops`). The normalized [`PrSnapshot`],
 //! the [`PrView`] failure states with their remedies, and the association helpers every
-//! provider shares all live here. Nothing ever writes to a forge. The `PR` tab renders what
-//! this module produces; degradation is in-band as [`PrView`].
+//! provider shares all live here. Fetches are read-only; the only forge write is the explicitly
+//! confirmed GitHub pending-review comment exception documented in `specs/forge-host.md`. The
+//! `PR` tab renders what this module produces; degradation is in-band as [`PrView`].
 
 use std::io::Read;
 use std::path::Path;
@@ -135,6 +136,8 @@ pub struct PrSnapshot {
     /// The PR's head commit — the hold gate's anchor, never rendered
     /// (`specs/forge-host.md` Refresh).
     pub head_oid: String,
+    /// Immutable base commit paired with `head_oid` for canonical GitHub diff positions.
+    pub base_oid: String,
     pub base_ref: String,
     pub merge: Merge,
     pub sync: Sync,
@@ -343,6 +346,85 @@ fn run_cli(cmd: &mut Command, cancelled: &AtomicBool) -> Result<String, CliError
     Err(CliError::Failed { stderr: String::from_utf8_lossy(&stderr.bytes).into_owned() })
 }
 
+/// Map one exact current-side source row to its one-based GitHub unified-diff position.
+///
+/// `target_marked_line` includes the diff marker (for example, `"+let answer = 42;"`).
+/// The parser deliberately treats every real hunk source row as a position, including
+/// deletions, but advances the new-file line counter only for context and additions. A
+/// missing or ambiguous match returns `None`: publishing must never guess a line position.
+#[must_use]
+pub fn position_for_unified_patch(
+    patch: &str,
+    target_new_line: u32,
+    target_marked_line: &str,
+) -> Option<u32> {
+    let mut in_hunk = false;
+    let mut new_line = 0_u32;
+    let mut position = 0_u32;
+    let mut matched = None;
+
+    for row in patch.lines() {
+        if let Some(header) = row.strip_prefix("@@") {
+            let (ranges, _) = header.split_once("@@")?;
+            let new_range = ranges.split_whitespace().nth(1)?;
+            let new_range = new_range.strip_prefix('+')?;
+            let (start, _) = new_range.split_once(',').unwrap_or((new_range, "1"));
+            new_line = start.parse().ok()?;
+            position = 0;
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk || row == "\\ No newline at end of file" {
+            continue;
+        }
+        let Some(marker) = row.as_bytes().first().copied() else {
+            continue;
+        };
+        if !matches!(marker, b'+' | b'-' | b' ') {
+            continue;
+        }
+        position = position.checked_add(1)?;
+        if matches!(marker, b'+' | b' ') {
+            if new_line == target_new_line
+                && row == target_marked_line
+                && matched.replace(position).is_some()
+            {
+                return None;
+            }
+            new_line = new_line.checked_add(1)?;
+        }
+    }
+    matched
+}
+
+/// Resolve a GitHub diff position from the canonical commit-pinned patch.
+///
+/// The command is argv-only and disables external diff drivers. Callers must provide the PR's
+/// immutable base/head OIDs and reject a dirty worktree before using this result.
+#[must_use]
+pub fn canonical_patch_position(
+    repo: &Path,
+    base_oid: &str,
+    head_oid: &str,
+    path: &str,
+    target_new_line: u32,
+    target_marked_line: &str,
+) -> Option<u32> {
+    if base_oid.is_empty() || head_oid.is_empty() || path.is_empty() || path.starts_with('-') {
+        return None;
+    }
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["diff", "--no-ext-diff", "--unified=3", base_oid, head_oid, "--", path])
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.len() > CLI_OUTPUT_LIMIT {
+        return None;
+    }
+    let unified_diff = std::str::from_utf8(&output.stdout).ok()?;
+    position_for_unified_patch(unified_diff, target_new_line, target_marked_line)
+}
+
 /// Run explicitly targeted `gh` arguments in `repo` and return stdout or a classified failure.
 fn gh(repo: &Path, host: &str, args: &[&str], cancelled: &AtomicBool) -> Result<String, GhError> {
     let mut cmd = Command::new("gh");
@@ -354,6 +436,161 @@ fn gh(repo: &Path, host: &str, args: &[&str], cancelled: &AtomicBool) -> Result<
         |stderr| classify_failure(stderr, host),
         GhError::Other,
     )
+}
+
+/// A Preview-owned, session-only GitHub pending review.  The binding intentionally carries the
+/// exact PR head: callers must never append a line comment to a review created for another push.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingReviewBinding {
+    pub host: String,
+    pub owner: String,
+    pub repository: String,
+    pub number: u64,
+    pub head_oid: String,
+    pub review_id: String,
+    /// URL of the last comment Preview added to this pending review.
+    pub comment_url: Option<String>,
+}
+
+/// The one safe shape Phase 2B may publish.  Multi-line comments are deliberately excluded:
+/// GitHub's range semantics vary across diff shapes, while a single current-side line is exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingReviewComment<'a> {
+    pub path: &'a str,
+    /// GitHub unified-diff position, one-based within the containing hunk.
+    pub position: u32,
+    pub body: &'a str,
+}
+
+/// Add exactly one current-side line comment to a Preview-owned GitHub pending review.
+///
+/// When `binding` is absent this creates the pending review and returns its ID; when present it
+/// appends only after its full `{host, owner, repository, number, head_oid}` key matches.  This
+/// function never discovers/adopts other pending reviews and never submits a review.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn publish_pending_comment(
+    repo: &Path,
+    host: &str,
+    owner: &str,
+    repository: &str,
+    number: u64,
+    head_oid: &str,
+    binding: Option<&PendingReviewBinding>,
+    comment: PendingReviewComment<'_>,
+    cancelled: &AtomicBool,
+) -> Result<PendingReviewBinding, GhError> {
+    if let Some(existing) = binding
+        && existing.host == host
+        && existing.owner == owner
+        && existing.repository == repository
+        && existing.number == number
+        && existing.head_oid == head_oid
+    {
+        let query = "mutation($id:ID!,$body:String!,$path:String!,$position:Int!,$commit:GitObjectID!){addPullRequestReviewComment(input:{pullRequestReviewId:$id,body:$body,path:$path,position:$position,commitOID:$commit}){comment{url}}}";
+        let number = number.to_string();
+        let position = comment.position.to_string();
+        let args = [
+            "api",
+            "graphql",
+            "--hostname",
+            host,
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            &format!("id={}", existing.review_id),
+            "-f",
+            &format!("body={}", comment.body),
+            "-f",
+            &format!("path={}", comment.path),
+            "-F",
+            &format!("position={position}"),
+            "-f",
+            &format!("commit={head_oid}"),
+            "-F",
+            &format!("number={number}"),
+        ];
+        let json = gh(repo, host, &args, cancelled)?;
+        let mut updated = existing.clone();
+        updated.comment_url = serde_json::from_str::<Value>(&json).ok().and_then(|v| {
+            v.pointer("/data/addPullRequestReviewComment/comment/url")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        return Ok(updated);
+    }
+    let query = initial_pending_review_mutation();
+    // GitHub requires the opaque pull-request node ID. Resolve it in the same explicitly-hosted
+    // command path rather than deriving it from a URL or trusting a remote response's host.
+    let lookup = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){id}}}";
+    let n = number.to_string();
+    let lookup_args = [
+        "api",
+        "graphql",
+        "--hostname",
+        host,
+        "-f",
+        &format!("query={lookup}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("repo={repository}"),
+        "-F",
+        &format!("number={n}"),
+    ];
+    let lookup_json = gh(repo, host, &lookup_args, cancelled)?;
+    let pr_id = serde_json::from_str::<Value>(&lookup_json)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/data/repository/pullRequest/id").and_then(Value::as_str).map(str::to_owned)
+        })
+        .ok_or_else(|| GhError::Other("GitHub returned no pull request ID".to_string()))?;
+    let position = comment.position.to_string();
+    let args = [
+        "api",
+        "graphql",
+        "--hostname",
+        host,
+        "-f",
+        &format!("query={query}"),
+        "-f",
+        &format!("pr={pr_id}"),
+        "-f",
+        &format!("body={}", comment.body),
+        "-f",
+        &format!("path={}", comment.path),
+        "-F",
+        &format!("position={position}"),
+        "-f",
+        &format!("commit={head_oid}"),
+    ];
+    let json = gh(repo, host, &args, cancelled)?;
+    let value = serde_json::from_str::<Value>(&json)
+        .map_err(|_| GhError::Other("GitHub returned invalid pending review data".to_string()))?;
+    let review_id = value
+        .pointer("/data/addPullRequestReview/pullRequestReview/id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| GhError::Other("GitHub returned no pending review ID".to_string()))?;
+    let comment_url = value
+        .pointer("/data/addPullRequestReview/pullRequestReview/comments/nodes/0/url")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(PendingReviewBinding {
+        host: host.to_owned(),
+        owner: owner.to_owned(),
+        repository: repository.to_owned(),
+        number,
+        head_oid: head_oid.to_owned(),
+        review_id,
+        comment_url,
+    })
+}
+
+/// The initial mutation must put `commitOID` on `AddPullRequestReviewInput`; GitHub rejects it
+/// on the nested `DraftPullRequestReviewComment` input. Keep this query factored for a precise
+/// regression test of the outbound GraphQL contract.
+const fn initial_pending_review_mutation() -> &'static str {
+    "mutation($pr:ID!,$body:String!,$path:String!,$position:Int!,$commit:GitObjectID!){addPullRequestReview(input:{pullRequestId:$pr,body:\"\",commitOID:$commit,comments:[{body:$body,path:$path,position:$position}]}){pullRequestReview{id comments(first:1){nodes{url}}}}}"
 }
 
 /// Map a failed `gh`'s stderr to a degraded state by its wording — `gh` has no stable exit
@@ -442,7 +679,7 @@ pub(crate) fn reports_status(lowercased_stderr: &str, code: u16) -> bool {
 
 /// A classified `gh` failure, mapped to a [`PrView`] degraded state.
 #[derive(Debug, PartialEq, Eq)]
-enum GhError {
+pub enum GhError {
     NoGh,
     NotAuthed(String),
     LocalGit(String),
@@ -869,7 +1106,7 @@ fn build_detail_query(number: u64) -> String {
     format!(
         "query($o:String!,$n:String!){{repository(owner:$o,name:$n){{\
          pullRequest(number:{number}){{\
-         number title url body isDraft state mergeable mergeStateStatus baseRefName headRefName \
+         number title url body isDraft state mergeable mergeStateStatus baseRefName baseRefOid headRefName \
          headRefOid isCrossRepository \
          commits(last:1){{nodes{{commit{{statusCheckRollup{{contexts(first:100){{pageInfo{{hasNextPage}} nodes{{__typename \
          ... on CheckRun{{name status conclusion}} ... on StatusContext{{context state}}}}}}}}}}}}}} \
@@ -939,6 +1176,7 @@ fn build_snapshot(node: &Value, sync: Sync) -> PrSnapshot {
         head_ref: node["headRefName"].as_str().unwrap_or_default().to_string(),
         head_is_fork: node["isCrossRepository"].as_bool().unwrap_or(false),
         head_oid: node["headRefOid"].as_str().unwrap_or_default().to_string(),
+        base_oid: node["baseRefOid"].as_str().unwrap_or_default().to_string(),
         base_ref: node["baseRefName"].as_str().unwrap_or_default().to_string(),
         merge: derive_merge(node["mergeable"].as_str(), node["mergeStateStatus"].as_str()),
         sync,
@@ -1219,6 +1457,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn initial_pending_review_puts_commit_on_review_input_not_draft_comment() {
+        let query = initial_pending_review_mutation();
+        let input = query.split("input:{").nth(1).expect("mutation has input");
+        assert!(input.starts_with("pullRequestId:$pr,body:\"\",commitOID:$commit,comments:["));
+        let draft = input.split("comments:[{").nth(1).expect("mutation has draft comment");
+        assert!(draft.starts_with("body:$body,path:$path,position:$position}"));
+        assert!(!draft.contains("commitOID"));
+        assert!(!query.contains("submitPullRequestReview"));
+    }
+
+    #[test]
+    fn pending_binding_reuses_only_the_exact_session_pr_head_key() {
+        let binding = PendingReviewBinding {
+            host: "github.example".into(),
+            owner: "pi-dal".into(),
+            repository: "herdr-preview".into(),
+            number: 42,
+            head_oid: "abc123".into(),
+            review_id: "review-1".into(),
+            comment_url: None,
+        };
+        let matches = |host: &str, owner: &str, repository: &str, number, head_oid: &str| {
+            binding.host == host
+                && binding.owner == owner
+                && binding.repository == repository
+                && binding.number == number
+                && binding.head_oid == head_oid
+        };
+        assert!(matches("github.example", "pi-dal", "herdr-preview", 42, "abc123"));
+        assert!(!matches("github.com", "pi-dal", "herdr-preview", 42, "abc123"));
+        assert!(!matches("github.example", "pi-dal", "herdr-preview", 42, "next-head"));
+        assert!(!matches("github.example", "pi-dal", "other", 42, "abc123"));
+    }
+
+    #[test]
     fn bounded_reader_retains_limit_and_drains_excess() {
         let input = vec![b'x'; CLI_OUTPUT_LIMIT + 17];
         let output = read_bounded(std::io::Cursor::new(input)).expect("cursor reads");
@@ -1339,6 +1612,7 @@ mod tests {
             head_ref: String::new(),
             head_is_fork: false,
             head_oid: String::new(),
+            base_oid: String::new(),
             base_ref: String::new(),
             merge: Merge::Clean,
             sync: Sync::InSync,
@@ -1657,6 +1931,34 @@ mod tests {
             PrView::from(GhError::LocalGit("rev-list failed".into())),
             PrView::GitError("rev-list failed".into())
         );
+    }
+
+    #[test]
+    fn unified_patch_position_resets_at_each_hunk_and_counts_deletions() {
+        let patch = concat!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n",
+            "@@ -1,3 +1,3 @@\n",
+            " keep\n",
+            "-gone\n",
+            "+new\n",
+            " tail\n",
+            "@@ -20,2 +20,2 @@\n",
+            " keep2\n",
+            "+target\n",
+        );
+        assert_eq!(position_for_unified_patch(patch, 2, "+new"), Some(3));
+        assert_eq!(position_for_unified_patch(patch, 21, "+target"), Some(2));
+    }
+
+    #[test]
+    fn unified_patch_position_rejects_missing_or_ambiguous_rows() {
+        let missing = "@@ -1 +1 @@\n+only\n";
+        assert_eq!(position_for_unified_patch(missing, 2, "+only"), None);
+        let duplicate = "@@ -1 +1 @@\n+same\n@@ -3 +3 @@\n+same\n";
+        assert_eq!(position_for_unified_patch(duplicate, 1, "+same"), Some(1));
+        // Matching the same new-file line in two hunks is malformed, but must still fail closed.
+        let ambiguous = "@@ -1 +1 @@\n+same\n@@ -1 +1 @@\n+same\n";
+        assert_eq!(position_for_unified_patch(ambiguous, 1, "+same"), None);
     }
 
     #[test]

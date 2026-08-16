@@ -123,6 +123,20 @@ Details:
 - Each surface reads its newest 100 rows, never paged to exhaustion. A further page sets `truncated` and `pr-tab.md` marks the capped list. A forge that cannot identify its newest page serves the oldest, marked truncated.
 - Each provider CLI stdout and stderr stream is retained up to 4 MiB while still drained to EOF. Either stream exceeding that limit yields a retryable PR error; it never grows the fetch worker's memory without bound or deadlocks the child on a full pipe.
 
+### GitHub pending-review publishing
+
+GitHub alone may receive an explicitly confirmed local, current-side, single-line Diff comment as a **pending** review comment. Publishing never submits a review, approves, requests changes, resolves a thread, or removes the local comment. A Preview session owns at most one pending review for an exact `{host, owner, repository, PR number, head OID}` key; later eligible comments append only to that exact session-owned review. Preview never adopts a pending review made by the web UI or another client.
+
+Before any mutation Preview requires all of the following:
+
+- the cached and freshly fetched GitHub PR are the same open PR with the same head OID;
+- local `HEAD` equals that OID; and
+- index, worktree, and untracked paths are clean.
+
+The GitHub `position` is derived only from `git diff --no-ext-diff --unified=3 <base OID> <head OID> -- <path>`, using the immutable PR base/head pair. It is hunk-local and resets at every real `@@` hunk. The selected current-side line and its marked source text must map exactly once in that canonical patch. Missing or ambiguous mappings, an unavailable patch, stale anchors, a dirty worktree, a closed PR, or any head mismatch reject the publish before a GitHub write; Preview never derives a position from a rendered or working-tree diff and never guesses.
+
+A failed create or append keeps the local comment and records a retryable failed receipt. A successful publish records the pending review/comment receipt but still keeps the local comment and any agent-assignment receipt.
+
 ### Refresh
 
 - The first fetch starts when the panel opens.
@@ -156,7 +170,7 @@ reviewr only reads, so every failure degrades to a clear state. `Changes` and `A
 
 ## Non-goals
 
-- No writes to any forge: no posting, resolving, re-running checks, or merging. No routing PR feedback to the agent.
+- Except for the explicitly confirmed GitHub pending-review comment flow above, no writes to any forge: no posting, resolving, re-running checks, or merging. No routing PR feedback to the agent.
 - No transport of its own. The forge's CLI owns hosts, credentials, and TLS.
 - No repository selector or cross-repository search.
 - No different parent repositories across sibling worktrees from one clone. Use a separate clone.

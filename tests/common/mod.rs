@@ -132,6 +132,7 @@ pub fn pr_snapshot() -> herdr_reviewr::forge::PrSnapshot {
         head_ref: "feature".into(),
         head_is_fork: false,
         head_oid: String::new(),
+        base_oid: String::new(),
         base_ref: "main".into(),
         merge: Merge::Clean,
         sync: Sync::InSync,

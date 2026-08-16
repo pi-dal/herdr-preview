@@ -191,6 +191,7 @@ mod tests {
             text: text.into(),
             diff_anchored: true,
             assignment: None,
+            github: None,
         }
     }
 

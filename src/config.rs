@@ -1137,7 +1137,7 @@ mod tests {
         std::fs::write(dir.path().join("config.toml"), "[keybindings]\npreview = [\"p\"]\n")
             .unwrap();
         let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
-        assert!(error.contains("`preview`") && error.contains("`navigator-position`"), "{error}");
+        assert!(error.contains("`preview`") && error.contains("`publish`"), "{error}");
         assert!(error.contains("p is bound"), "{error}");
     }
 

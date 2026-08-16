@@ -27,7 +27,7 @@ use crate::forge;
 use crate::herdr::AgentChoice;
 use crate::keymap::Keymap;
 use crate::markdown::{hostile_char, sanitize_terminal_text};
-use crate::model::{Comment, DeliveryReceipt};
+use crate::model::{Comment, DeliveryReceipt, GitHubReceipt};
 use crate::theme::Palette;
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -79,6 +79,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let popup: Option<fn(&mut Frame, &App, Rect)> = match app.mode {
         Mode::List => Some(render_comments_list),
         Mode::ConfirmDelete { .. } => Some(render_delete_confirmation),
+        Mode::ConfirmPublish { .. } => Some(render_publish_confirmation),
         Mode::Picker | Mode::AssignPicker { .. } => Some(render_agent_picker),
         Mode::BasePick => Some(render_base_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
@@ -1231,9 +1232,10 @@ fn comment_card_lines(
     let stale_label = stale_reason
         .map_or_else(String::new, |reason| format!(" · STALE: {}", sanitize_one_line(reason)));
     let assignment_label = receipt_label(c.assignment.as_ref());
+    let github_label = github_receipt_label(c.github.as_ref());
     let label = truncate_width(
         &format!(
-            " ● {ordinal}/{total} comment · {}{stale_label}{assignment_label} · click/e edit ",
+            " ● {ordinal}/{total} comment · {}{stale_label}{assignment_label}{github_label} · click/e edit ",
             sanitize_one_line(&c.location())
         ),
         box_w.saturating_sub(3),
@@ -1283,6 +1285,21 @@ fn receipt_label(receipt: Option<&DeliveryReceipt>) -> String {
         }
         Some(DeliveryReceipt::Failed { agent }) => {
             format!(" · assignment failed: {}", sanitize_one_line(agent))
+        }
+        None => String::new(),
+    }
+}
+
+/// GitHub return values are untrusted remote text, so sanitize them only in this final paint
+/// helper. The raw receipt remains available for retry/state logic.
+fn github_receipt_label(receipt: Option<&GitHubReceipt>) -> String {
+    match receipt {
+        Some(GitHubReceipt::Pending { url: Some(url), .. }) => {
+            format!(" · GitHub pending: {}", sanitize_one_line(url))
+        }
+        Some(GitHubReceipt::Pending { url: None, .. }) => " · GitHub pending".to_string(),
+        Some(GitHubReceipt::Failed { message }) => {
+            format!(" · GitHub failed: {}", sanitize_one_line(message))
         }
         None => String::new(),
     }
@@ -2157,6 +2174,13 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             "scope",
         ),
         A::Send => return (hint(K::Send), format!("send {}", app.store.len())),
+        A::Publish => {
+            return if matches!(app.mode, Mode::ConfirmPublish { .. }) {
+                ("enter".into(), "publish".into())
+            } else {
+                (hint(K::Publish), "publish GitHub".into())
+            };
+        }
         A::List => (hint(K::Comments), "list"),
         A::Copy => (hint(K::Copy), "copy"),
         A::Save => ("enter".into(), "save"),
@@ -2530,6 +2554,28 @@ fn render_band(
 const LIST_POPUP_W_PCT: u16 = 80;
 const LIST_POPUP_H_PCT: u16 = 70;
 
+fn render_publish_confirmation(frame: &mut Frame, app: &App, area: Rect) {
+    let p = app.palette();
+    let Mode::ConfirmPublish { id } = app.mode else { return };
+    let ordinal = app.comment_ordinal(id).unwrap_or(0);
+    let popup = body_popup(area, app, 58.min(panes(area, app).body.width), 5);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.mauve))
+        .title(framed_title(&format!(
+            "Publish comment {ordinal}/{} to GitHub pending review?",
+            app.store.len()
+        )));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new("Enter publish · Esc cancel · review is not submitted")
+            .style(Style::default().fg(p.text)),
+        inner,
+    );
+}
+
 fn render_delete_confirmation(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let Mode::ConfirmDelete { id } = app.mode else { return };
@@ -2583,12 +2629,13 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
                 |why| format!("STALE: {}", sanitize_one_line(why)),
             );
             let preview = sanitize_one_line(c.text.lines().next().unwrap_or_default().trim());
+            let assignment = receipt_label(c.assignment.as_ref());
+            let github = github_receipt_label(c.github.as_ref());
             let fixed = format!(
-                " {}/{}  {}  {state}{}  ",
+                " {}/{}  {}  {state}{assignment}{github}  ",
                 i + 1,
                 app.store.len(),
                 sanitize_one_line(&c.location()),
-                receipt_label(c.assignment.as_ref())
             );
             let room = width.saturating_sub(fixed.width());
             let spans = vec![

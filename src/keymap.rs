@@ -42,6 +42,8 @@ pub enum Action {
     Find,
     Keys,
     Send,
+    /// Publish one selected local comment into Preview's pending GitHub review.
+    Publish,
     Assign,
     Copy,
     OpenPr,
@@ -114,7 +116,7 @@ impl std::fmt::Display for Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 38] = [
+const ACTIONS: [(Action, &str, &[Key]); 39] = [
     (Action::Down, "down", &[Key::plain('j')]),
     (Action::Up, "up", &[Key::plain('k')]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']'), Key::alt_named('→')]),
@@ -133,7 +135,7 @@ const ACTIONS: [(Action, &str, &[Key]); 38] = [
     (Action::TabPr, "tab-pr", &[Key::plain('3'), Key::alt('r')]),
     (Action::Wrap, "wrap", &[Key::plain('w')]),
     (Action::Preview, "preview", &[Key::plain('m')]),
-    (Action::NavigatorPosition, "navigator-position", &[Key::plain('p')]),
+    (Action::NavigatorPosition, "navigator-position", &[Key::plain('P')]),
     (Action::NavigatorHide, "navigator-hide", &[Key::plain('z')]),
     (Action::NavigatorGrow, "navigator-grow", &[Key::plain('<')]),
     (Action::NavigatorShrink, "navigator-shrink", &[Key::plain('>')]),
@@ -148,6 +150,7 @@ const ACTIONS: [(Action, &str, &[Key]); 38] = [
     (Action::Find, "find", &[Key::ctrl('f')]),
     (Action::Keys, "keys", &[Key::plain('?'), Key::alt('h')]),
     (Action::Send, "send", &[Key::plain('s'), Key::plain('S'), Key::alt('s')]),
+    (Action::Publish, "publish", &[Key::plain('p')]),
     (Action::Assign, "assign", &[Key::plain('a')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
@@ -281,11 +284,13 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('c')), Some(Action::Comment));
         assert_eq!(keymap.action_for(Key::plain('S')), Some(Action::Send));
         assert_eq!(keymap.action_for(Key::plain('m')), Some(Action::Preview));
-        assert_eq!(keymap.action_for(Key::plain('p')), Some(Action::NavigatorPosition));
+        assert_eq!(keymap.action_for(Key::plain('P')), Some(Action::NavigatorPosition));
+        assert_eq!(keymap.action_for(Key::plain('p')), Some(Action::Publish));
         assert_eq!(keymap.action_for(Key::plain('z')), Some(Action::NavigatorHide));
         assert_eq!(keymap.action_for(Key::plain('x')), None);
         assert_eq!(keymap.action_for(Key::plain('?')), Some(Action::Keys));
         assert_eq!(keymap.hint(Action::Send), Key::plain('s'));
+        assert_eq!(keymap.hint(Action::Publish), Key::plain('p'));
         assert_eq!(keymap.hint(Action::TabPr), Key::plain('3'));
         assert_eq!(keymap.action_for(Key::alt_named('↓')), Some(Action::NextChange));
         assert_eq!(keymap.action_for(Key::alt('u')), Some(Action::HideUnchanged));

@@ -1493,7 +1493,7 @@ fn navigator_actions_cycle_remember_shares_and_respect_modes() {
     app.diff_scroll = 1;
     let cursor = app.diff_cursor;
 
-    press(&mut app, &keymap, KeyCode::Char('p'));
+    press(&mut app, &keymap, KeyCode::Char('P'));
     assert_eq!(app.navigator_position, NavigatorPosition::Bottom);
     assert_eq!(app.focus, Focus::Diff);
     assert_eq!(app.diff_cursor, cursor);
@@ -1501,15 +1501,15 @@ fn navigator_actions_cycle_remember_shares_and_respect_modes() {
 
     press(&mut app, &keymap, KeyCode::Char('<'));
     assert_eq!(app.navigator_stack_pct, 29);
-    press(&mut app, &keymap, KeyCode::Char('p'));
+    press(&mut app, &keymap, KeyCode::Char('P'));
     assert_eq!(app.navigator_position, NavigatorPosition::Left);
     assert_eq!(app.navigator_side_pct, 32, "switching axis restores the side share");
     press(&mut app, &keymap, KeyCode::Char('<'));
     assert_eq!(app.navigator_side_pct, 36);
-    press(&mut app, &keymap, KeyCode::Char('p'));
+    press(&mut app, &keymap, KeyCode::Char('P'));
     assert_eq!(app.navigator_position, NavigatorPosition::Top);
     assert_eq!(app.navigator_stack_pct, 29, "the stacked share is remembered");
-    press(&mut app, &keymap, KeyCode::Char('p'));
+    press(&mut app, &keymap, KeyCode::Char('P'));
     assert_eq!(app.navigator_position, NavigatorPosition::Right);
     assert_eq!(app.navigator_side_pct, 36, "the side share is remembered");
 
@@ -1528,7 +1528,7 @@ fn navigator_actions_cycle_remember_shares_and_respect_modes() {
     assert_eq!(app.navigator_position, NavigatorPosition::Right, "the action is inert in list");
     app.mode = Mode::Normal;
     app.set_tab(herdr_reviewr::app::Tab::Pr).unwrap();
-    press(&mut app, &keymap, KeyCode::Char('p'));
+    press(&mut app, &keymap, KeyCode::Char('P'));
     assert_eq!(app.navigator_position, NavigatorPosition::Bottom, "the action works on PR");
     assert!(
         app.footer_bands().iter().any(|&(a, _)| a == FooterAction::NavigatorPosition),
@@ -2852,6 +2852,7 @@ fn changed_count_and_staleness_stay_scope_based_on_all_files() {
         text: "?".into(),
         diff_anchored: true,
         assignment: None,
+        github: None,
     };
     app.store.add(comment.clone());
 
