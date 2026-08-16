@@ -149,6 +149,14 @@ A selected GitHub inline finding may be assigned to a selected Herdr coding-agen
 
 The action is unavailable outside Git review, in Files-only or image preview, on non-GitHub providers, and unless the PR navigator selects an inline finding with a direct thread URL. All forge text is terminal-sanitized only at final rendering; raw identity and the task payload remain unmodified.
 
+### Lifecycle reconciliation and remote thread detail
+
+Every landed, read-only PR snapshot reconciles presentation by immutable provider identity. A finding with a nonblank direct URL is selected and reconciled by that raw direct URL alone; only a provider finding that genuinely lacks a URL falls back explicitly to its author/timestamp/location tuple. A finding's direct URL retains its selected row, read scroll, and session-local remote assignment receipt even if the provider changes its `path:line`, snippet, resolved/outdated state, order, or surrounding remote activity. Local comments retain their distinct stable local identity and their pending/submitted/failed GitHub receipt; they are never merged with a remote finding merely because bodies, anchors, authors, or timestamps look alike. A remote finding continues to surface the forge-supplied `open`, `resolved`, or `outdated` state alongside either delivered or failed session assignment receipt.
+
+At assignment time Preview may capture a bounded fingerprint of the relevant safe repository-relative regular file. It opens the repository root, every parent, and the final target through no-follow descriptors, and reads a maximum 4 MiB from that authorized regular-file descriptor. Each landed read-only PR refresh compares it only with the current same safe file: an exact mismatch says `relevant file changed`; any malformed path, symlink, unavailable/oversized file, special file, or failed read says `state unknown`. Rendering reads that cached observation and never performs file I/O. This is a local reviewer cue, not proof that the thread is fixed. It never resolves, modifies, or suppresses a remote thread.
+
+A selected inline finding with a direct URL can be opened externally only after a separate bare-Enter confirmation. The URL must satisfy the same trimmed HTTP(S), nonblank, no-control/no-bidi `openable_url` policy both before confirmation and again immediately before launch; the launcher receives only that validated value and returns success or a visible error. It sends no forge request and does not alter review lifecycle state. Files-only, image preview, missing/unsafe URL, and non-finding targets are inert.
+
 ### Refresh
 
 - The first fetch starts when the panel opens.

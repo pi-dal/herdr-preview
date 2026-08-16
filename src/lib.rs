@@ -1625,6 +1625,14 @@ pub fn handle_key_with_clipboard(
         }
         return Ok(());
     }
+    if matches!(app.mode, Mode::ConfirmOpenRemoteThread { .. }) {
+        match key.code {
+            Esc => app.cancel_remote_thread_open(),
+            Enter if key.modifiers.is_empty() => app.confirm_open_remote_thread(),
+            _ => {}
+        }
+        return Ok(());
+    }
     if matches!(app.mode, Mode::SubmitReview { .. }) {
         match key.code {
             Esc => app.cancel_submit_review(),
@@ -1682,6 +1690,7 @@ pub fn handle_key_with_clipboard(
             (Some(K::Up), _) => app.pr_move(-1),
             (Some(K::Keys), _) => app.toggle_keys(),
             (Some(K::AssignRemote), _) => app.assign_remote_thread_to_agent(),
+            (Some(K::OpenRemoteThread), _) => app.request_open_remote_thread(),
             (_, Esc) => app.escape(),
             (_, Tab) => app.toggle_focus(),
             (_, PageDown) if app.focus == Focus::Files => app.pr_scroll_nav(PAGE),
@@ -1774,7 +1783,13 @@ pub fn handle_key_with_clipboard(
             K::Find => app.open_find(),
             K::Keys => app.toggle_keys(),
             // `edit`/`delete` off the diff, and `open-pr` off the `PR` tab, are inert.
-            K::Edit | K::Delete | K::Assign | K::AssignRemote | K::Publish | K::OpenPr => {}
+            K::Edit
+            | K::Delete
+            | K::Assign
+            | K::AssignRemote
+            | K::OpenRemoteThread
+            | K::Publish
+            | K::OpenPr => {}
         }
         return Ok(());
     }

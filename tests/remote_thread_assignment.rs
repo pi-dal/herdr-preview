@@ -51,7 +51,7 @@ fn remote_app(repo: &Repo) -> herdr_reviewr::app::App {
     let mut finding = comment();
     finding.kind = CommentKind::Finding;
     finding.url = "https://github.com/o/r/pull/1#discussion_r17".into();
-    finding.anchor = "src/lib.rs:7".into();
+    finding.anchor = "tracked.txt:7".into();
     finding.author = "eve".into();
     finding.body = "Please preserve this exact body.".into();
     finding.snippet = Some("+ unsafe input".into());
@@ -118,7 +118,7 @@ fn remote_assignment_is_framed_frozen_and_retryable() {
             assert!(payload.starts_with("\x1b[200~") && payload.ends_with("\x1b[201~"));
             assert!(payload.contains("https://github.com/o/r/pull/1#discussion_r17"));
             assert!(payload.contains("**Author:** @eve"));
-            assert!(payload.contains("**Location:** src/lib.rs:7"));
+            assert!(payload.contains("**Location:** tracked.txt:7"));
             assert!(payload.contains("Please preserve this exact body."));
             assert!(payload.contains("+ unsafe input"));
             assert!(!commands.iter().any(|command| {
@@ -135,6 +135,7 @@ fn remote_assignment_is_framed_frozen_and_retryable() {
     }
 
     let repo = Repo::init();
+    repo.write("tracked.txt", "before\n");
     let mut app = remote_app(&repo);
     let area = Rect::new(0, 0, 100, 30);
     let keymap = Keymap::default();
@@ -151,6 +152,30 @@ fn remote_assignment_is_framed_frozen_and_retryable() {
     assert_eq!(app.mode, Mode::Normal);
     app.pr_forge = herdr_reviewr::git::Forge::GitHub;
 
+    // Unsafe, blank-after-trim, control, and bidi URLs cannot even enter the confirmation.
+    for unsafe_url in [
+        "   ",
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "https://example.test/\x1b[31m",
+        "https://example.test/\u{202e}hidden",
+    ] {
+        let PrView::Pr(pr) = &mut app.pr else { unreachable!() };
+        pr.comments[0].url = unsafe_url.into();
+        handle_key(&mut app, key(KeyCode::Char('O')), area, &keymap).unwrap();
+        assert_eq!(app.mode, Mode::Normal, "{unsafe_url:?} must not open a confirmation");
+    }
+    let PrView::Pr(pr) = &mut app.pr else { unreachable!() };
+    pr.comments[0].url = "https://github.com/o/r/pull/1#discussion_r17".into();
+
+    // Opening a direct thread is separately confirmed; Esc and modified Enter cannot launch it.
+    handle_key(&mut app, key(KeyCode::Char('O')), area, &keymap).unwrap();
+    assert!(matches!(app.mode, Mode::ConfirmOpenRemoteThread { .. }));
+    handle_key(&mut app, modified_enter(), area, &keymap).unwrap();
+    assert!(matches!(app.mode, Mode::ConfirmOpenRemoteThread { .. }));
+    handle_key(&mut app, key(KeyCode::Esc), area, &keymap).unwrap();
+    assert_eq!(app.mode, Mode::Normal);
+
     drive_to_confirmation(&mut app);
     // Modified Enter and Esc cannot deliver. Esc restores the pre-picker state.
     handle_key(&mut app, modified_enter(), area, &keymap).unwrap();
@@ -161,12 +186,26 @@ fn remote_assignment_is_framed_frozen_and_retryable() {
     handle_key(&mut app, key(KeyCode::Enter), area, &keymap).unwrap();
 
     let receipt = app.remote_thread_receipt(&app.pr_snapshot().unwrap().comments[0]);
-    if env::var("REMOTE_ASSIGN_FAIL").as_deref() == Ok("1") {
+    let failed = env::var("REMOTE_ASSIGN_FAIL").as_deref() == Ok("1");
+    if failed {
         assert!(matches!(receipt, Some(herdr_reviewr::app::RemoteThreadReceipt::Failed { .. })));
         assert!(app.status.contains("kept"));
     } else {
         assert!(matches!(receipt, Some(herdr_reviewr::app::RemoteThreadReceipt::Delivered { .. })));
         assert!(app.status.contains("GitHub unchanged"));
+        assert!(matches!(
+            app.remote_thread_worktree_state(&app.pr_snapshot().unwrap().comments[0]),
+            Some(herdr_reviewr::app::RemoteWorktreeState::Unchanged)
+        ));
+        repo.write("tracked.txt", "after\n");
+        // The read pane never performs filesystem I/O: a landed read-only PR refresh reconciles
+        // the cached baseline instead.
+        let refreshed = app.pr.clone();
+        app.apply_pr(refreshed);
+        assert!(matches!(
+            app.remote_thread_worktree_state(&app.pr_snapshot().unwrap().comments[0]),
+            Some(herdr_reviewr::app::RemoteWorktreeState::Changed)
+        ));
         // A refresh may move the anchor, but this same immutable discussion URL retains its receipt.
         let PrView::Pr(pr) = &mut app.pr else { unreachable!() };
         pr.comments[0].anchor = "renamed/module.rs:99".into();
@@ -175,11 +214,18 @@ fn remote_assignment_is_framed_frozen_and_retryable() {
             app.remote_thread_receipt(&moved_comment),
             Some(herdr_reviewr::app::RemoteThreadReceipt::Delivered { .. })
         ));
+    }
 
-        // Forge-derived text is sanitized only for paint; the raw payload above was frozen.
+    // Every receipt state keeps the provider lifecycle visible. Forge-derived text is sanitized
+    // only for paint; the raw task payload above was frozen before selection.
+    for (resolved, outdated, lifecycle) in
+        [(false, false, "open"), (true, false, "resolved"), (false, true, "outdated")]
+    {
         let PrView::Pr(pr) = &mut app.pr else { unreachable!() };
+        pr.comments[0].is_resolved = resolved;
+        pr.comments[0].is_outdated = outdated;
         pr.comments[0].author = "eve\x1b[31m".into();
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(300, 40)).unwrap();
         terminal.draw(|frame| ui::render(frame, &app)).unwrap();
         let painted = terminal
             .backend()
@@ -188,7 +234,8 @@ fn remote_assignment_is_framed_frozen_and_retryable() {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(painted.contains("assigned"));
+        let receipt = if failed { "assign failed" } else { "assigned" };
+        assert!(painted.contains(&format!("{receipt} · {lifecycle}")), "{painted}");
         assert!(!painted.contains('\x1b'));
     }
 }

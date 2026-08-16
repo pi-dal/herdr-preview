@@ -6,10 +6,14 @@
 //! terminal and maps input events onto these methods.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs::File;
+use std::hash::{Hash, Hasher};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Result;
+use rustix::fs::{CWD, Mode as FsMode, OFlags, openat};
 
 use crate::diff::{DiffCache, FileDiff, Row, View};
 use crate::export::{Agent, ExportTarget, format_all};
@@ -220,18 +224,145 @@ impl RemoteThread {
         }
     }
 
-    /// GitHub's direct review-comment URL is the immutable identity supplied by the provider.
-    /// Location, author, and timestamps are presentation data that can change after a force-push.
+    /// GitHub's direct review-comment URL is the immutable receipt identity supplied by the
+    /// provider. Location, author, and timestamps are presentation data that can change after a
+    /// force-push. Assignment requires this URL, so it remains raw and unprefixed in the map.
     fn identity(&self) -> String {
         self.url.clone()
     }
 }
 
+/// Refresh-selection continuity distinguishes a real direct URL from the explicit fallback used
+/// only for providers that supplied no URL. This avoids confusing a URL with textual fields while
+/// retaining the raw URL as the receipt identity.
+#[derive(Clone, PartialEq, Eq)]
+enum RemoteCommentIdentity {
+    Url(String),
+    Fallback { author: String, created_at: String, anchor: String },
+}
+
+fn comment_identity(comment: &forge::Comment) -> RemoteCommentIdentity {
+    if comment.url.trim().is_empty() {
+        RemoteCommentIdentity::Fallback {
+            author: comment.author.clone(),
+            created_at: comment.created_at.clone(),
+            anchor: comment.anchor.clone(),
+        }
+    } else {
+        RemoteCommentIdentity::Url(comment.url.clone())
+    }
+}
+
+/// Frozen read-only worktree observation for a remote thread assignment. The provider's
+/// immutable URL remains the receipt key; this is only a conservative local follow-up signal.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RemoteThreadBaseline {
+    pub path: Option<String>,
+    fingerprint: Option<u64>,
+}
+
+impl RemoteThreadBaseline {
+    fn capture(repo: &Path, anchor: &str) -> Self {
+        let path = anchor
+            .rsplit_once(':')
+            .filter(|(_, line)| line.parse::<u32>().is_ok())
+            .map(|(path, _)| path.to_owned())
+            .filter(|path| safe_repo_relative(path));
+        let fingerprint = path.as_deref().and_then(|path| fingerprint_file(repo, path));
+        Self { path, fingerprint }
+    }
+
+    fn current_state(&self, repo: &Path) -> RemoteWorktreeState {
+        let (Some(path), Some(expected)) = (&self.path, self.fingerprint) else {
+            return RemoteWorktreeState::Unknown;
+        };
+        match fingerprint_file(repo, path) {
+            Some(actual) if actual == expected => RemoteWorktreeState::Unchanged,
+            Some(_) => RemoteWorktreeState::Changed,
+            None => RemoteWorktreeState::Unknown,
+        }
+    }
+}
+
+fn safe_repo_relative(path: &str) -> bool {
+    !path.is_empty()
+        && Path::new(path).components().all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Read the compared file from no-follow descriptors only. Any unavailable, non-regular,
+/// oversized, symlinked, or concurrently replaced target is deliberately `Unknown` rather than
+/// guessed from a pathname. The 4 MiB cap is enforced on the authorized fd, not metadata alone.
+fn fingerprint_file(repo: &Path, relative: &str) -> Option<u64> {
+    const CAP: usize = 4 * 1024 * 1024;
+    let components: Vec<_> = Path::new(relative).components().collect();
+    if components.is_empty() || !components.iter().all(|c| matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    let (name, parents) = components.split_last()?;
+    let root = openat(
+        CWD,
+        repo,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        FsMode::empty(),
+    )
+    .ok()?;
+    let mut directory = File::from(root);
+    for parent in parents {
+        let fd = openat(
+            &directory,
+            *parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            FsMode::empty(),
+        )
+        .ok()?;
+        directory = File::from(fd);
+    }
+    let fd = openat(
+        &directory,
+        *name,
+        // Opening a FIFO for reading normally waits for a writer. Keep this descriptor
+        // acquisition nonblocking until its type proves it is an authorized regular file.
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        FsMode::empty(),
+    )
+    .ok()?;
+    let mut file = File::from(fd);
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > CAP as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize + 1);
+    file.by_ref().take(CAP.saturating_add(1) as u64).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > CAP {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// The conservative current-worktree comparison for an assigned remote finding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RemoteWorktreeState {
+    Unchanged,
+    Changed,
+    Unknown,
+}
+
 /// Local delivery metadata for a remote thread. This never mutates forge state.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RemoteThreadReceipt {
-    Delivered { agent: String, tab: String },
-    Failed { agent: String },
+    Delivered {
+        agent: String,
+        tab: String,
+        baseline: RemoteThreadBaseline,
+        worktree: RemoteWorktreeState,
+    },
+    Failed {
+        agent: String,
+        baseline: RemoteThreadBaseline,
+        worktree: RemoteWorktreeState,
+    },
 }
 
 /// The interaction mode the UI is in.
@@ -273,6 +404,10 @@ pub enum Mode {
         thread: RemoteThread,
         agent: AgentChoice,
     },
+    /// A final explicit confirmation before opening the selected remote finding externally.
+    ConfirmOpenRemoteThread {
+        url: String,
+    },
     /// Choosing the `branch` scope's base (`specs/input.md` Base picker). Its state lives in
     /// [`App::base_picker`].
     BasePick,
@@ -305,6 +440,7 @@ impl Mode {
                 | Mode::AssignPicker { .. }
                 | Mode::RemoteAssignPicker { .. }
                 | Mode::ConfirmRemoteAssign { .. }
+                | Mode::ConfirmOpenRemoteThread { .. }
                 | Mode::BasePick
         )
     }
@@ -510,6 +646,8 @@ pub enum FooterAction {
     SubmitReview,
     /// Assign the selected remote GitHub finding to a Herdr coding agent.
     AssignRemote,
+    /// Open the selected remote finding externally after an explicit confirmation.
+    OpenRemoteThread,
     List,
     Copy,
     Save,
@@ -1124,7 +1262,8 @@ impl App {
             | Mode::Picker
             | Mode::AssignPicker { .. }
             | Mode::RemoteAssignPicker { .. }
-            | Mode::ConfirmRemoteAssign { .. } => {}
+            | Mode::ConfirmRemoteAssign { .. }
+            | Mode::ConfirmOpenRemoteThread { .. } => {}
             Mode::List
             | Mode::Composing { .. }
             | Mode::ConfirmDelete { .. }
@@ -2551,19 +2690,20 @@ impl App {
         // it survives while the new snapshot still has a description, and an emptied one
         // vanishes like a deleted comment.
         let on_description = self.pr_on_description();
-        let selected = self
-            .pr_selected_comment()
-            .map(|c| (c.author.clone(), c.created_at.clone(), c.anchor.clone()));
+        let selected = self.pr_selected_comment().map(comment_identity);
         self.pr = view;
+        self.reconcile_remote_thread_assignments();
         self.recompute_github_submit_availability();
         let offset = self.pr_description_offset();
         let restored = if on_description {
             self.pr_has_description().then_some(0)
         } else {
-            selected.as_ref().and_then(|(author, created, anchor)| {
-                let i = self.pr_snapshot()?.comments.iter().position(|c| {
-                    c.author == *author && c.created_at == *created && c.anchor == *anchor
-                })?;
+            selected.as_ref().and_then(|identity| {
+                let i = self
+                    .pr_snapshot()?
+                    .comments
+                    .iter()
+                    .position(|comment| comment_identity(comment) == *identity)?;
                 Some(i + offset)
             })
         };
@@ -3422,7 +3562,8 @@ impl App {
             | Mode::Picker
             | Mode::AssignPicker { .. }
             | Mode::RemoteAssignPicker { .. }
-            | Mode::ConfirmRemoteAssign { .. } => None,
+            | Mode::ConfirmRemoteAssign { .. }
+            | Mode::ConfirmOpenRemoteThread { .. } => None,
         }
     }
 
@@ -3697,6 +3838,7 @@ impl App {
             | Mode::AssignPicker { .. }
             | Mode::RemoteAssignPicker { .. }
             | Mode::ConfirmRemoteAssign { .. }
+            | Mode::ConfirmOpenRemoteThread { .. }
             | Mode::BasePick
             | Mode::Search
             | Mode::Find => None,
@@ -4286,7 +4428,10 @@ impl App {
                 return vec![(A::SubmitReview, Primary), (A::Cancel, Do)];
             }
             Mode::ConfirmRemoteAssign { .. } => {
-                return vec![(A::PickAgent, Primary), (A::Cancel, Do)];
+                return vec![(A::AssignRemote, Primary), (A::Cancel, Do)];
+            }
+            Mode::ConfirmOpenRemoteThread { .. } => {
+                return vec![(A::OpenRemoteThread, Primary), (A::Cancel, Do)];
             }
             Mode::List => {
                 let mut actions = vec![
@@ -4399,6 +4544,7 @@ impl App {
                         && !comment.url.is_empty()
                 }) {
                     out.push((A::AssignRemote, Do));
+                    out.push((A::OpenRemoteThread, Do));
                 }
             }
             out.push((A::Search, Go));
@@ -5233,13 +5379,33 @@ impl App {
             thread.url, thread.author, thread.anchor, thread.body, snippet
         );
         let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone() };
-        let delivered = target.export(&payload).is_ok();
+        self.complete_remote_thread_assignment(&thread, &agent, || target.export(&payload).is_ok());
+    }
+
+    /// Record an assignment using the observation made immediately before the irreversible
+    /// bracketed-paste delivery. The recipient may change the worktree before delivery returns,
+    /// so both success and failure receipts must retain this pre-delivery baseline rather than
+    /// sampling after the export call.
+    fn complete_remote_thread_assignment(
+        &mut self,
+        thread: &RemoteThread,
+        agent: &AgentChoice,
+        deliver: impl FnOnce() -> bool,
+    ) {
+        let baseline = RemoteThreadBaseline::capture(&self.repo, &thread.anchor);
+        let worktree = baseline.current_state(&self.repo);
+        let delivered = deliver();
         self.remote_thread_assignments.insert(
             thread.identity(),
             if delivered {
-                RemoteThreadReceipt::Delivered { agent: agent.name.clone(), tab: agent.tab.clone() }
+                RemoteThreadReceipt::Delivered {
+                    agent: agent.name.clone(),
+                    tab: agent.tab.clone(),
+                    baseline,
+                    worktree,
+                }
             } else {
-                RemoteThreadReceipt::Failed { agent: agent.name.clone() }
+                RemoteThreadReceipt::Failed { agent: agent.name.clone(), baseline, worktree }
             },
         );
         self.status = if delivered {
@@ -5256,6 +5422,69 @@ impl App {
     /// The session-only receipt for this raw remote finding, if it was assigned in this pane.
     pub fn remote_thread_receipt(&self, comment: &forge::Comment) -> Option<&RemoteThreadReceipt> {
         self.remote_thread_assignments.get(&RemoteThread::from_comment(comment).identity())
+    }
+
+    /// Reconcile frozen assignment baselines only while a PR result lands. Rendering reads this
+    /// cache and never performs file I/O; a later local edit is therefore conservatively shown
+    /// as the state observed at the most recent read-only PR refresh.
+    fn reconcile_remote_thread_assignments(&mut self) {
+        for receipt in self.remote_thread_assignments.values_mut() {
+            match receipt {
+                RemoteThreadReceipt::Delivered { baseline, worktree, .. }
+                | RemoteThreadReceipt::Failed { baseline, worktree, .. } => {
+                    *worktree = baseline.current_state(&self.repo);
+                }
+            }
+        }
+    }
+
+    /// The worktree state observed at the latest landed PR refresh for this receipt.
+    pub fn remote_thread_worktree_state(
+        &self,
+        comment: &forge::Comment,
+    ) -> Option<RemoteWorktreeState> {
+        match self.remote_thread_receipt(comment)? {
+            RemoteThreadReceipt::Delivered { worktree, .. }
+            | RemoteThreadReceipt::Failed { worktree, .. } => Some(*worktree),
+        }
+    }
+
+    /// Ask before opening a remote finding URL. This is intentionally separate from `o open PR`.
+    pub fn request_open_remote_thread(&mut self) {
+        if self.image_view_active() || !self.is_git_review() || self.tab != Tab::Pr {
+            return;
+        }
+        let Some(comment) = self.pr_selected_comment() else {
+            self.status = "select a remote inline finding to open".into();
+            return;
+        };
+        if comment.kind != forge::CommentKind::Finding {
+            self.status = "select a remote inline finding to open".into();
+            return;
+        }
+        let Ok(url) = crate::browser::openable_url(&comment.url) else {
+            self.status = "selected finding has no safe direct URL; refresh and retry".into();
+            return;
+        };
+        self.mode = Mode::ConfirmOpenRemoteThread { url: url.to_owned() };
+    }
+
+    pub fn confirm_open_remote_thread(&mut self) {
+        let Mode::ConfirmOpenRemoteThread { url } = self.mode.clone() else { return };
+        match crate::browser::openable_url(&url) {
+            Ok(validated) => match crate::browser::open(validated) {
+                Ok(()) => self.status = "opened remote thread externally — GitHub unchanged".into(),
+                Err(error) => self.status = format!("could not open remote thread: {error}"),
+            },
+            Err(_) => self.status = "could not open remote thread: unsafe direct URL".into(),
+        }
+        self.mode = Mode::Normal;
+    }
+
+    pub fn cancel_remote_thread_open(&mut self) {
+        if matches!(self.mode, Mode::ConfirmOpenRemoteThread { .. }) {
+            self.mode = Mode::Normal;
+        }
     }
 
     pub fn cancel_remote_thread_assignment(&mut self) {
@@ -5777,7 +6006,10 @@ fn anchor(selected: &[Row]) -> Option<(Side, u32, u32, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Band, FooterAction, Mode, RepositoryMode, Tab};
+    use super::{
+        App, Band, FooterAction, Mode, RemoteThreadBaseline, RemoteWorktreeState, RepositoryMode,
+        Tab, fingerprint_file,
+    };
     use crate::config::NavigatorPosition;
     use crate::diff::{FileState, View};
     use crate::file_list::RowKind;
@@ -5818,6 +6050,195 @@ mod tests {
             checks: Vec::new(),
             comments: Vec::new(),
             truncated: false,
+        }
+    }
+
+    #[test]
+    fn pr_refresh_preserves_url_selected_finding_and_read_scroll_after_move_and_reorder() {
+        let mut app = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        app.tab = Tab::Pr;
+        let mut first = crate::forge::Comment {
+            kind: crate::forge::CommentKind::Finding,
+            url: "https://github.com/o/r/pull/1#discussion_r1".into(),
+            author: "first".into(),
+            author_is_bot: false,
+            anchor: "old.rs:1".into(),
+            body: "first".into(),
+            snippet: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            is_resolved: false,
+            is_outdated: false,
+            reply_count: 0,
+        };
+        let mut selected = first.clone();
+        selected.url = "https://github.com/o/r/pull/1#discussion_r2".into();
+        selected.author = "selected".into();
+        selected.anchor = "old.rs:9".into();
+        let mut initial = open_pr("head");
+        initial.comments = vec![first.clone(), selected.clone()];
+        app.apply_pr(crate::forge::PrView::Pr(Box::new(initial)));
+        app.pr_cursor = 1;
+        app.pr_read_scroll = 7;
+
+        // GitHub may move a discussion's anchor, alter its lifecycle, and reorder activity.
+        selected.anchor = "renamed/module.rs:99".into();
+        selected.is_outdated = true;
+        first.anchor = "another.rs:4".into();
+        let mut refreshed = open_pr("head");
+        refreshed.comments = vec![selected.clone(), first];
+        app.apply_pr(crate::forge::PrView::Pr(Box::new(refreshed)));
+
+        assert_eq!(app.pr_selected_comment().unwrap().url, selected.url);
+        assert_eq!(app.pr_read_scroll, 7, "the same URL keeps the read position");
+    }
+
+    #[test]
+    fn unsafe_remote_urls_never_open_and_are_revalidated_at_launch() {
+        let mut app = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        app.tab = Tab::Pr;
+        let mut comment = crate::forge::Comment {
+            kind: crate::forge::CommentKind::Finding,
+            url: String::new(),
+            author: "author".into(),
+            author_is_bot: false,
+            anchor: "file.rs:1".into(),
+            body: String::new(),
+            snippet: None,
+            created_at: String::new(),
+            is_resolved: false,
+            is_outdated: false,
+            reply_count: 0,
+        };
+        for bad in [
+            "   ",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "https://example.test/\x1b[31m",
+            "https://example.test/\u{202e}hidden",
+        ] {
+            comment.url = bad.into();
+            let mut pr = open_pr("head");
+            pr.comments = vec![comment.clone()];
+            app.pr = crate::forge::PrView::Pr(Box::new(pr));
+            app.mode = Mode::Normal;
+            app.request_open_remote_thread();
+            assert_eq!(app.mode, Mode::Normal, "{bad:?} must not reach confirmation");
+        }
+
+        comment.url = "https://example.test/safe".into();
+        let mut pr = open_pr("head");
+        pr.comments = vec![comment];
+        app.pr = crate::forge::PrView::Pr(Box::new(pr));
+        app.request_open_remote_thread();
+        let Mode::ConfirmOpenRemoteThread { url } = &mut app.mode else {
+            panic!("safe URL confirms")
+        };
+        *url = "javascript:alert(1)".into();
+        app.confirm_open_remote_thread();
+        assert!(app.status.contains("unsafe direct URL"));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_assignment_fingerprint_uses_nofollow_fds_or_stays_unknown() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("tracked.txt"), "before\n").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside\n").unwrap();
+        let baseline = RemoteThreadBaseline::capture(root.path(), "tracked.txt:1");
+        assert!(baseline.fingerprint.is_some());
+        assert_eq!(baseline.current_state(root.path()), RemoteWorktreeState::Unchanged);
+
+        std::fs::remove_file(root.path().join("tracked.txt")).unwrap();
+        symlink(outside.path().join("secret.txt"), root.path().join("tracked.txt")).unwrap();
+        assert_eq!(baseline.current_state(root.path()), RemoteWorktreeState::Unknown);
+        assert!(fingerprint_file(root.path(), "missing.txt").is_none());
+        assert!(fingerprint_file(root.path(), "../outside").is_none());
+
+        std::fs::remove_file(root.path().join("tracked.txt")).unwrap();
+        std::fs::write(root.path().join("tracked.txt"), vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
+        assert!(fingerprint_file(root.path(), "tracked.txt").is_none(), "oversize is unknown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_assignment_fingerprint_rejects_fifo_without_a_writer() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("thread.fifo");
+        assert!(
+            Command::new("mkfifo").arg(&fifo).status().unwrap().success(),
+            "the Unix FIFO fixture must be created without a writer"
+        );
+
+        let started = Instant::now();
+        assert!(fingerprint_file(root.path(), "thread.fifo").is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a FIFO without a writer must not block baseline capture"
+        );
+        let baseline = RemoteThreadBaseline::capture(root.path(), "thread.fifo:1");
+        assert!(baseline.fingerprint.is_none());
+        assert_eq!(baseline.current_state(root.path()), RemoteWorktreeState::Unknown);
+    }
+
+    #[test]
+    fn remote_assignment_baseline_precedes_delivery_for_delivered_and_failed_receipts() {
+        for delivered in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let file = root.path().join("tracked.rs");
+            std::fs::write(&file, "before\n").unwrap();
+            let mut app = App::blocked(root.path().to_owned(), Scope::Uncommitted, None);
+            let thread = super::RemoteThread {
+                url: format!("https://github.com/o/r/pull/1#discussion_r{delivered}"),
+                author: "reviewer".into(),
+                body: "please fix".into(),
+                anchor: "tracked.rs:1".into(),
+                snippet: Some("before".into()),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            };
+            let agent = crate::herdr::AgentChoice {
+                pane_id: "w1:p1".into(),
+                name: "coding-agent".into(),
+                state: "idle".into(),
+                tab: "work".into(),
+            };
+
+            // This closure is the deterministic delivery seam: it simulates an agent that edits
+            // the relevant file before `export` reports either success or failure.
+            app.complete_remote_thread_assignment(&thread, &agent, || {
+                std::fs::write(&file, "after\n").unwrap();
+                delivered
+            });
+
+            let receipt = app.remote_thread_assignments.get(&thread.identity()).unwrap();
+            let (baseline, worktree) = match receipt {
+                super::RemoteThreadReceipt::Delivered { baseline, worktree, .. }
+                | super::RemoteThreadReceipt::Failed { baseline, worktree, .. } => {
+                    (baseline, *worktree)
+                }
+            };
+            assert_eq!(
+                worktree,
+                RemoteWorktreeState::Unchanged,
+                "the stored initial state is sampled before delivery mutates the worktree"
+            );
+            assert_eq!(baseline.current_state(root.path()), RemoteWorktreeState::Changed);
+
+            // PR refresh reconciliation compares the frozen pre-delivery bytes, not a second
+            // post-delivery baseline, so both receipt outcomes surface the edit.
+            app.reconcile_remote_thread_assignments();
+            let refreshed = app.remote_thread_assignments.get(&thread.identity()).unwrap();
+            let state = match refreshed {
+                super::RemoteThreadReceipt::Delivered { worktree, .. }
+                | super::RemoteThreadReceipt::Failed { worktree, .. } => *worktree,
+            };
+            assert_eq!(state, RemoteWorktreeState::Changed);
         }
     }
 

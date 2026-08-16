@@ -49,6 +49,8 @@ pub enum Action {
     Assign,
     /// Assign the selected remote GitHub finding to a Herdr agent without changing GitHub.
     AssignRemote,
+    /// Explicitly open the selected remote finding's direct URL externally.
+    OpenRemoteThread,
     Copy,
     OpenPr,
     Refresh,
@@ -120,7 +122,7 @@ impl std::fmt::Display for Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 41] = [
+const ACTIONS: [(Action, &str, &[Key]); 42] = [
     (Action::Down, "down", &[Key::plain('j')]),
     (Action::Up, "up", &[Key::plain('k')]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']'), Key::alt_named('→')]),
@@ -158,6 +160,7 @@ const ACTIONS: [(Action, &str, &[Key]); 41] = [
     (Action::SubmitReview, "submit-review", &[Key::plain('S')]),
     (Action::Assign, "assign", &[Key::plain('a')]),
     (Action::AssignRemote, "assign-remote", &[Key::plain('A')]),
+    (Action::OpenRemoteThread, "open-remote-thread", &[Key::plain('O')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
     (Action::Refresh, "refresh", &[Key::plain('r'), Key::alt_shift('r')]),

@@ -82,6 +82,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::ConfirmPublish { .. } => Some(render_publish_confirmation),
         Mode::SubmitReview { .. } => Some(render_submit_review_confirmation),
         Mode::ConfirmRemoteAssign { .. } => Some(render_remote_assign_confirmation),
+        Mode::ConfirmOpenRemoteThread { .. } => Some(render_remote_thread_open_confirmation),
         Mode::Picker | Mode::AssignPicker { .. } | Mode::RemoteAssignPicker { .. } => {
             Some(render_agent_picker)
         }
@@ -2206,6 +2207,13 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
                 (hint(K::AssignRemote), "assign GitHub thread")
             }
         }
+        A::OpenRemoteThread => {
+            if matches!(app.mode, Mode::ConfirmOpenRemoteThread { .. }) {
+                ("enter".into(), "open externally")
+            } else {
+                (hint(K::OpenRemoteThread), "open thread ↗")
+            }
+        }
         A::List => (hint(K::Comments), "list"),
         A::Copy => (hint(K::Copy), "copy"),
         A::Save => ("enter".into(), "save"),
@@ -2647,6 +2655,24 @@ fn render_remote_assign_confirmation(frame: &mut Frame, app: &App, area: Rect) {
         sanitize_terminal_text(&agent.tab),
         sanitize_terminal_text(&thread.url),
         sanitize_terminal_text(&thread.anchor),
+    );
+    frame.render_widget(Paragraph::new(copy).style(Style::default().fg(p.text)), inner);
+}
+
+fn render_remote_thread_open_confirmation(frame: &mut Frame, app: &App, area: Rect) {
+    let p = app.palette();
+    let Mode::ConfirmOpenRemoteThread { ref url } = app.mode else { return };
+    let popup = body_popup(area, app, 70.min(panes(area, app).body.width), 5);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.mauve))
+        .title(framed_title("Open remote GitHub thread externally?"));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let copy = format!(
+        "{}\nEnter opens externally · Esc cancel · GitHub is unchanged",
+        sanitize_terminal_text(url),
     );
     frame.render_widget(Paragraph::new(copy).style(Style::default().fg(p.text)), inner);
 }
@@ -3871,7 +3897,14 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
     });
     let offset = app.pr_description_offset();
     rows.extend(s.comments.iter().enumerate().map(|(index, comment)| PrNavRow {
-        spans: pr_comment_row(comment, app.remote_thread_receipt(comment), width, now, p),
+        spans: pr_comment_row(
+            comment,
+            app.remote_thread_receipt(comment),
+            app.remote_thread_worktree_state(comment),
+            width,
+            now,
+            p,
+        ),
         cursor: Some(index + offset),
     }));
     rows
@@ -3910,17 +3943,37 @@ fn pr_checks_header(s: &forge::PrSnapshot) -> String {
 fn pr_comment_row(
     cm: &forge::Comment,
     receipt: Option<&crate::app::RemoteThreadReceipt>,
+    worktree: Option<crate::app::RemoteWorktreeState>,
     width: usize,
     now: std::time::SystemTime,
     p: &Palette,
 ) -> Vec<Span<'static>> {
     let author_color = if cm.author_is_bot { p.overlay1 } else { p.peach };
+    // Provider lifecycle is independent from our session-only delivery receipt: a failed or
+    // delivered assignment must never conceal whether GitHub still reports the finding open,
+    // resolved, or outdated.
+    let lifecycle = if cm.is_resolved {
+        "resolved"
+    } else if cm.is_outdated {
+        "outdated"
+    } else {
+        "open"
+    };
     let trailing = match receipt {
-        Some(crate::app::RemoteThreadReceipt::Delivered { .. }) => "assigned".to_string(),
-        Some(crate::app::RemoteThreadReceipt::Failed { .. }) => "assign failed".to_string(),
-        None if cm.is_resolved => "resolved".to_string(),
-        None if cm.is_outdated => "outdated".to_string(),
-        None => forge::relative_age(&cm.created_at, now),
+        Some(crate::app::RemoteThreadReceipt::Delivered { .. }) => {
+            format!("assigned · {lifecycle}")
+        }
+        Some(crate::app::RemoteThreadReceipt::Failed { .. }) => {
+            format!("assign failed · {lifecycle}")
+        }
+        None => format!("{lifecycle} · {}", forge::relative_age(&cm.created_at, now)),
+    };
+    let trailing = match worktree {
+        Some(crate::app::RemoteWorktreeState::Changed) => format!("{trailing} · file changed"),
+        Some(crate::app::RemoteWorktreeState::Unknown) => {
+            format!("{trailing} · file state unknown")
+        }
+        Some(crate::app::RemoteWorktreeState::Unchanged) | None => trailing,
     };
     let author = format!("@{} ", sanitize_terminal_text(&cm.author));
     let budget = width.saturating_sub(author.width() + trailing.width() + 3).max(1);
@@ -4084,6 +4137,37 @@ fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
         let offset = lines.len();
         lines.append(&mut rendered.lines);
         body_meta = Some((offset, rendered));
+        if let Some(receipt) = app.remote_thread_receipt(cm) {
+            let delivery = match receipt {
+                crate::app::RemoteThreadReceipt::Delivered { agent, tab, .. } => {
+                    format!("Agent assignment: delivered to {agent} · {tab}")
+                }
+                crate::app::RemoteThreadReceipt::Failed { agent, .. } => {
+                    format!("Agent assignment: failed for {agent}; A retries")
+                }
+            };
+            let worktree = match app.remote_thread_worktree_state(cm) {
+                Some(crate::app::RemoteWorktreeState::Unchanged) => {
+                    "Worktree since assignment: relevant file unchanged"
+                }
+                Some(crate::app::RemoteWorktreeState::Changed) => {
+                    "Worktree since assignment: relevant file changed — review manually"
+                }
+                Some(crate::app::RemoteWorktreeState::Unknown) | None => {
+                    "Worktree since assignment: state unknown — review manually"
+                }
+            };
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                sanitize_terminal_text(&delivery),
+                Style::default().fg(p.overlay0),
+            )));
+            lines.push(Line::from(Span::styled(worktree, Style::default().fg(p.yellow))));
+            lines.push(Line::from(Span::styled(
+                "A assign · O open thread externally · GitHub is unchanged",
+                Style::default().fg(p.overlay0),
+            )));
+        }
         if cm.reply_count > 0 {
             let plural = if cm.reply_count == 1 { "reply" } else { "replies" };
             lines.push(Line::raw(""));
