@@ -148,6 +148,7 @@ pub fn comment() -> herdr_reviewr::forge::Comment {
     use herdr_reviewr::forge::{Comment, CommentKind};
     Comment {
         kind: CommentKind::Comment,
+        url: String::new(),
         author: "ann".into(),
         author_is_bot: false,
         anchor: "comment".into(),

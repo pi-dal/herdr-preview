@@ -199,6 +199,9 @@ pub enum CheckStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comment {
     pub kind: CommentKind,
+    /// Canonical forge URL for this exact remote item when the provider supplies one.
+    /// Empty means the provider cannot identify a direct link.
+    pub url: String,
     pub author: String,
     pub author_is_bot: bool,
     /// `path:line` for a finding, the literal `review`/`comment` for the unanchored kinds.
@@ -1163,10 +1166,10 @@ fn build_detail_query(number: u64) -> String {
          headRefOid isCrossRepository \
          commits(last:1){{nodes{{commit{{statusCheckRollup{{contexts(first:100){{pageInfo{{hasNextPage}} nodes{{__typename \
          ... on CheckRun{{name status conclusion}} ... on StatusContext{{context state}}}}}}}}}}}}}} \
-         reviews(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login}} body submittedAt}}}} \
-         comments(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login}} body createdAt}}}} \
+         reviews(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login}} body submittedAt url}}}} \
+         comments(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login}} body createdAt url}}}} \
          reviewThreads(last:100){{pageInfo{{hasPreviousPage}} nodes{{isResolved isOutdated path line \
-         comments(first:1){{totalCount nodes{{author{{login}} body createdAt diffHunk}}}}}}}}}}}}}}"
+         comments(first:1){{totalCount nodes{{author{{login}} body createdAt diffHunk url}}}}}}}}}}}}}}"
     )
 }
 
@@ -1330,7 +1333,10 @@ fn merge_comments(reviews: &Value, issues: &Value, threads: &Value) -> Vec<Comme
         if body.is_empty() {
             continue;
         }
-        out.push(prose_comment(CommentKind::Review, &r["author"], body, r["submittedAt"].as_str()));
+        let mut comment =
+            prose_comment(CommentKind::Review, &r["author"], body, r["submittedAt"].as_str());
+        comment.url = r["url"].as_str().unwrap_or("").to_string();
+        out.push(comment);
     }
 
     // Plain conversation comments (the `comment` cards).
@@ -1339,7 +1345,10 @@ fn merge_comments(reviews: &Value, issues: &Value, threads: &Value) -> Vec<Comme
         if body.is_empty() {
             continue;
         }
-        out.push(prose_comment(CommentKind::Comment, &c["author"], body, c["createdAt"].as_str()));
+        let mut comment =
+            prose_comment(CommentKind::Comment, &c["author"], body, c["createdAt"].as_str());
+        comment.url = c["url"].as_str().unwrap_or("").to_string();
+        out.push(comment);
     }
 
     // Inline review threads (the `finding` cards), with resolved/outdated and replies.
@@ -1353,6 +1362,7 @@ fn merge_comments(reviews: &Value, issues: &Value, threads: &Value) -> Vec<Comme
         };
         out.push(Comment {
             kind: CommentKind::Finding,
+            url: root["url"].as_str().unwrap_or("").to_string(),
             author_is_bot: is_bot(&login),
             author: login,
             anchor,
@@ -1395,6 +1405,7 @@ pub(crate) fn prose_row(
     };
     Comment {
         kind,
+        url: String::new(),
         author_is_bot,
         author,
         anchor: anchor.to_string(),
@@ -1916,6 +1927,7 @@ mod tests {
         // standing verdict, not repeated prose, so newest-wins dedup never drops one.
         let row = |kind, anchor: &str, body: &str, created_at: &str| Comment {
             kind,
+            url: String::new(),
             author: "claude[bot]".to_string(),
             author_is_bot: true,
             anchor: anchor.to_string(),

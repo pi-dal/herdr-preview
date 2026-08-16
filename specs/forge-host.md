@@ -143,6 +143,12 @@ A failed create or append keeps the local comment and records a retryable failed
 
 Immediately before `submitPullRequestReview`, Preview applies the same fresh open-PR, base/head, local-HEAD, and clean index/worktree/untracked gates as publishing. A failed submission retains the binding and local comments so it is retryable. A successful submission removes only that binding and marks every local comment bearing that review ID `submitted`; local comments and agent receipts are retained.
 
+### Remote GitHub thread assignment
+
+A selected GitHub inline finding may be assigned to a selected Herdr coding-agent tab with no forge write. Preview freezes the selected finding's direct GitHub URL, author, body, `path:line`, and returned snippet, then requires both an explicit agent picker choice and a separate bare-Enter confirmation before bracketed-pasting the task envelope into that tab. It never auto-submits the pasted agent input and never replies to, resolves, approves, requests changes on, or otherwise changes the GitHub thread. Delivery is session-local metadata (`delivered` or `failed`) keyed solely to the frozen direct GitHub thread/comment URL. It is independent of forge status and mutable location metadata, so an anchor moved by a later commit retains its receipt.
+
+The action is unavailable outside Git review, in Files-only or image preview, on non-GitHub providers, and unless the PR navigator selects an inline finding with a direct thread URL. All forge text is terminal-sanitized only at final rendering; raw identity and the task payload remain unmodified.
+
 ### Refresh
 
 - The first fetch starts when the panel opens.

@@ -81,7 +81,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::ConfirmDelete { .. } => Some(render_delete_confirmation),
         Mode::ConfirmPublish { .. } => Some(render_publish_confirmation),
         Mode::SubmitReview { .. } => Some(render_submit_review_confirmation),
-        Mode::Picker | Mode::AssignPicker { .. } => Some(render_agent_picker),
+        Mode::ConfirmRemoteAssign { .. } => Some(render_remote_assign_confirmation),
+        Mode::Picker | Mode::AssignPicker { .. } | Mode::RemoteAssignPicker { .. } => {
+            Some(render_agent_picker)
+        }
         Mode::BasePick => Some(render_base_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
     };
@@ -2196,6 +2199,13 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
                 (hint(K::SubmitReview), "submit review")
             }
         }
+        A::AssignRemote => {
+            if matches!(app.mode, Mode::ConfirmRemoteAssign { .. }) {
+                ("enter".into(), "assign")
+            } else {
+                (hint(K::AssignRemote), "assign GitHub thread")
+            }
+        }
         A::List => (hint(K::Comments), "list"),
         A::Copy => (hint(K::Copy), "copy"),
         A::Save => ("enter".into(), "save"),
@@ -2620,6 +2630,27 @@ fn render_submit_review_confirmation(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(format!("Event: {event}\n[c] Comment  [a] Approve  [r] Request changes\nEnter submit · Esc cancel")).style(Style::default().fg(p.text)), inner);
 }
 
+fn render_remote_assign_confirmation(frame: &mut Frame, app: &App, area: Rect) {
+    let p = app.palette();
+    let Mode::ConfirmRemoteAssign { ref thread, ref agent } = app.mode else { return };
+    let popup = body_popup(area, app, 70.min(panes(area, app).body.width), 7);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.mauve))
+        .title(framed_title("Assign remote GitHub thread to agent?"));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let copy = format!(
+        "Agent: {} · {}\nThread: {}\nLocation: {}\nEnter assign · Esc cancel · GitHub is unchanged",
+        sanitize_terminal_text(&agent.name),
+        sanitize_terminal_text(&agent.tab),
+        sanitize_terminal_text(&thread.url),
+        sanitize_terminal_text(&thread.anchor),
+    );
+    frame.render_widget(Paragraph::new(copy).style(Style::default().fg(p.text)), inner);
+}
+
 fn render_delete_confirmation(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let Mode::ConfirmDelete { id } = app.mode else { return };
@@ -2817,6 +2848,9 @@ fn picker_title(app: &App) -> String {
     if matches!(app.mode, Mode::AssignPicker { .. }) {
         return "Assign comment to agent".into();
     }
+    if matches!(app.mode, Mode::RemoteAssignPicker { .. }) {
+        return "Assign remote GitHub thread to agent".into();
+    }
     let n = app.store.len();
     let noun = if n == 1 { "comment" } else { "comments" };
     format!("Send {n} {noun} to · {} stale", app.stale_count())
@@ -2837,11 +2871,13 @@ fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
     let inner = picker_inner(popup);
     frame.render_widget(block, popup);
 
-    let message = sanitize_terminal_text(
-        app.picker_notice
-            .as_deref()
-            .unwrap_or("Text is added to agent input and is not submitted."),
-    );
+    let message = sanitize_terminal_text(app.picker_notice.as_deref().unwrap_or(
+        if matches!(app.mode, Mode::RemoteAssignPicker { .. }) {
+            "Remote thread task is added to agent input; GitHub is not changed."
+        } else {
+            "Text is added to agent input and is not submitted."
+        },
+    ));
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
@@ -3835,7 +3871,7 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
     });
     let offset = app.pr_description_offset();
     rows.extend(s.comments.iter().enumerate().map(|(index, comment)| PrNavRow {
-        spans: pr_comment_row(comment, width, now, p),
+        spans: pr_comment_row(comment, app.remote_thread_receipt(comment), width, now, p),
         cursor: Some(index + offset),
     }));
     rows
@@ -3873,17 +3909,18 @@ fn pr_checks_header(s: &forge::PrSnapshot) -> String {
 /// One comment row: `@author anchor`, then a trailing `resolved`/`outdated` marker or the age.
 fn pr_comment_row(
     cm: &forge::Comment,
+    receipt: Option<&crate::app::RemoteThreadReceipt>,
     width: usize,
     now: std::time::SystemTime,
     p: &Palette,
 ) -> Vec<Span<'static>> {
     let author_color = if cm.author_is_bot { p.overlay1 } else { p.peach };
-    let trailing = if cm.is_resolved {
-        "resolved".to_string()
-    } else if cm.is_outdated {
-        "outdated".to_string()
-    } else {
-        forge::relative_age(&cm.created_at, now)
+    let trailing = match receipt {
+        Some(crate::app::RemoteThreadReceipt::Delivered { .. }) => "assigned".to_string(),
+        Some(crate::app::RemoteThreadReceipt::Failed { .. }) => "assign failed".to_string(),
+        None if cm.is_resolved => "resolved".to_string(),
+        None if cm.is_outdated => "outdated".to_string(),
+        None => forge::relative_age(&cm.created_at, now),
     };
     let author = format!("@{} ", sanitize_terminal_text(&cm.author));
     let budget = width.saturating_sub(author.width() + trailing.width() + 3).max(1);

@@ -1559,7 +1559,10 @@ pub fn handle_key_with_clipboard(
     // quit here and `y` must not copy, or a habitual keystroke destroys or consumes the whole
     // review while the picker is up (`specs/input.md`). It is checked before the tab handlers,
     // like every other modal, so no tab can ever eat the modal's keys.
-    if matches!(app.mode, Mode::Picker | Mode::AssignPicker { .. }) {
+    if matches!(
+        app.mode,
+        Mode::Picker | Mode::AssignPicker { .. } | Mode::RemoteAssignPicker { .. }
+    ) {
         // The send is irreversible and consumes every comment, so only the bare key fires it:
         // `alt+enter` and `shift+enter` mean "newline, not submit" in the comment editor the
         // reviewer was in moments ago, and that muscle memory must not send a review. The digits
@@ -1572,6 +1575,8 @@ pub fn handle_key_with_clipboard(
             (_, Enter) if bare => {
                 if matches!(app.mode, Mode::AssignPicker { .. }) {
                     app.assign_picker_pick();
+                } else if matches!(app.mode, Mode::RemoteAssignPicker { .. }) {
+                    app.remote_assign_picker_pick();
                 } else {
                     app.picker_pick();
                 }
@@ -1608,6 +1613,14 @@ pub fn handle_key_with_clipboard(
         match key.code {
             Esc => app.cancel_publish_comment(),
             Enter if key.modifiers.is_empty() => app.confirm_publish_comment(),
+            _ => {}
+        }
+        return Ok(());
+    }
+    if matches!(app.mode, Mode::ConfirmRemoteAssign { .. }) {
+        match key.code {
+            Esc => app.cancel_remote_thread_assignment(),
+            Enter if key.modifiers.is_empty() => app.confirm_remote_thread_assignment(),
             _ => {}
         }
         return Ok(());
@@ -1668,6 +1681,7 @@ pub fn handle_key_with_clipboard(
             (Some(K::Down), _) => app.pr_move(1),
             (Some(K::Up), _) => app.pr_move(-1),
             (Some(K::Keys), _) => app.toggle_keys(),
+            (Some(K::AssignRemote), _) => app.assign_remote_thread_to_agent(),
             (_, Esc) => app.escape(),
             (_, Tab) => app.toggle_focus(),
             (_, PageDown) if app.focus == Focus::Files => app.pr_scroll_nav(PAGE),
@@ -1760,7 +1774,7 @@ pub fn handle_key_with_clipboard(
             K::Find => app.open_find(),
             K::Keys => app.toggle_keys(),
             // `edit`/`delete` off the diff, and `open-pr` off the `PR` tab, are inert.
-            K::Edit | K::Delete | K::Assign | K::Publish | K::OpenPr => {}
+            K::Edit | K::Delete | K::Assign | K::AssignRemote | K::Publish | K::OpenPr => {}
         }
         return Ok(());
     }

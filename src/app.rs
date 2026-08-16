@@ -196,6 +196,44 @@ impl BasePicker {
     }
 }
 
+/// A stable in-memory identity for one remote finding selected from the current PR snapshot.
+/// It intentionally retains raw forge values; only its display copy is sanitized by the UI.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RemoteThread {
+    pub url: String,
+    pub author: String,
+    pub body: String,
+    pub anchor: String,
+    pub snippet: Option<String>,
+    pub created_at: String,
+}
+
+impl RemoteThread {
+    fn from_comment(comment: &forge::Comment) -> Self {
+        Self {
+            url: comment.url.clone(),
+            author: comment.author.clone(),
+            body: comment.body.clone(),
+            anchor: comment.anchor.clone(),
+            snippet: comment.snippet.clone(),
+            created_at: comment.created_at.clone(),
+        }
+    }
+
+    /// GitHub's direct review-comment URL is the immutable identity supplied by the provider.
+    /// Location, author, and timestamps are presentation data that can change after a force-push.
+    fn identity(&self) -> String {
+        self.url.clone()
+    }
+}
+
+/// Local delivery metadata for a remote thread. This never mutates forge state.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RemoteThreadReceipt {
+    Delivered { agent: String, tab: String },
+    Failed { agent: String },
+}
+
 /// The interaction mode the UI is in.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -225,6 +263,15 @@ pub enum Mode {
     /// Choosing an agent for one exact comment.
     AssignPicker {
         id: CommentId,
+    },
+    /// Choosing a Herdr agent for the exact remote GitHub finding selected in the PR tab.
+    RemoteAssignPicker {
+        thread: RemoteThread,
+    },
+    /// A final explicit confirmation before a remote-thread task is pasted into an agent tab.
+    ConfirmRemoteAssign {
+        thread: RemoteThread,
+        agent: AgentChoice,
     },
     /// Choosing the `branch` scope's base (`specs/input.md` Base picker). Its state lives in
     /// [`App::base_picker`].
@@ -256,6 +303,8 @@ impl Mode {
                 | Mode::List
                 | Mode::Picker
                 | Mode::AssignPicker { .. }
+                | Mode::RemoteAssignPicker { .. }
+                | Mode::ConfirmRemoteAssign { .. }
                 | Mode::BasePick
         )
     }
@@ -459,6 +508,8 @@ pub enum FooterAction {
     Publish,
     /// Confirm the selected event and submit Preview's pending GitHub review.
     SubmitReview,
+    /// Assign the selected remote GitHub finding to a Herdr coding agent.
+    AssignRemote,
     List,
     Copy,
     Save,
@@ -654,6 +705,9 @@ pub struct App {
     /// The agent this session last sent to, which arms the picker's highlight. Only a
     /// successful send sets it (`specs/herdr-host.md`).
     pub last_sent_pane: Option<String>,
+    /// Session-local delivery receipts for remote GitHub findings. These are deliberately
+    /// separate from forge data and do not resolve, reply to, or otherwise write a thread.
+    pub remote_thread_assignments: HashMap<String, RemoteThreadReceipt>,
     /// Preview-owned pending GitHub reviews, keyed by the complete PR identity for this pane
     /// session. Retaining every exact head key means an A→B→A force-push sequence reuses A's
     /// own pending review instead of creating a duplicate.
@@ -892,6 +946,7 @@ impl App {
             picker_notice: None,
             picker_over: Mode::Normal,
             last_sent_pane: None,
+            remote_thread_assignments: HashMap::new(),
             pending_github_reviews: HashMap::new(),
             github_publishable_comments: HashSet::new(),
             github_submit_target: None,
@@ -1063,8 +1118,13 @@ impl App {
             // before the mode is stored, so none reaches recovery; the search query is not
             // restored and the picker's frozen rows are not either (specs/search.md,
             // specs/find-in-file.md, specs/herdr-host.md).
-            Mode::Normal | Mode::Search | Mode::Find | Mode::Picker | Mode::AssignPicker { .. } => {
-            }
+            Mode::Normal
+            | Mode::Search
+            | Mode::Find
+            | Mode::Picker
+            | Mode::AssignPicker { .. }
+            | Mode::RemoteAssignPicker { .. }
+            | Mode::ConfirmRemoteAssign { .. } => {}
             Mode::List
             | Mode::Composing { .. }
             | Mode::ConfirmDelete { .. }
@@ -3360,7 +3420,9 @@ impl App {
             | Mode::SubmitReview { .. }
             | Mode::List
             | Mode::Picker
-            | Mode::AssignPicker { .. } => None,
+            | Mode::AssignPicker { .. }
+            | Mode::RemoteAssignPicker { .. }
+            | Mode::ConfirmRemoteAssign { .. } => None,
         }
     }
 
@@ -3633,6 +3695,8 @@ impl App {
             | Mode::List
             | Mode::Picker
             | Mode::AssignPicker { .. }
+            | Mode::RemoteAssignPicker { .. }
+            | Mode::ConfirmRemoteAssign { .. }
             | Mode::BasePick
             | Mode::Search
             | Mode::Find => None,
@@ -4221,6 +4285,9 @@ impl App {
             Mode::SubmitReview { .. } => {
                 return vec![(A::SubmitReview, Primary), (A::Cancel, Do)];
             }
+            Mode::ConfirmRemoteAssign { .. } => {
+                return vec![(A::PickAgent, Primary), (A::Cancel, Do)];
+            }
             Mode::List => {
                 let mut actions = vec![
                     (A::Send, Primary),
@@ -4237,7 +4304,7 @@ impl App {
                 }
                 return actions;
             }
-            Mode::Picker | Mode::AssignPicker { .. } => {
+            Mode::Picker | Mode::AssignPicker { .. } | Mode::RemoteAssignPicker { .. } => {
                 return vec![(A::PickAgent, Primary), (A::ClosePicker, Do), (A::MovePickerRow, Do)];
             }
             Mode::BasePick => {
@@ -4326,6 +4393,13 @@ impl App {
             let mut out = Vec::new();
             if self.pr_snapshot().is_some() {
                 out.push((A::OpenPr, Primary));
+                if self.pr_selected_comment().is_some_and(|comment| {
+                    self.pr_forge == git::Forge::GitHub
+                        && comment.kind == forge::CommentKind::Finding
+                        && !comment.url.is_empty()
+                }) {
+                    out.push((A::AssignRemote, Do));
+                }
             }
             out.push((A::Search, Go));
             out.push((A::TogglePane, Go));
@@ -4589,7 +4663,10 @@ impl App {
     /// Close the picker back onto the view it opened over, so a reviewer who sent from the
     /// comments list or with the find band open is not dropped into `Normal` (`specs/input.md`).
     pub fn close_picker(&mut self) {
-        if matches!(self.mode, Mode::Picker | Mode::AssignPicker { .. }) {
+        if matches!(
+            self.mode,
+            Mode::Picker | Mode::AssignPicker { .. } | Mode::RemoteAssignPicker { .. }
+        ) {
             self.mode = std::mem::replace(&mut self.picker_over, Mode::Normal);
         }
         self.picker_rows.clear();
@@ -4609,8 +4686,10 @@ impl App {
     }
 
     pub fn picker_move(&mut self, delta: isize) {
-        if matches!(self.mode, Mode::Picker | Mode::AssignPicker { .. })
-            && !self.picker_rows.is_empty()
+        if matches!(
+            self.mode,
+            Mode::Picker | Mode::AssignPicker { .. } | Mode::RemoteAssignPicker { .. }
+        ) && !self.picker_rows.is_empty()
         {
             self.picker_cursor = step(self.picker_cursor, delta, self.picker_rows.len());
         }
@@ -4619,8 +4698,10 @@ impl App {
     /// Move the highlight to `row`, for a digit key or a click. A row past the end is inert
     /// rather than clamped, so a mistyped digit never arms a neighbour (`specs/input.md`).
     pub fn picker_goto(&mut self, row: usize) {
-        if matches!(self.mode, Mode::Picker | Mode::AssignPicker { .. })
-            && row < self.picker_rows.len()
+        if matches!(
+            self.mode,
+            Mode::Picker | Mode::AssignPicker { .. } | Mode::RemoteAssignPicker { .. }
+        ) && row < self.picker_rows.len()
         {
             self.picker_cursor = row;
         }
@@ -5093,6 +5174,93 @@ impl App {
             Err(e) => {
                 self.status = format!("agent assignment unavailable: {e}");
             }
+        }
+    }
+
+    /// Open a remote finding assignment picker. The eligible target is captured by value so a
+    /// refresh cannot redirect a confirmation to a neighboring newest-first row.
+    pub fn assign_remote_thread_to_agent(&mut self) {
+        if self.image_view_active() || !self.is_git_review() || self.tab != Tab::Pr {
+            return;
+        }
+        let Some(comment) = self.pr_selected_comment() else {
+            self.status = "select a GitHub inline finding to assign".into();
+            return;
+        };
+        if self.pr_forge != git::Forge::GitHub || comment.kind != forge::CommentKind::Finding {
+            self.status = "select a GitHub inline finding to assign".into();
+            return;
+        }
+        let thread = RemoteThread::from_comment(comment);
+        if thread.url.is_empty() {
+            self.status = "remote thread has no GitHub URL; refresh and retry".into();
+            return;
+        }
+        match herdr::send_target() {
+            Ok(SendTarget::One(agent)) => self.open_remote_assign_picker(thread, vec![agent]),
+            Ok(SendTarget::Many(rows)) => self.open_remote_assign_picker(thread, rows),
+            Err(error) => self.status = format!("remote assignment unavailable: {error}"),
+        }
+    }
+
+    fn open_remote_assign_picker(&mut self, thread: RemoteThread, rows: Vec<AgentChoice>) {
+        if rows.is_empty() || self.mode.is_modal() {
+            return;
+        }
+        self.picker_cursor = armed_row(&rows, self.last_sent_pane.as_deref());
+        self.picker_rows = rows;
+        self.picker_notice = None;
+        self.picker_over = self.mode.clone();
+        self.mode = Mode::RemoteAssignPicker { thread };
+    }
+
+    /// Advance from agent selection to a separate confirmation sheet; no Herdr write happens
+    /// merely by choosing a row.
+    pub fn remote_assign_picker_pick(&mut self) {
+        let Mode::RemoteAssignPicker { thread } = self.mode.clone() else { return };
+        let Some(agent) = self.picker_rows.get(self.picker_cursor).cloned() else { return };
+        self.picker_rows.clear();
+        self.picker_cursor = 0;
+        self.picker_notice = None;
+        self.mode = Mode::ConfirmRemoteAssign { thread, agent };
+    }
+
+    pub fn confirm_remote_thread_assignment(&mut self) {
+        let Mode::ConfirmRemoteAssign { thread, agent } = self.mode.clone() else { return };
+        let snippet = thread.snippet.as_deref().unwrap_or("(no snippet returned by GitHub)");
+        let payload = format!(
+            "## Remote GitHub review task from Herdr Preview\n\n**Thread URL:** {}\n**Author:** @{}\n**Location:** {}\n\n**Thread body:**\n{}\n\n**Current snippet:**\n```diff\n{}\n```\n\nPlease inspect this exact remote finding, implement a fix if appropriate, and report validation. Do not submit, approve, request changes, reply to, resolve, or otherwise modify GitHub on my behalf.\n",
+            thread.url, thread.author, thread.anchor, thread.body, snippet
+        );
+        let target = Agent { pane: agent.pane_id.clone(), name: agent.name.clone() };
+        let delivered = target.export(&payload).is_ok();
+        self.remote_thread_assignments.insert(
+            thread.identity(),
+            if delivered {
+                RemoteThreadReceipt::Delivered { agent: agent.name.clone(), tab: agent.tab.clone() }
+            } else {
+                RemoteThreadReceipt::Failed { agent: agent.name.clone() }
+            },
+        );
+        self.status = if delivered {
+            format!(
+                "Assigned remote GitHub thread to {} · {} — GitHub unchanged",
+                agent.name, agent.tab
+            )
+        } else {
+            "Agent not found — remote thread assignment kept".into()
+        };
+        self.mode = std::mem::replace(&mut self.picker_over, Mode::Normal);
+    }
+
+    /// The session-only receipt for this raw remote finding, if it was assigned in this pane.
+    pub fn remote_thread_receipt(&self, comment: &forge::Comment) -> Option<&RemoteThreadReceipt> {
+        self.remote_thread_assignments.get(&RemoteThread::from_comment(comment).identity())
+    }
+
+    pub fn cancel_remote_thread_assignment(&mut self) {
+        if matches!(self.mode, Mode::ConfirmRemoteAssign { .. }) {
+            self.mode = std::mem::replace(&mut self.picker_over, Mode::Normal);
         }
     }
 

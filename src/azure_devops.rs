@@ -652,6 +652,7 @@ fn merge_comments(threads: &[&Value], pr: &Value) -> Vec<Comment> {
         };
         out.push(Comment {
             kind,
+            url: String::new(),
             author_is_bot: is_azure_bot(&root["author"]),
             author,
             anchor,

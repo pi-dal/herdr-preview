@@ -650,6 +650,7 @@ fn merge_comments(discussions: &[Value], approvals: &Value) -> Vec<Comment> {
         };
         out.push(Comment {
             kind,
+            url: root["web_url"].as_str().unwrap_or("").to_string(),
             author_is_bot: is_gitlab_bot(&author),
             author,
             anchor,
