@@ -104,8 +104,19 @@ pub enum DeliveryReceipt {
 /// It deliberately does not replace the snippet-authoritative local anchor or agent receipt.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum GitHubReceipt {
-    Pending { review_id: String, url: Option<String> },
-    Failed { message: String },
+    Pending {
+        review_id: String,
+        url: Option<String>,
+    },
+    /// Preview submitted its own pending review. The local note remains available as an
+    /// immutable review record and is never consumed by the GitHub lifecycle.
+    Submitted {
+        review_id: String,
+        url: Option<String>,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -197,6 +208,10 @@ impl CommentStore {
 
     pub fn iter_with_ids(&self) -> impl Iterator<Item = (CommentId, &Comment)> {
         self.items.iter().map(|item| (item.id, &item.comment))
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (CommentId, &mut Comment)> {
+        self.items.iter_mut().map(|item| (item.id, &mut item.comment))
     }
 
     pub fn id_at(&self, position: usize) -> Option<CommentId> {

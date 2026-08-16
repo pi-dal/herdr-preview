@@ -137,6 +137,12 @@ The GitHub `position` is derived only from `git diff --no-ext-diff --unified=3 <
 
 A failed create or append keeps the local comment and records a retryable failed receipt. A successful publish records the pending review/comment receipt but still keeps the local comment and any agent-assignment receipt.
 
+### GitHub pending-review submission
+
+`S` opens a confirmation sheet only when this Preview pane session owns a pending-review binding. `c`, `a`, and `r` select the explicit `Comment`, `Approve`, and `Request changes` events; only a bare `Enter` submits, and `Esc` cancels. Modified Enter never submits. Preview submits only the exact stored binding and never discovers, adopts, or submits a pending review made elsewhere.
+
+Immediately before `submitPullRequestReview`, Preview applies the same fresh open-PR, base/head, local-HEAD, and clean index/worktree/untracked gates as publishing. A failed submission retains the binding and local comments so it is retryable. A successful submission removes only that binding and marks every local comment bearing that review ID `submitted`; local comments and agent receipts are retained.
+
 ### Refresh
 
 - The first fetch starts when the panel opens.

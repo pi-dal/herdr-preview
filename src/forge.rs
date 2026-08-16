@@ -586,6 +586,59 @@ pub fn publish_pending_comment(
     })
 }
 
+/// Submit a Preview-owned pending review after the caller has completed every fresh PR, HEAD,
+/// and clean-worktree gate. This function deliberately accepts a complete binding rather than a
+/// bare review ID, so callers cannot accidentally submit a review belonging to another PR head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewEvent {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl ReviewEvent {
+    const fn graphql(self) -> &'static str {
+        match self {
+            Self::Comment => "COMMENT",
+            Self::Approve => "APPROVE",
+            Self::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+}
+
+pub fn submit_pending_review(
+    repo: &Path,
+    binding: &PendingReviewBinding,
+    event: ReviewEvent,
+    cancelled: &AtomicBool,
+) -> Result<Option<String>, GhError> {
+    let query = "mutation($id:ID!,$event:PullRequestReviewEvent!){submitPullRequestReview(input:{pullRequestReviewId:$id,event:$event}){pullRequestReview{url}}}";
+    let args = [
+        "api",
+        "graphql",
+        "--hostname",
+        &binding.host,
+        "-f",
+        &format!("query={query}"),
+        "-f",
+        &format!("id={}", binding.review_id),
+        "-f",
+        &format!("event={}", event.graphql()),
+    ];
+    let json = gh(repo, &binding.host, &args, cancelled)?;
+    let value = serde_json::from_str::<Value>(&json)
+        .map_err(|_| GhError::Other("GitHub returned invalid submitted review data".to_string()))?;
+    if value.get("errors").is_some() {
+        return Err(GhError::Other("GitHub rejected pending review submission".to_string()));
+    }
+    let url = value
+        .pointer("/data/submitPullRequestReview/pullRequestReview/url")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| GhError::Other("GitHub returned no submitted review URL".to_string()))?;
+    Ok(Some(url))
+}
+
 /// The initial mutation must put `commitOID` on `AddPullRequestReviewInput`; GitHub rejects it
 /// on the nested `DraftPullRequestReviewComment` input. Keep this query factored for a precise
 /// regression test of the outbound GraphQL contract.

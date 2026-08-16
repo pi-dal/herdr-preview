@@ -80,6 +80,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::List => Some(render_comments_list),
         Mode::ConfirmDelete { .. } => Some(render_delete_confirmation),
         Mode::ConfirmPublish { .. } => Some(render_publish_confirmation),
+        Mode::SubmitReview { .. } => Some(render_submit_review_confirmation),
         Mode::Picker | Mode::AssignPicker { .. } => Some(render_agent_picker),
         Mode::BasePick => Some(render_base_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
@@ -1298,6 +1299,10 @@ fn github_receipt_label(receipt: Option<&GitHubReceipt>) -> String {
             format!(" · GitHub pending: {}", sanitize_one_line(url))
         }
         Some(GitHubReceipt::Pending { url: None, .. }) => " · GitHub pending".to_string(),
+        Some(GitHubReceipt::Submitted { url: Some(url), .. }) => {
+            format!(" · GitHub submitted: {}", sanitize_one_line(url))
+        }
+        Some(GitHubReceipt::Submitted { url: None, .. }) => " · GitHub submitted".to_string(),
         Some(GitHubReceipt::Failed { message }) => {
             format!(" · GitHub failed: {}", sanitize_one_line(message))
         }
@@ -2181,6 +2186,16 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
                 (hint(K::Publish), "publish GitHub".into())
             };
         }
+        // `S` opens the submit-confirmation sheet from the normal footer; only that sheet's
+        // bare Enter performs the destructive write. Keep the two affordances distinct so the
+        // normal and expanded shortcut lists never advertise an inert Enter.
+        A::SubmitReview => {
+            if matches!(app.mode, Mode::SubmitReview { .. }) {
+                ("enter".into(), "submit")
+            } else {
+                (hint(K::SubmitReview), "submit review")
+            }
+        }
         A::List => (hint(K::Comments), "list"),
         A::Copy => (hint(K::Copy), "copy"),
         A::Save => ("enter".into(), "save"),
@@ -2236,7 +2251,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
 fn band_styles(band: Band, p: &Palette) -> (Style, Style) {
     match band {
         Band::Primary => (Style::default().fg(p.peach).add_modifier(Modifier::BOLD), text_style(p)),
-        Band::Send | Band::Do | Band::Go | Band::Move => {
+        Band::Send | Band::Submit | Band::Do | Band::Go | Band::Move => {
             (Style::default().fg(p.lavender), Style::default().fg(p.subtext0))
         }
     }
@@ -2317,6 +2332,8 @@ fn footer_lines(app: &App, w: usize) -> Vec<Line<'static>> {
         // Row 1 already carries the `do` label, so its overflow continues under a blank gutter,
         // aligned with row 1's content; an empty overflow is dropped.
         lines.extend(render_band(app, w, "", Band::Do, &overflow));
+        lines.extend(render_band(app, w, "send", Band::Send, &of_band(Band::Send)));
+        lines.extend(render_band(app, w, "submit", Band::Submit, &of_band(Band::Submit)));
         lines.extend(render_band(app, w, "go", Band::Go, &of_band(Band::Go)));
         lines.extend(render_band(app, w, "move", Band::Move, &of_band(Band::Move)));
         if matches!(app.tab, Tab::Changes | Tab::AllFiles)
@@ -2361,21 +2378,28 @@ fn type_legend_lines(width: usize, p: &Palette, mode: FileIconMode) -> Vec<Line<
     lines
 }
 
-/// Row 1: the primary, the cursor's `Do` actions (trimmed to fit), `send`, the transient status,
-/// and a right-aligned `?` in `Normal` mode. Returns the trimmed-off `Do` actions for the `do` band.
+/// Row 1: the primary, cursor `Do` actions (trimmed to fit), every persistent send action, the
+/// transient status, and a right-aligned `?` in `Normal` mode. Returns trimmed `Do` actions for
+/// the `do` band. `S submit-review` has its own expanded band but is also a row-1 action, so it
+/// remains discoverable beside agent send in the ordinary workflow.
 fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
     let p = app.palette();
     let bands = app.footer_bands();
     let primary = bands.iter().find(|&&(_, b)| b == Band::Primary).map(|&(a, _)| a);
     let do_acts: Vec<FooterAction> =
         bands.iter().filter(|&&(_, b)| b == Band::Do).map(|&(a, _)| a).collect();
-    let send = bands.iter().find(|&&(_, b)| b == Band::Send).map(|&(a, _)| a);
+    let mut sends: Vec<(FooterAction, Band)> =
+        bands.iter().filter(|&&(_, b)| matches!(b, Band::Send | Band::Submit)).copied().collect();
+    // `S` is the explicit forge-write confirmation. Keep it first in the always-visible row so
+    // narrow panes preserve submit discovery before they clip ordinary agent send; expansion
+    // still groups both actions under their semantic bands.
+    sends.sort_by_key(|&(_, band)| usize::from(band == Band::Send));
     let show_more = app.mode == Mode::Normal;
     let reserve = if show_more { 2 } else { 0 }; // a gap plus the `?`
 
     // `send` and the `?` share the right of the row and never drop, so the primary and the actions
     // both yield to keep them on the line — the primary reserves their width before anything else.
-    let send_w = send.map_or(0, |a| entry_width(app, a));
+    let send_w: usize = sends.iter().map(|&(a, _)| entry_width(app, a)).sum();
     let tail = send_w + reserve;
 
     // While the panel is open, row 1 joins the labeled grid: a dim `do` gutter, its content aligned
@@ -2466,12 +2490,13 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
         spans.extend(action_entry(app, a, Band::Do));
     }
 
-    // `send` closes the actions and never drops.
-    if let Some(a) = send {
-        used += send_w;
+    // Persistent sends close the actions and never drop. Preview review submission gets its own
+    // band for the expanded list, but stays here too so ordinary (collapsed) footer users see `S`.
+    for (a, band) in sends {
         spans.push(Span::styled(SEP, Style::default().fg(p.overlay0)));
-        spans.extend(action_entry(app, a, Band::Send));
+        spans.extend(action_entry(app, a, band));
     }
+    used += send_w;
 
     // The transient status rides after the actions, truncated into the room its reservation kept.
     // It drops only below `STATUS_MIN`, where no message would be legible anyway. A modal that
@@ -2574,6 +2599,25 @@ fn render_publish_confirmation(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(p.text)),
         inner,
     );
+}
+
+fn render_submit_review_confirmation(frame: &mut Frame, app: &App, area: Rect) {
+    let p = app.palette();
+    let Mode::SubmitReview { event, .. } = app.mode else { return };
+    let event = match event {
+        crate::forge::ReviewEvent::Comment => "Comment",
+        crate::forge::ReviewEvent::Approve => "Approve",
+        crate::forge::ReviewEvent::RequestChanges => "Request changes",
+    };
+    let popup = body_popup(area, app, 62.min(panes(area, app).body.width), 6);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.mauve))
+        .title(framed_title("Submit GitHub pending review?"));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(format!("Event: {event}\n[c] Comment  [a] Approve  [r] Request changes\nEnter submit · Esc cancel")).style(Style::default().fg(p.text)), inner);
 }
 
 fn render_delete_confirmation(frame: &mut Frame, app: &App, area: Rect) {

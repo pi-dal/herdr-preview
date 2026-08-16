@@ -212,6 +212,11 @@ pub enum Mode {
     ConfirmPublish {
         id: CommentId,
     },
+    /// Explicitly submit this pane session's exact GitHub pending review.
+    SubmitReview {
+        key: (String, String, String, u64, String),
+        event: forge::ReviewEvent,
+    },
     /// Browsing the comments-list overlay.
     List,
     /// Choosing which agent a `Send` goes to (`specs/herdr-host.md`). Its rows and highlight
@@ -247,6 +252,7 @@ impl Mode {
             Mode::Composing { .. }
                 | Mode::ConfirmDelete { .. }
                 | Mode::ConfirmPublish { .. }
+                | Mode::SubmitReview { .. }
                 | Mode::List
                 | Mode::Picker
                 | Mode::AssignPicker { .. }
@@ -451,6 +457,8 @@ pub enum FooterAction {
     Send,
     /// Publish one eligible local comment to Preview's pending GitHub review.
     Publish,
+    /// Confirm the selected event and submit Preview's pending GitHub review.
+    SubmitReview,
     List,
     Copy,
     Save,
@@ -477,13 +485,17 @@ pub enum FooterAction {
     Quit,
 }
 
-/// Where a footer action sits: on row 1 (`Primary`, `Send`, or a `Do` cursor action), or in one of
-/// the `?`-expansion bands (`Do` overflow, `Go`, `Move`). Row 1 keeps the primary, `send`, and the
-/// `?`, trimming trailing `Do` actions to fit and spilling them into the `do` band (`specs/input.md`).
+/// Where a footer action sits: on row 1 (`Primary`, `Send`, `Submit`, or a `Do` cursor action),
+/// or in one of the `?`-expansion bands (`Do` overflow, `Go`, `Move`). Row 1 keeps the primary,
+/// send actions, and the `?`, trimming trailing `Do` actions to fit and spilling them into the
+/// `do` band (`specs/input.md`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Band {
     Primary,
     Send,
+    /// Preview-owned GitHub review submission. Kept distinct from agent send so the expanded
+    /// footer cannot hide `S` behind `s send`.
+    Submit,
     Do,
     Go,
     Move,
@@ -651,6 +663,13 @@ pub struct App {
     /// The renderer reads this immutable snapshot; refreshes rebuild it from each comment's
     /// own diff so a footer never advertises an action that the entry gate will refuse.
     github_publishable_comments: HashSet<CommentId>,
+    /// Latest PR-probe target, retained only as an in-memory identity cache for the footer.
+    /// Rendering must not probe Git or a forge; a successful PR/identity worker result refreshes
+    /// this value and [`Self::github_submit_available`] together.
+    github_submit_target: Option<(String, String, String)>,
+    /// Whether the cached open PR has an exact session-owned pending-review binding. This is the
+    /// render-time eligibility cache for `S`; write-time validation remains authoritative.
+    github_submit_available: bool,
     /// The base picker's rows, filter, and highlight while `Mode::BasePick` is open
     /// (`specs/input.md` Base picker).
     pub base_picker: Option<BasePicker>,
@@ -875,6 +894,8 @@ impl App {
             last_sent_pane: None,
             pending_github_reviews: HashMap::new(),
             github_publishable_comments: HashSet::new(),
+            github_submit_target: None,
+            github_submit_available: false,
             base_picker: None,
             mode: Mode::Normal,
             input: String::new(),
@@ -1048,6 +1069,7 @@ impl App {
             | Mode::Composing { .. }
             | Mode::ConfirmDelete { .. }
             | Mode::ConfirmPublish { .. }
+            | Mode::SubmitReview { .. }
             | Mode::BasePick => {
                 self.scope = old.scope;
                 self.tab = old.tab;
@@ -2432,6 +2454,7 @@ impl App {
     /// Clear a snapshot whose complete fetch input no longer matches the worktree.
     pub fn clear_pr(&mut self) {
         self.pr = forge::PrView::Pending;
+        self.recompute_github_submit_availability();
         self.pr_notice = None;
         self.pr_refreshing = false;
         self.pr_cursor = 0;
@@ -2472,6 +2495,7 @@ impl App {
             .pr_selected_comment()
             .map(|c| (c.author.clone(), c.created_at.clone(), c.anchor.clone()));
         self.pr = view;
+        self.recompute_github_submit_availability();
         let offset = self.pr_description_offset();
         let restored = if on_description {
             self.pr_has_description().then_some(0)
@@ -3333,6 +3357,7 @@ impl App {
             Mode::Normal
             | Mode::ConfirmDelete { .. }
             | Mode::ConfirmPublish { .. }
+            | Mode::SubmitReview { .. }
             | Mode::List
             | Mode::Picker
             | Mode::AssignPicker { .. } => None,
@@ -3604,6 +3629,7 @@ impl App {
             Mode::Normal
             | Mode::ConfirmDelete { .. }
             | Mode::ConfirmPublish { .. }
+            | Mode::SubmitReview { .. }
             | Mode::List
             | Mode::Picker
             | Mode::AssignPicker { .. }
@@ -4161,7 +4187,7 @@ impl App {
     /// `Do` actions into the `do` band, and wraps the bands below (`specs/input.md`).
     #[must_use]
     pub fn footer_bands(&self) -> Vec<(FooterAction, Band)> {
-        use Band::{Do, Go, Move, Primary, Send};
+        use Band::{Do, Go, Move, Primary, Send, Submit};
         use FooterAction as A;
 
         // This check precedes modal footers: a refresh may turn a previously-confirmed source
@@ -4192,6 +4218,9 @@ impl App {
             Mode::ConfirmPublish { .. } => {
                 return vec![(A::Publish, Primary), (A::Cancel, Do)];
             }
+            Mode::SubmitReview { .. } => {
+                return vec![(A::SubmitReview, Primary), (A::Cancel, Do)];
+            }
             Mode::List => {
                 let mut actions = vec![
                     (A::Send, Primary),
@@ -4202,6 +4231,9 @@ impl App {
                 ];
                 if self.github_publish_cached_available() {
                     actions.push((A::Publish, Do));
+                }
+                if self.github_submit_cached_available() {
+                    actions.push((A::SubmitReview, Submit));
                 }
                 return actions;
             }
@@ -4385,6 +4417,11 @@ impl App {
         // `?` (the renderer keeps it when a narrow row trims the actions before it).
         if !self.store.is_empty() {
             out.push((A::Send, Send));
+        }
+        // A submit is discoverable only for this pane's exact, session-owned pending review.
+        // It has its own footer band and never consumes local comments.
+        if self.github_submit_cached_available() {
+            out.push((A::SubmitReview, Submit));
         }
 
         // The `go` band: the keys that work anywhere. `scope` and `refresh` only when they are not
@@ -4814,6 +4851,7 @@ impl App {
                     binding.head_oid.clone(),
                 );
                 self.pending_github_reviews.insert(key, binding);
+                self.recompute_github_submit_availability();
                 if let Some(stored) = self.store.get_mut(id) {
                     stored.github = Some(receipt);
                 }
@@ -4830,6 +4868,213 @@ impl App {
 
     pub fn cancel_publish_comment(&mut self) {
         if matches!(self.mode, Mode::ConfirmPublish { .. }) {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// Rebuild the pure in-memory `S` eligibility cache when the PR worker observes an identity.
+    /// This is deliberately called only from PR/identity-refresh paths or local binding changes:
+    /// `footer_bands()` and painting must never run Git or forge commands.
+    pub(crate) fn refresh_github_submit_availability(&mut self, input: &forge::PrFetchInput) {
+        self.github_submit_target = match &input.repository {
+            git::RepositoryIdentity::Repository(target) if target.forge() == git::Forge::GitHub => {
+                Some((
+                    target.host().to_owned(),
+                    target.owner().to_owned(),
+                    target.name().to_owned(),
+                ))
+            }
+            _ => None,
+        };
+        self.recompute_github_submit_availability();
+    }
+
+    /// Recompute from cached snapshot, identity, and this pane session's bindings only.
+    fn recompute_github_submit_availability(&mut self) {
+        self.github_submit_available =
+            self.github_submit_target.as_ref().is_some_and(|(host, owner, repository)| {
+                self.pr_snapshot().is_some_and(|pr| {
+                    self.pr_forge == git::Forge::GitHub
+                        && pr.state == forge::PrState::Open
+                        && !pr.base_oid.is_empty()
+                        && !pr.head_oid.is_empty()
+                        && self.pending_github_reviews.contains_key(&(
+                            host.clone(),
+                            owner.clone(),
+                            repository.clone(),
+                            pr.number,
+                            pr.head_oid.clone(),
+                        ))
+                })
+            });
+    }
+
+    /// A render-time predicate only. It reads the PR worker's cached identity and session-owned
+    /// binding map; `request_submit_review` and `confirm_submit_review` revalidate externally.
+    fn github_submit_cached_available(&self) -> bool {
+        self.github_submit_available
+    }
+
+    /// Open an explicit submit sheet only for a review this pane created in this session.
+    pub fn request_submit_review(&mut self) {
+        let Some(pr) = self.pr_snapshot() else {
+            self.status = "GitHub submit unavailable: refresh PR and retry".into();
+            return;
+        };
+        if self.pr_forge != git::Forge::GitHub
+            || pr.state != forge::PrState::Open
+            || pr.base_oid.is_empty()
+            || pr.head_oid.is_empty()
+        {
+            self.status = "GitHub submit unavailable: no open GitHub PR".into();
+            return;
+        }
+        let input =
+            match forge::fetch_input(&self.repo, self.base.as_deref(), self.config_snapshot()) {
+                Ok(input) => input,
+                Err(error) => {
+                    self.status = format!("GitHub submit unavailable: {error:?}");
+                    return;
+                }
+            };
+        let git::RepositoryIdentity::Repository(target) = input.repository else {
+            self.status = "GitHub submit unavailable: no GitHub remote".into();
+            return;
+        };
+        if target.forge() != git::Forge::GitHub {
+            self.status = "GitHub submit unavailable: no GitHub remote".into();
+            return;
+        }
+        let key = (
+            target.host().to_owned(),
+            target.owner().to_owned(),
+            target.name().to_owned(),
+            pr.number,
+            pr.head_oid.clone(),
+        );
+        if !self.pending_github_reviews.contains_key(&key) {
+            self.status =
+                "GitHub submit unavailable: no Preview pending review for this PR head".into();
+            return;
+        }
+        self.mode = Mode::SubmitReview { key, event: forge::ReviewEvent::Comment };
+    }
+
+    pub fn select_submit_event(&mut self, event: forge::ReviewEvent) {
+        if let Mode::SubmitReview { event: selected, .. } = &mut self.mode {
+            *selected = event;
+        }
+    }
+
+    /// The final, bare-Enter-confirmed pending-review submission. Local notes remain intact.
+    pub fn confirm_submit_review(&mut self) {
+        let Mode::SubmitReview { ref key, event } = self.mode else { return };
+        let Some(binding) = self.pending_github_reviews.get(key).cloned() else {
+            self.mode = Mode::Normal;
+            self.status = "GitHub submit unavailable: pending review changed".into();
+            return;
+        };
+        // A pending review is a forge write just like adding its comments. Its cached binding is
+        // never authority: immediately before submit, prove the same open PR/base/head still
+        // exists, local HEAD still names it, and no worktree/index/untracked change intervened.
+        let Some(cached) = self.pr_snapshot().cloned() else {
+            self.mode = Mode::Normal;
+            self.status = "GitHub submit unavailable: refresh PR and retry".into();
+            return;
+        };
+        if self.pr_forge != git::Forge::GitHub
+            || cached.state != forge::PrState::Open
+            || cached.number != binding.number
+            || cached.head_oid != binding.head_oid
+            || cached.base_oid.is_empty()
+            || !self.github_publish_worktree_clean()
+        {
+            self.mode = Mode::Normal;
+            self.status =
+                "GitHub submit unavailable: PR or worktree changed; refresh and retry".into();
+            return;
+        }
+        let input =
+            match forge::fetch_input(&self.repo, self.base.as_deref(), self.config_snapshot()) {
+                Ok(input) => input,
+                Err(error) => {
+                    self.mode = Mode::Normal;
+                    self.status = format!("GitHub submit unavailable: {error:?}");
+                    return;
+                }
+            };
+        let git::RepositoryIdentity::Repository(ref target) = input.repository else {
+            self.mode = Mode::Normal;
+            self.status = "GitHub submit unavailable: no GitHub remote".into();
+            return;
+        };
+        if target.forge() != git::Forge::GitHub
+            || target.host() != binding.host
+            || target.owner() != binding.owner
+            || target.name() != binding.repository
+            || input.local.head_oid.as_deref() != Some(binding.head_oid.as_str())
+        {
+            self.mode = Mode::Normal;
+            self.status = "GitHub submit unavailable: PR head changed; refresh and retry".into();
+            return;
+        }
+        let forge::PrView::Pr(fresh) = forge::fetch(&self.repo, &input) else {
+            self.mode = Mode::Normal;
+            self.status = "GitHub submit unavailable: refresh PR and retry".into();
+            return;
+        };
+        if fresh.state != forge::PrState::Open
+            || fresh.number != binding.number
+            || fresh.head_oid != binding.head_oid
+            || fresh.base_oid.is_empty()
+            || fresh.base_oid != cached.base_oid
+        {
+            self.mode = Mode::Normal;
+            self.status = "GitHub submit unavailable: PR changed; refresh and retry".into();
+            return;
+        }
+        let final_input =
+            match forge::fetch_input(&self.repo, self.base.as_deref(), self.config_snapshot()) {
+                Ok(input) => input,
+                Err(error) => {
+                    self.mode = Mode::Normal;
+                    self.status = format!("GitHub submit unavailable: {error:?}");
+                    return;
+                }
+            };
+        if final_input.local.head_oid.as_deref() != Some(binding.head_oid.as_str())
+            || !self.github_publish_worktree_clean()
+        {
+            self.mode = Mode::Normal;
+            self.status =
+                "GitHub submit unavailable: local state changed; refresh and retry".into();
+            return;
+        }
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        match forge::submit_pending_review(&self.repo, &binding, event, &cancel) {
+            Ok(url) => {
+                self.pending_github_reviews.remove(key);
+                self.recompute_github_submit_availability();
+                for (_, comment) in self.store.iter_mut() {
+                    if matches!(comment.github, Some(GitHubReceipt::Pending { ref review_id, .. }) if review_id == &binding.review_id)
+                    {
+                        comment.github = Some(GitHubReceipt::Submitted {
+                            review_id: binding.review_id.clone(),
+                            url: url.clone(),
+                        });
+                    }
+                }
+                self.status = "Submitted GitHub review".into();
+            }
+            Err(error) => {
+                self.status = format!("GitHub submit failed — pending review kept: {error:?}");
+            }
+        }
+        self.mode = Mode::Normal;
+    }
+
+    pub fn cancel_submit_review(&mut self) {
+        if matches!(self.mode, Mode::SubmitReview { .. }) {
             self.mode = Mode::Normal;
         }
     }
@@ -5364,12 +5609,160 @@ fn anchor(selected: &[Row]) -> Option<(Side, u32, u32, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Mode, RepositoryMode, Tab};
+    use super::{App, Band, FooterAction, Mode, RepositoryMode, Tab};
     use crate::config::NavigatorPosition;
     use crate::diff::{FileState, View};
     use crate::file_list::RowKind;
     use crate::model::{Comment, Scope, Side};
+    use ratatui::{Terminal, backend::TestBackend};
     use std::path::PathBuf;
+
+    fn github_input(owner: &str, head: &str) -> crate::forge::PrFetchInput {
+        crate::forge::PrFetchInput {
+            repository: crate::git::RepositoryIdentity::Repository(
+                crate::git::RepoTarget::new("github.com", owner, "repo").unwrap(),
+            ),
+            origin_repository: None,
+            local: crate::git::PrLocalState {
+                head_oid: Some(head.into()),
+                base_oid: Some("base".into()),
+                names: vec!["feature".into()],
+                detached: false,
+            },
+        }
+    }
+
+    fn open_pr(head: &str) -> crate::forge::PrSnapshot {
+        crate::forge::PrSnapshot {
+            number: 1,
+            title: String::new(),
+            url: String::new(),
+            body: String::new(),
+            state: crate::forge::PrState::Open,
+            is_draft: false,
+            head_ref: String::new(),
+            head_is_fork: false,
+            head_oid: head.into(),
+            base_oid: "base".into(),
+            base_ref: String::new(),
+            merge: crate::forge::Merge::Clean,
+            sync: crate::forge::Sync::InSync,
+            checks: Vec::new(),
+            comments: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn submit_footer_uses_only_the_cached_identity_and_session_binding() {
+        let mut app = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        app.apply_pr(crate::forge::PrView::Pr(Box::new(open_pr("head"))));
+        app.refresh_github_submit_availability(&github_input("owner", "head"));
+        assert!(!app.github_submit_cached_available(), "a remote review is never adopted");
+
+        let key = ("github.com".into(), "owner".into(), "repo".into(), 1, "head".into());
+        app.pending_github_reviews.insert(
+            key,
+            crate::forge::PendingReviewBinding {
+                host: "github.com".into(),
+                owner: "owner".into(),
+                repository: "repo".into(),
+                number: 1,
+                head_oid: "head".into(),
+                review_id: "review".into(),
+                comment_url: None,
+            },
+        );
+        app.recompute_github_submit_availability();
+        assert!(app.github_submit_cached_available());
+        assert!(app.footer_bands().contains(&(FooterAction::SubmitReview, Band::Submit)));
+
+        // A new PR identity invalidates only the cached affordance; it does not inspect Git and
+        // it does not adopt the owner binding that happens to remain in this pane's session map.
+        app.refresh_github_submit_availability(&github_input("other", "head"));
+        assert!(!app.github_submit_cached_available());
+    }
+
+    fn submit_footer_app() -> App {
+        let mut app = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        app.apply_pr(crate::forge::PrView::Pr(Box::new(open_pr("head"))));
+        app.refresh_github_submit_availability(&github_input("owner", "head"));
+        app.pending_github_reviews.insert(
+            ("github.com".into(), "owner".into(), "repo".into(), 1, "head".into()),
+            crate::forge::PendingReviewBinding {
+                host: "github.com".into(),
+                owner: "owner".into(),
+                repository: "repo".into(),
+                number: 1,
+                head_oid: "head".into(),
+                review_id: "review".into(),
+                comment_url: None,
+            },
+        );
+        app.recompute_github_submit_availability();
+        app
+    }
+
+    fn render_text(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer.cell((x, y)).unwrap().symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn submit_review_footer_uses_configured_key_outside_confirmation_in_all_layouts() {
+        let app = submit_footer_app();
+        let collapsed = render_text(&app, 140, 40);
+        assert!(collapsed.contains("S submit review"), "{collapsed}");
+        assert!(!collapsed.contains("enter submit"), "{collapsed}");
+
+        let mut expanded_app = submit_footer_app();
+        expanded_app.keys_expanded = true;
+        let expanded = render_text(&expanded_app, 140, 40);
+        assert!(expanded.contains("submit"), "{expanded}");
+        assert!(expanded.contains("S submit review"), "{expanded}");
+        assert!(!expanded.contains("enter submit"), "{expanded}");
+
+        let narrow = render_text(&app, 30, 12);
+        assert!(narrow.contains("S submit review"), "{narrow}");
+        assert!(!narrow.contains("enter submit"), "{narrow}");
+    }
+
+    #[test]
+    fn submit_review_footer_renders_a_non_default_configured_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[keybindings]\nsubmit-review = [\"ctrl+u\"]\n",
+        )
+        .unwrap();
+        let mut app = submit_footer_app();
+        app.set_plugin_config(crate::config::plugin_config_in(dir.path()).unwrap());
+
+        let footer = render_text(&app, 140, 40);
+        assert!(footer.contains("ctrl+u submit review"), "{footer}");
+        assert!(!footer.contains("S submit review"), "{footer}");
+    }
+
+    #[test]
+    fn submit_review_modal_footer_advertises_enter_submit_not_send() {
+        let mut app = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        app.mode = Mode::SubmitReview {
+            key: ("github.com".into(), "owner".into(), "repo".into(), 1, "head".into()),
+            event: crate::forge::ReviewEvent::Comment,
+        };
+        assert_eq!(
+            app.footer_bands(),
+            vec![(FooterAction::SubmitReview, Band::Primary), (FooterAction::Cancel, Band::Do)]
+        );
+        let modal = render_text(&app, 140, 40);
+        assert!(modal.contains("enter submit"), "{modal}");
+        assert!(!modal.contains("S submit review"), "{modal}");
+    }
 
     #[test]
     fn files_only_folder_root_shows_a_tree_and_opens_nested_content() {

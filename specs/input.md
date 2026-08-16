@@ -61,7 +61,8 @@ The keymap is rebindable per action through `[keybindings]` in the plugin config
 | `search`                                                 | open the search screen (`search.md`)        | `/`                                         | —                             |
 | `find`                                                   | open in-file find (`find-in-file.md`)       | `ctrl+f`                                    | —                             |
 | `keys`                                                   | toggle the footer's full shortcut list      | `alt+h`, `?`                                | —                             |
-| `send`                                                   | send all comments to the agent              | `alt+s`, `s` / `S`                          | —                             |
+| `send`                                                   | send all comments to the agent              | `alt+s`, `s`                                | —                             |
+| `submit-review`                                          | submit this pane's pending GitHub review     | `S`                                         | —                             |
 | `copy`                                                   | copy all comments to the clipboard          | `y` / `Y`                                   | —                             |
 | `open-pr`                                                | open the PR in the browser (`pr-tab.md`)    | `o`                                         | click the status chip         |
 | `refresh`                                                | refresh now                                 | `alt+shift+r`, `r`                          | —                             |
@@ -119,18 +120,22 @@ The steps and the skips share the rest:
 
 ### Footer
 
-The footer is one row: the primary next step, the cursor's own actions, and `send` once a comment
-exists, closing with a `?`. Pressing `?` expands it to every shortcut that works here, and it stays
-until `?` or `esc`. It never lists a key that would not work in the current state.
+The footer is one row: the primary next step, the cursor's own actions, `send` once a comment
+exists, and `S submit review` when this Preview pane's cached current GitHub PR identity has its own
+pending-review binding, closing with a `?`. The footer predicate is an in-memory PR/identity-refresh
+cache; rendering never runs Git or forge commands. Pressing `?` expands it to every shortcut that
+works here, and it stays until `?` or `esc`. It never lists a key that would not work in the current
+state.
 
 ```
  e edit · d delete · n/N jump · s send 2                                      ?
 ```
 
 Opening it turns the one-row action bar into a labeled grid. Row 1 becomes the `do` band under a
-dim `do` label: the primary and the cursor's actions. Two bands follow it, `go` (the global
-actions) and `move` (cursor movement). Every band's content aligns in one column. The `?` stays at the
-right of the `do` row.
+dim `do` label: the primary and the cursor's actions. `send` and `submit` bands follow when their
+actions are available, then `go` (the global actions) and `move` (cursor movement). The distinct
+`submit` band ensures `S` remains discoverable when ordinary agent send is also available. Every
+band's content aligns in one column. The `?` stays at the right of the `do` row.
 
 ```
  do    e edit · d delete · n/N jump · s send 2                                ?

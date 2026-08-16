@@ -44,6 +44,8 @@ pub enum Action {
     Send,
     /// Publish one selected local comment into Preview's pending GitHub review.
     Publish,
+    /// Explicitly submit Preview's session-owned GitHub pending review.
+    SubmitReview,
     Assign,
     Copy,
     OpenPr,
@@ -116,7 +118,7 @@ impl std::fmt::Display for Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 39] = [
+const ACTIONS: [(Action, &str, &[Key]); 40] = [
     (Action::Down, "down", &[Key::plain('j')]),
     (Action::Up, "up", &[Key::plain('k')]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']'), Key::alt_named('→')]),
@@ -149,8 +151,9 @@ const ACTIONS: [(Action, &str, &[Key]); 39] = [
     (Action::Search, "search", &[Key::plain('/')]),
     (Action::Find, "find", &[Key::ctrl('f')]),
     (Action::Keys, "keys", &[Key::plain('?'), Key::alt('h')]),
-    (Action::Send, "send", &[Key::plain('s'), Key::plain('S'), Key::alt('s')]),
+    (Action::Send, "send", &[Key::plain('s'), Key::alt('s')]),
     (Action::Publish, "publish", &[Key::plain('p')]),
+    (Action::SubmitReview, "submit-review", &[Key::plain('S')]),
     (Action::Assign, "assign", &[Key::plain('a')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
@@ -282,7 +285,7 @@ mod tests {
     fn defaults_bind_every_action_and_hint_is_first_key() {
         let keymap = Keymap::default();
         assert_eq!(keymap.action_for(Key::plain('c')), Some(Action::Comment));
-        assert_eq!(keymap.action_for(Key::plain('S')), Some(Action::Send));
+        assert_eq!(keymap.action_for(Key::plain('S')), Some(Action::SubmitReview));
         assert_eq!(keymap.action_for(Key::plain('m')), Some(Action::Preview));
         assert_eq!(keymap.action_for(Key::plain('P')), Some(Action::NavigatorPosition));
         assert_eq!(keymap.action_for(Key::plain('p')), Some(Action::Publish));
@@ -291,6 +294,7 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('?')), Some(Action::Keys));
         assert_eq!(keymap.hint(Action::Send), Key::plain('s'));
         assert_eq!(keymap.hint(Action::Publish), Key::plain('p'));
+        assert_eq!(keymap.hint(Action::SubmitReview), Key::plain('S'));
         assert_eq!(keymap.hint(Action::TabPr), Key::plain('3'));
         assert_eq!(keymap.action_for(Key::alt_named('↓')), Some(Action::NextChange));
         assert_eq!(keymap.action_for(Key::alt('u')), Some(Action::HideUnchanged));
@@ -319,7 +323,7 @@ mod tests {
 
         let keymap = Keymap::resolve(&[(Action::Send, vec![Key::plain('x')])]).unwrap();
         assert_eq!(keymap.action_for(Key::plain('s')), None);
-        assert_eq!(keymap.action_for(Key::plain('S')), None);
+        assert_eq!(keymap.action_for(Key::plain('S')), Some(Action::SubmitReview));
         assert_eq!(keymap.action_for(Key::plain('x')), Some(Action::Send));
     }
 

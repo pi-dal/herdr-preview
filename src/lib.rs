@@ -1265,24 +1265,31 @@ fn apply_pr_probe_result(
                 crate::git::RepositoryIdentity::Repository(target) => target.forge(),
                 _ => crate::git::Forge::default(),
             };
-            match pr.refresh.observed(input, config_epoch) {
+            let effect = pr.refresh.observed(input.clone(), config_epoch);
+            match effect {
                 Some(PrEffect::Clear) => {
                     app.clear_pr();
+                    app.refresh_github_submit_availability(&input);
                     pr.wait_started = (app.tab == crate::app::Tab::Pr).then(Instant::now);
                     true
                 }
                 Some(PrEffect::Refetch) => {
                     // The snapshot stays painted; only the refreshing indicator may appear
                     // once the wait crosses the loading delay. Nothing repaints now.
+                    app.refresh_github_submit_availability(&input);
                     pr.wait_started = (app.tab == crate::app::Tab::Pr).then(Instant::now);
                     false
                 }
                 Some(PrEffect::Apply(view)) => {
                     app.apply_pr(view);
+                    app.refresh_github_submit_availability(&input);
                     pr.wait_started = None;
                     true
                 }
-                None => false,
+                None => {
+                    app.refresh_github_submit_availability(&input);
+                    false
+                }
             }
         }
     }
@@ -1605,6 +1612,23 @@ pub fn handle_key_with_clipboard(
         }
         return Ok(());
     }
+    if matches!(app.mode, Mode::SubmitReview { .. }) {
+        match key.code {
+            Esc => app.cancel_submit_review(),
+            Enter if key.modifiers.is_empty() => app.confirm_submit_review(),
+            Char('c') if key.modifiers.is_empty() => {
+                app.select_submit_event(crate::forge::ReviewEvent::Comment);
+            }
+            Char('a') if key.modifiers.is_empty() => {
+                app.select_submit_event(crate::forge::ReviewEvent::Approve);
+            }
+            Char('r') if key.modifiers.is_empty() => {
+                app.select_submit_event(crate::forge::ReviewEvent::RequestChanges);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
 
     // The base picker: every printable narrows the filter — the bound shortcuts included, so
     // a branch named `qa` is typable — and the filter edits with the comment editor's
@@ -1666,6 +1690,7 @@ pub fn handle_key_with_clipboard(
             (Some(K::Send), _) => app.send_to_agent(),
             (Some(K::Assign), _) => app.assign_comment_to_agent(),
             (Some(K::Publish), _) => app.request_publish_comment(),
+            (Some(K::SubmitReview), _) => app.request_submit_review(),
             (Some(K::Copy), _) => {
                 app.export(clipboard);
             }
@@ -1724,6 +1749,7 @@ pub fn handle_key_with_clipboard(
             // cursor. The comments-list overlay above is the explicit alternate target.
             K::Assign if app.focus == Focus::Diff => app.assign_comment_to_agent(),
             K::Publish if app.focus == Focus::Diff => app.request_publish_comment(),
+            K::SubmitReview => app.request_submit_review(),
             K::Copy => {
                 app.export(clipboard);
             }
@@ -2938,6 +2964,69 @@ mod input_dispatch_tests {
         };
         app.visible = rows;
         app
+    }
+
+    fn submit_modal(event: crate::forge::ReviewEvent) -> App {
+        let mut app = app_with_rows();
+        app.mode = Mode::SubmitReview {
+            key: ("github.com".into(), "owner".into(), "repo".into(), 1, "head".into()),
+            event,
+        };
+        app
+    }
+
+    #[test]
+    fn submit_review_modal_requires_bare_enter_and_routes_event_keys_and_escape() {
+        let area = Rect::new(0, 0, 100, 20);
+        let keymap = default_keymap();
+
+        for (key, expected) in [
+            ('c', crate::forge::ReviewEvent::Comment),
+            ('a', crate::forge::ReviewEvent::Approve),
+            ('r', crate::forge::ReviewEvent::RequestChanges),
+        ] {
+            let mut app = submit_modal(crate::forge::ReviewEvent::Comment);
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                area,
+                keymap,
+            )
+            .unwrap();
+            assert!(matches!(app.mode, Mode::SubmitReview { event, .. } if event == expected));
+        }
+
+        let mut modified_enter = submit_modal(crate::forge::ReviewEvent::Approve);
+        handle_key(
+            &mut modified_enter,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            area,
+            keymap,
+        )
+        .unwrap();
+        assert!(matches!(
+            modified_enter.mode,
+            Mode::SubmitReview { event: crate::forge::ReviewEvent::Approve, .. }
+        ));
+
+        // A bare Enter alone reaches confirmation. This deliberately incomplete test binding
+        // fails its first safety gate, proving dispatch reached confirmation without issuing a
+        // forge write; a modified Enter above remains inert in the sheet.
+        let mut bare_enter = submit_modal(crate::forge::ReviewEvent::Comment);
+        handle_key(
+            &mut bare_enter,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            area,
+            keymap,
+        )
+        .unwrap();
+        assert_eq!(bare_enter.mode, Mode::Normal);
+        assert!(bare_enter.status.contains("pending review changed"));
+
+        let mut escape = submit_modal(crate::forge::ReviewEvent::RequestChanges);
+        handle_key(&mut escape, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area, keymap)
+            .unwrap();
+        assert_eq!(escape.mode, Mode::Normal);
     }
 
     #[test]

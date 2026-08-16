@@ -1073,7 +1073,7 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('c')), Some(Action::Comment));
         assert_eq!(keymap.action_for(Key::plain('x')), Some(Action::Send));
         assert_eq!(keymap.action_for(Key::plain('s')), None, "a binding replaces its defaults");
-        assert_eq!(keymap.action_for(Key::plain('S')), None);
+        assert_eq!(keymap.action_for(Key::plain('S')), Some(Action::SubmitReview));
         assert_eq!(keymap.action_for(Key::plain('v')), Some(Action::Select), "unbound keep theirs");
     }
 
@@ -1236,7 +1236,8 @@ mod tests {
             "every action is present, resolved"
         );
         assert_eq!(keybindings["quit"], serde_json::json!(["q"]));
-        assert_eq!(keybindings["send"], serde_json::json!(["s", "S", "alt+s"]));
+        assert_eq!(keybindings["send"], serde_json::json!(["s", "alt+s"]));
+        assert_eq!(keybindings["submit-review"], serde_json::json!(["S"]));
         assert_eq!(keybindings["next-change"], serde_json::json!(["alt+down"]));
         assert_eq!(keybindings["hide-unchanged"], serde_json::json!(["alt+u"]));
     }
