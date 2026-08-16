@@ -253,10 +253,38 @@ enum CliError {
     NotFound,
     /// The CLI ran and exited non-zero; `stderr` carries its diagnostic.
     Failed { stderr: String },
+    /// Either pipe exceeded the retained output limit; retrying may succeed with a smaller reply.
+    OutputTooLarge,
     /// Spawning or waiting failed at the OS level.
     Io(String),
     /// The coordinator superseded this fetch mid-flight.
     Cancelled,
+}
+
+/// Each provider response and diagnostic is retained up to this bound. Readers continue to
+/// drain beyond it so an oversized response cannot deadlock the child on a full pipe.
+const CLI_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn read_bounded(mut reader: impl Read) -> std::io::Result<BoundedOutput> {
+    let mut bytes = Vec::new();
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = CLI_OUTPUT_LIMIT.saturating_sub(bytes.len());
+        let retained = read.min(remaining);
+        bytes.extend_from_slice(&buffer[..retained]);
+        exceeded |= retained != read;
+    }
+    Ok(BoundedOutput { bytes, exceeded })
 }
 
 /// Run one prepared forge-CLI command to completion and return its stdout.
@@ -275,16 +303,8 @@ fn run_cli(cmd: &mut Command, cancelled: &AtomicBool) -> Result<String, CliError
     // keeps ownership until this worker reports completion, preserving one real fetch in flight.
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        bytes
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes);
-        bytes
-    });
+    let stdout_reader = thread::spawn(move || read_bounded(&mut stdout));
+    let stderr_reader = thread::spawn(move || read_bounded(&mut stderr));
     let status = loop {
         if cancelled.load(Ordering::Acquire) {
             let _ = child.kill();
@@ -301,15 +321,26 @@ fn run_cli(cmd: &mut Command, cancelled: &AtomicBool) -> Result<String, CliError
             }
         }
     };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    let stdout = stdout_reader
+        .join()
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(BoundedOutput { bytes: Vec::new(), exceeded: true });
+    let stderr = stderr_reader
+        .join()
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(BoundedOutput { bytes: Vec::new(), exceeded: true });
     if cancelled.load(Ordering::Acquire) {
         return Err(CliError::Cancelled);
     }
-    if status.success() {
-        return Ok(String::from_utf8_lossy(&stdout).into_owned());
+    if stdout.exceeded || stderr.exceeded {
+        return Err(CliError::OutputTooLarge);
     }
-    Err(CliError::Failed { stderr: String::from_utf8_lossy(&stderr).into_owned() })
+    if status.success() {
+        return Ok(String::from_utf8_lossy(&stdout.bytes).into_owned());
+    }
+    Err(CliError::Failed { stderr: String::from_utf8_lossy(&stderr.bytes).into_owned() })
 }
 
 /// Run explicitly targeted `gh` arguments in `repo` and return stdout or a classified failure.
@@ -357,6 +388,9 @@ pub(crate) fn run_provider<E>(
         Ok(stdout) => Ok(stdout),
         Err(CliError::NotFound) => Err(not_found),
         Err(CliError::Failed { stderr }) => Err(classify(&stderr)),
+        Err(CliError::OutputTooLarge) => Err(other(format!(
+            "provider output exceeded {CLI_OUTPUT_LIMIT} bytes; press refresh to retry"
+        ))),
         Err(CliError::Io(error)) => Err(other(error)),
         Err(CliError::Cancelled) => Err(other("request cancelled".to_string())),
     }
@@ -1183,6 +1217,23 @@ fn parse_iso(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_reader_retains_limit_and_drains_excess() {
+        let input = vec![b'x'; CLI_OUTPUT_LIMIT + 17];
+        let output = read_bounded(std::io::Cursor::new(input)).expect("cursor reads");
+        assert!(output.exceeded);
+        assert_eq!(output.bytes.len(), CLI_OUTPUT_LIMIT);
+        assert!(output.bytes.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[test]
+    fn bounded_reader_keeps_small_output() {
+        let output =
+            read_bounded(std::io::Cursor::new(b"small response".to_vec())).expect("cursor reads");
+        assert!(!output.exceeded);
+        assert_eq!(output.bytes, b"small response");
+    }
 
     #[test]
     fn merge_surfaces_only_conflicts_and_blocked() {

@@ -2555,10 +2555,14 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
     let h = body.height * LIST_POPUP_H_PCT / 100;
     let popup = body_popup(area, app, w, h);
     frame.render_widget(Clear, popup);
-    let block =
-        Block::default().borders(Borders::ALL).border_style(Style::default().fg(p.mauve)).title(
-            framed_title(&format!("Comments ({}) · {} stale", app.store.len(), app.stale_count())),
-        );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.mauve))
+        .title(framed_title(&format!(
+            "Local comments ({}) · {} stale",
+            app.store.len(),
+            app.stale_count()
+        )));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -3674,7 +3678,8 @@ fn render_pr_nav(frame: &mut Frame, app: &App, area: Rect) {
     // Identity lives in the header; the read pane shows the selected comment, so the navigator
     // names its contents rather than repeating "PR".
     let p = app.palette();
-    let block = bordered("Checks & comments", app.focus == Focus::Files, p);
+    let title = format!("Checks & {} activity", app.pr_forge.display_name());
+    let block = bordered(&title, app.focus == Focus::Files, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = inner.width as usize;
@@ -3731,7 +3736,10 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
     }
     rows.push(PrNavRow { spans: Vec::new(), cursor: None });
     rows.push(PrNavRow {
-        spans: vec![Span::styled(format!("comments · {}", s.comments.len()), dim)],
+        spans: vec![Span::styled(
+            format!("{} activity · {}", app.pr_forge.display_name(), s.comments.len()),
+            dim,
+        )],
         cursor: None,
     });
     let offset = app.pr_description_offset();

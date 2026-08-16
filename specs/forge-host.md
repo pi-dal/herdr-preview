@@ -6,7 +6,9 @@ Last edited: 2026-07-23
 
 # forge host
 
-The `PR` tab shows the pull request for the branch you are on: its state, checks, and comments. reviewr reads it through the forge's own CLI and never writes back. Rendering lives in `pr-tab.md`.
+The `PR` tab shows the pull request for the branch you are on: its state, checks, and remote review activity. reviewr reads it through the forge's own CLI and never writes back. Rendering lives in `pr-tab.md`.
+
+`PR` activity is remote forge data, distinct from the in-memory **Local comments** review pass (`review-model.md`). A refresh may replace remote activity only; it never changes local drafts, their agent-assignment receipts, or their anchors.
 
 ## Overview
 
@@ -112,12 +114,14 @@ Details:
 - One row per check name, latest run only. A passed re-run replaces the earlier failure.
 - A top-level rollup gives the overall pass or fail.
 
-### Comments
+### Remote review activity
 
+- The navigator labels this section **GitHub activity** on GitHub (and the equivalent forge activity on other supported providers), while the `Comments` overlay is explicitly **Local comments**.
 - Reviews, inline threads, and conversation comments merge into one newest-first list.
 - A bot's PR-level posts collapse to its latest. A human's all stay.
 - `is_resolved` and `is_outdated` come from the forge, never recomputed locally. Resolved and outdated threads stay listed, marked.
 - Each surface reads its newest 100 rows, never paged to exhaustion. A further page sets `truncated` and `pr-tab.md` marks the capped list. A forge that cannot identify its newest page serves the oldest, marked truncated.
+- Each provider CLI stdout and stderr stream is retained up to 4 MiB while still drained to EOF. Either stream exceeding that limit yields a retryable PR error; it never grows the fetch worker's memory without bound or deadlocks the child on a full pipe.
 
 ### Refresh
 

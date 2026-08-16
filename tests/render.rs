@@ -6,6 +6,8 @@ mod common;
 use common::{Repo, app_on, enter_tab};
 use herdr_reviewr::app::{App, BaseChoice, BasePicker, Focus, Mode, Tab};
 use herdr_reviewr::config::NavigatorPosition;
+use herdr_reviewr::forge::PrView;
+use herdr_reviewr::git::Forge;
 use herdr_reviewr::herdr::AgentChoice;
 use herdr_reviewr::keymap::Keymap;
 use herdr_reviewr::model::Scope;
@@ -1518,7 +1520,7 @@ fn open_list_renders_the_comments_overlay() {
     app.open_list();
 
     let out = render(&app);
-    assert!(out.contains("Comments ("), "overlay titled with a count");
+    assert!(out.contains("Local comments ("), "overlay titled with a count");
     assert!(out.contains("overlay note"), "comment text listed");
 }
 
@@ -1770,7 +1772,7 @@ fn pr_bodies_render_as_markdown_and_the_description_row_pins_first() {
     let nav = right_column(&out, 68);
     let desc_at = nav.find("description").expect("description row in the nav");
     let checks_at = nav.find("checks").expect("checks section in the nav");
-    let comments_at = nav.find("comments ·").expect("comments header in the nav");
+    let comments_at = nav.find("GitHub activity ·").expect("comments header in the nav");
     assert!(desc_at < checks_at && checks_at < comments_at, "nav order:\n{nav}");
 
     // The finding: the snippet stays plain +/− lines, the body renders as markdown.
@@ -1779,6 +1781,27 @@ fn pr_bodies_render_as_markdown_and_the_description_row_pins_first() {
     assert!(out.contains("+    new"), "the diff hunk stays plain:\n{out}");
     assert!(out.contains("Avoid panics in parse."), "the body renders styled:\n{out}");
     assert!(!out.contains("**panics**"), "markers are consumed:\n{out}");
+}
+
+#[test]
+fn pr_nav_labels_activity_for_the_resolved_forge() {
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    app.pr = PrView::Pr(Box::new(common::pr_snapshot()));
+    enter_tab(&mut app, Tab::Pr);
+
+    app.pr_forge = Forge::GitLab;
+    let gitlab = render(&app);
+    assert!(gitlab.contains("Checks & GitLab activity"), "GitLab header:\n{gitlab}");
+    assert!(gitlab.contains("GitLab activity ·"), "GitLab rows:\n{gitlab}");
+    assert!(!gitlab.contains("GitHub activity"), "GitHub must not leak:\n{gitlab}");
+
+    app.pr_forge = Forge::AzureDevOps;
+    let azure = render(&app);
+    assert!(azure.contains("Checks & Azure DevOps activity"), "Azure header:\n{azure}");
+    assert!(azure.contains("Azure DevOps activity ·"), "Azure rows:\n{azure}");
 }
 
 #[test]
