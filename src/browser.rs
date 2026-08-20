@@ -1,7 +1,11 @@
-//! Open a URL in the user's browser — the `PR` tab's only outward action.
+//! Open a policy-gated URL in the user's browser.
 //!
-//! See `specs/forge-host.md` (external links). Mirrors the clipboard-tool probe in
-//! `export.rs`: the first platform opener on `PATH` wins; none present errors clearly.
+//! The PR tab also deliberately supports local comment send/list/copy and an explicitly
+//! confirmed GitHub pending-review submit; this module performs none of those operations and
+//! never mutates a forge. Its only job is the external-launch boundary for the PR and selected
+//! remote-thread links. Callers must first pass the exact URL through [`openable_url`]. See
+//! `specs/forge-host.md` (external links) and `specs/pr-tab.md`. Mirrors the clipboard-tool probe
+//! in `export.rs`: the first platform opener on `PATH` wins; none present errors clearly.
 
 use std::process::{Command, Stdio};
 
@@ -10,10 +14,11 @@ use anyhow::{Context, Result};
 /// Platform openers, tried in order: macOS `open`, then the Linux `xdg-open`.
 const OPENERS: &[&str] = &["open", "xdg-open"];
 
-/// Open `url` in the default browser via the first available opener. Errors when none is on
-/// `PATH` (the caller surfaces it to the status line). The opener hands the URL to the browser
-/// and exits at once, so this waits for it — reaping the child rather than leaving a zombie, and
-/// returning fast enough for a click handler (mirrors the codebase's synchronous tool calls).
+/// Open a URL already admitted by [`openable_url`] in the default browser via the first available
+/// opener. Errors when none is on `PATH` (the caller surfaces it to the status line). The opener
+/// hands the URL to the browser and exits at once, so this waits for it — reaping the child rather
+/// than leaving a zombie, and returning fast enough for a click handler (mirrors the codebase's
+/// synchronous tool calls).
 pub fn open(url: &str) -> Result<()> {
     let tool = OPENERS
         .iter()

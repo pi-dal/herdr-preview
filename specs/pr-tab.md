@@ -10,7 +10,7 @@ A read-only mirror of the pull request in reviewr's frame: identity in the heade
 
 ## Overview
 
-The navigator shows checks and selects the description or a comment. The read pane shows that selection. The header carries the PR's identity and state. The tab reads the repository's forge through `forge-host.md` and writes nothing. Its only outward action opens a link in the browser.
+The navigator shows checks and selects the description or a comment. The read pane shows that selection. The header carries the PR's identity and state. The tab reads the repository's forge through `forge-host.md`. It keeps review activity read-only by default, while deliberately retaining local comment `send`, `list`, and `copy` workflows. Its browser actions open only URLs that pass the shared safe-link policy. The only forge mutation reachable here is an explicitly confirmed `S submit review` for this pane's own cached GitHub pending-review binding; no action automatically submits, approves, requests changes, resolves, or posts to the forge.
 
 The tab is labeled `PR` on every forge. Body text, the chip, the read pane's title, and the footer use the resolved forge's vocabulary (`forge-providers.md`). A repository that resolves to no forge takes the default vocabulary. A `finding` from a forge that returns no code context shows its body alone.
 
@@ -39,7 +39,7 @@ The tab is labeled `PR` on every forge. Body text, the chip, the read pane's tit
 
 - The header right-anchors a clickable `status #226 ↗` chip, status colored by lifecycle: `open` green, `draft` yellow, `merged` mauve, `closed` red. The `draft` status shows only while the PR is open. The PR title sits to its left, truncated to fit.
 - Between title and chip sits the resolved head branch (`head_ref`, `forge-host.md`), dim, prefixed `⑂ ` when the head lives in a fork. On a narrow bar the branch drops first.
-- The footer leads with merge, sync, checks, and comment counts, then `o open ↗` and the `?`. Merge and sync show only while the PR is open. A capped surface appends a `+more ↗` link naming the forge (`forge-host.md`).
+- The footer leads with merge, sync, checks, and comment counts, then `o open ↗` and the `?` when the PR URL passes the shared trimmed HTTP(S), nonblank, no-control/no-bidi browser policy (`markdown.md`). An unsafe forge URL leaves `o open` out of the footer; pressing `o` or clicking the chip reports a safe failure without launching it. Merge and sync show only while the PR is open. A capped surface appends a `+more ↗` link naming the forge (`forge-host.md`).
 - The `?` expands to the `go` band and a `move` band of down, up, and the page keys. The `PR` tab has no hunk or file steps (`input.md`).
 - The ordinary no-PR body says only `No pull request yet. Ready to ship?` A detached HEAD says `No pull request found — HEAD is detached.` Both use the forge's noun.
 
@@ -53,10 +53,11 @@ The tab is labeled `PR` on every forge. Body text, the chip, the read pane's tit
 - A human author is emphasized over the bots.
 - `j`/`k` or a click selects a description or comment and reveals it in the navigator viewport. Checks are not selectable.
 - The wheel over the navigator scrolls its viewport without changing the selection. The wheel over the read pane scrolls the read pane. `PageUp`/`PageDown` scroll the focused pane. Both panes stop with their last line at the bottom edge.
-- `o` or the chip opens the PR in the browser.
+- `o` or the chip opens the PR in the browser only after its URL passes the shared trimmed HTTP(S), nonblank, no-control/no-bidi browser policy. An unsafe URL does not launch the browser and reports the safe failure in the status line.
 - A body taller than the read pane shows a scrollbar on the pane's right border. One that fits shows none.
 - A retry notice for a preserved snapshot stays fixed above the read body, so it remains visible without resetting the reader's scroll.
-- The authoring keys (`s`, `c`, `v`, `d`, `e`) do nothing here.
+- File-anchor authoring keys (`c`, `v`, `d`, `e`) do nothing here. Existing local comments deliberately remain available: `s` sends them to the selected Herdr agent, `l` lists them, and `y` copies them. These local workflows never mutate the forge.
+- `S` is available only while this pane's cached, session-owned GitHub pending-review binding still matches the current PR identity. It opens the explicit review-event selection and confirmation flow; only its final bare `enter` submits. `esc` cancels at every step. It never automatically submits, approves, requests changes, resolves, posts, or otherwise mutates GitHub.
 - A merged or closed PR shows the same mirror, read-only.
 - No usable forge CLI shows the matching failure state from `forge-host.md`, naming the command that unblocks it.
 

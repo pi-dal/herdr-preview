@@ -66,6 +66,17 @@ fn drive_to_confirmation(app: &mut herdr_reviewr::app::App) {
     let keymap = Keymap::default();
     handle_key(app, key(KeyCode::Char('A')), area, &keymap).unwrap();
     assert!(matches!(app.mode, Mode::RemoteAssignPicker { .. }));
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|frame| ui::render(frame, app)).unwrap();
+    let painted = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(painted.contains("Enter continue"), "{painted}");
+    assert!(!painted.contains("Enter send"), "{painted}");
     handle_key(app, key(KeyCode::Enter), area, &keymap).unwrap();
     assert!(matches!(app.mode, Mode::ConfirmRemoteAssign { .. }));
 }

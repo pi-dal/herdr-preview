@@ -2220,7 +2220,16 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::Newline => ("shift+enter".into(), "newline"),
         A::Cancel | A::ClosePicker => ("esc".into(), "cancel"),
         A::CloseList | A::CloseSearch | A::CloseFind => ("esc".into(), "close"),
-        A::PickAgent => ("enter".into(), "send"),
+        A::PickAgent => {
+            let label = if matches!(app.mode, Mode::RemoteAssignPicker { .. }) {
+                "continue"
+            } else if matches!(app.mode, Mode::AssignPicker { .. }) {
+                "assign"
+            } else {
+                "send"
+            };
+            ("enter".into(), label)
+        }
         // The digits are literal, so they are spelled; the two movement keys are bound, so they
         // read off the keymap like every other hint (`specs/input.md`).
         A::MovePickerRow => (format!("1-9 {} {}", hint(K::Down), hint(K::Up)), "move"),
@@ -2843,7 +2852,9 @@ fn picker_popup(area: Rect, app: &App) -> Rect {
     menu_popup(
         area,
         app,
-        widest.max("Text is added to agent input and is not submitted.".width()),
+        widest
+            .max("Text is added to agent input and is not submitted.".width())
+            .max(picker_instruction(app).width()),
         &picker_title(app),
         app.picker_rows.len() + 4,
     )
@@ -2886,6 +2897,20 @@ fn picker_scroll(app: &App, rows: usize) -> usize {
     menu_scroll(app.picker_cursor, app.picker_rows.len(), rows.saturating_sub(2))
 }
 
+fn picker_instruction(app: &App) -> String {
+    use crate::keymap::Action;
+    if app.picker_notice.is_some() {
+        return format!("{} copy · Esc cancel", app.keymap().hint(Action::Copy));
+    }
+    if matches!(app.mode, Mode::RemoteAssignPicker { .. }) {
+        "Enter continue · Esc cancel".into()
+    } else if matches!(app.mode, Mode::AssignPicker { .. }) {
+        "Enter assign · Esc cancel".into()
+    } else {
+        "Enter send · Esc cancel".into()
+    }
+}
+
 fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let popup = picker_popup(area, app);
@@ -2910,7 +2935,7 @@ fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
                 message,
                 Style::default().fg(if app.picker_notice.is_some() { p.red } else { p.text }),
             )),
-            Line::from(Span::styled("Enter send · Esc cancel", Style::default().fg(p.subtext0))),
+            Line::from(Span::styled(picker_instruction(app), Style::default().fg(p.subtext0))),
         ]),
         Rect { height: inner.height.min(2), ..inner },
     );

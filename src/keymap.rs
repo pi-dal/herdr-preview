@@ -68,6 +68,14 @@ pub struct Key {
 }
 
 impl Key {
+    /// True when this spelling would displace a structural key rather than name a deliverable
+    /// configurable shortcut. Kept here as a second boundary behind TOML parsing so direct
+    /// callers of `Keymap::resolve` cannot steal fixed paging either.
+    pub const fn invalid_override(self) -> bool {
+        matches!((self.ctrl, self.ch), (true, 'u' | 'U' | 'd' | 'D'))
+            || matches!(self.ch, '↑' | '↓' | '←' | '→' | '⇧' | '⇩') && (!self.alt || self.ctrl)
+    }
+
     /// A bare character, no modifier.
     pub const fn plain(ch: char) -> Self {
         Self { ctrl: false, alt: false, ch }
@@ -227,6 +235,13 @@ impl Keymap {
             if keys.is_empty() {
                 return Err(format!("`{}` has no keys", action.name()));
             }
+            if let Some(key) = keys.iter().copied().find(|key| key.invalid_override()) {
+                return Err(format!(
+                    "{} is a fixed key and cannot bind `{}`",
+                    key.config_str(),
+                    action.name()
+                ));
+            }
             let slot = keymap
                 .bindings
                 .iter_mut()
@@ -363,6 +378,15 @@ mod tests {
     fn an_empty_key_list_is_an_error_naming_the_action() {
         let error = Keymap::resolve(&[(Action::Quit, vec![])]).unwrap_err();
         assert!(error.contains("`quit`"), "{error}");
+    }
+
+    #[test]
+    fn fixed_paging_and_non_deliverable_arrow_glyphs_cannot_be_overridden() {
+        for key in [Key::ctrl('u'), Key::ctrl('D'), Key::plain('↑'), Key::ctrl('↓')] {
+            let error = Keymap::resolve(&[(Action::Refresh, vec![key])]).unwrap_err();
+            assert!(error.contains("fixed key") && error.contains("`refresh`"), "{error}");
+        }
+        assert!(Keymap::resolve(&[(Action::NextChange, vec![Key::alt_named('↓')])]).is_ok());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use common::{Repo, app_on};
 use herdr_reviewr::app::{App, Focus, Mode, RepositoryMode};
-use herdr_reviewr::keymap::Keymap;
+use herdr_reviewr::keymap::{Action, Key, Keymap};
 use herdr_reviewr::model::DeliveryReceipt;
 use herdr_reviewr::ui;
 use herdr_reviewr::{handle_key, handle_mouse};
@@ -20,6 +20,7 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use ratatui::{Terminal, backend::TestBackend};
 
 // `cwd` rides every real `agent list` entry (api notes). Send ignores it and resolves from
 // the workspace, so it is here to keep the fixture honest rather than to steer the send.
@@ -231,10 +232,7 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     assert_eq!(app.mode, Mode::Picker, "an empty workspace explains retained drafts in the sheet");
     assert_eq!(app.store.len(), 1, "a refusal keeps every comment");
-    assert_eq!(
-        app.picker_notice.as_deref(),
-        Some("No agent in this workspace — comments kept · y copy")
-    );
+    assert_eq!(app.picker_notice.as_deref(), Some("No agent in this workspace — comments kept"));
     press(&mut app, KeyCode::Esc, area, &keymap);
 
     fail_on(&fake_dir, "agent list");
@@ -245,7 +243,7 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
         "a failed enumeration still opens the retained-drafts sheet"
     );
     assert_eq!(app.store.len(), 1, "a refusal keeps every comment");
-    assert_eq!(app.picker_notice.as_deref(), Some("Herdr unavailable — comments kept · y copy"));
+    assert_eq!(app.picker_notice.as_deref(), Some("Herdr unavailable — comments kept"));
 }
 
 /// An in-memory clipboard seam for picker-fallback dispatch tests. It never invokes a platform
@@ -321,11 +319,12 @@ fn no_target_and_unavailable_picker_copy_uses_only_the_clipboard_seam() {
     r.commit_all("init");
     r.write("a.rs", "alpha\nbeta\n");
     let fake_dir = PathBuf::from(env::var("FAKE_HERDR_DIR").expect("set by the parent run"));
-    let keymap = Keymap::default();
+    let keymap = Keymap::resolve(&[(Action::Copy, vec![Key::plain('x')])]).unwrap();
     let area = Rect::new(0, 0, 80, 24);
     let mut app = app_on(&r);
 
-    // No agent: y reaches only the injected clipboard, whose confirmed success consumes drafts.
+    // No agent: only the resolved copy key reaches the injected clipboard, whose confirmed
+    // success consumes drafts. The old default stays inert in the notice picker.
     fs::write(fake_dir.join("agents.json"), r#"{"result":{"agents":[]}}"#).unwrap();
     write_comment(&mut app, "no-target success");
     press(&mut app, KeyCode::Char('s'), area, &keymap);
@@ -334,6 +333,16 @@ fn no_target_and_unavailable_picker_copy_uses_only_the_clipboard_seam() {
     herdr_reviewr::handle_key_with_clipboard(
         &mut app,
         KeyEvent::from(KeyCode::Char('y')),
+        area,
+        &keymap,
+        &copied,
+    )
+    .unwrap();
+    assert_eq!(app.mode, Mode::Picker, "the old copy default is inert in a notice picker");
+    assert!(app.store.len() == 1 && copied.captured.borrow().is_empty());
+    herdr_reviewr::handle_key_with_clipboard(
+        &mut app,
+        KeyEvent::from(KeyCode::Char('x')),
         area,
         &keymap,
         &copied,
@@ -349,7 +358,7 @@ fn no_target_and_unavailable_picker_copy_uses_only_the_clipboard_seam() {
     let failed = TestClipboard::failing();
     herdr_reviewr::handle_key_with_clipboard(
         &mut app,
-        KeyEvent::from(KeyCode::Char('y')),
+        KeyEvent::from(KeyCode::Char('x')),
         area,
         &keymap,
         &failed,
@@ -366,11 +375,11 @@ fn no_target_and_unavailable_picker_copy_uses_only_the_clipboard_seam() {
     // A failed Herdr enumeration has the same clipboard-only fallback behavior.
     fail_on(&fake_dir, "agent list");
     press(&mut app, KeyCode::Char('s'), area, &keymap);
-    assert_eq!(app.picker_notice.as_deref(), Some("Herdr unavailable — comments kept · y copy"));
+    assert_eq!(app.picker_notice.as_deref(), Some("Herdr unavailable — comments kept"));
     let unavailable_copied = TestClipboard::succeeding();
     herdr_reviewr::handle_key_with_clipboard(
         &mut app,
-        KeyEvent::from(KeyCode::Char('y')),
+        KeyEvent::from(KeyCode::Char('x')),
         area,
         &keymap,
         &unavailable_copied,
@@ -471,6 +480,17 @@ fn assignment_delivers_one_comment_without_consuming_or_submitting() {
 
     press(&mut app, KeyCode::Char('a'), area, &keymap);
     assert!(matches!(app.mode, Mode::AssignPicker { id: picked } if picked == id));
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let painted = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(painted.contains("Enter assign"), "{painted}");
+    assert!(!painted.contains("Enter send"), "{painted}");
     press(&mut app, KeyCode::Down, area, &keymap);
     assert_eq!(app.picker_cursor, 1, "arrow keys move the assignment highlight");
     press(&mut app, KeyCode::Char('2'), area, &keymap);

@@ -110,9 +110,9 @@ The bundled association baseline is project-owned while a pinned upstream snapsh
 
 ## Keybindings
 
-`[keybindings]` rebinds the action shortcuts: the resolved keymap is the default keymap with each bound action's keys replaced by its binding. A key is one printable, non-whitespace codepoint, alone or with a `ctrl+`/`alt+` prefix. `alt+up`, `alt+down`, `alt+left`, `alt+right`, `alt+shift+up`, and `alt+shift+down` are the named navigation keys. A chord-only action, like `find`, rebinds like any other (`input.md`).
+`[keybindings]` rebinds the action shortcuts: the resolved keymap is the default keymap with each bound action's keys replaced by its binding. A key is one printable, non-whitespace codepoint, alone or with a `ctrl+`/`alt+` prefix. Literal arrow glyphs are not binding keys; `alt+up`, `alt+down`, `alt+left`, `alt+right`, `alt+shift+up`, and `alt+shift+down` are the only named navigation-key spellings. A chord-only action, like `find`, rebinds like any other (`input.md`).
 
-A binding never displaces a fixed key (`input.md`). An unknown action name is an unknown key. A malformed key and a duplicate key are invalid values (→ CFG-WHOLE-FILE). A key appears at most once across the resolved keymap. A default added by an upgrade may collide with an existing custom binding, and the collision is invalid, the error naming both actions and the shared character.
+A binding never displaces a fixed key (`input.md`): in particular `ctrl+u` and `ctrl+d` remain half-page movement and are invalid override values. An unknown action name is an unknown key. A malformed key and a duplicate key are invalid values (→ CFG-WHOLE-FILE). A key appears at most once across the resolved keymap. A default added by an upgrade may collide with an existing custom binding, and the collision is invalid, the error naming both actions and the shared character.
 
 `list-wider` and `list-narrower` are accepted aliases for `navigator-grow` and `navigator-shrink`. A config naming an action and its alias is invalid as a duplicate action. Resolved output uses the canonical names.
 

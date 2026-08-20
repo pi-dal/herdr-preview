@@ -544,9 +544,11 @@ fn parse_key(text: &str) -> Option<crate::keymap::Key> {
     match (it.next(), it.next()) {
         (Some(ch), None)
             if !ch.is_whitespace()
+                && !matches!(ch, '↑' | '↓' | '←' | '→' | '⇧' | '⇩')
                 && unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) > 0 =>
         {
-            Some(crate::keymap::Key { ctrl, alt, ch })
+            let key = crate::keymap::Key { ctrl, alt, ch };
+            (!key.invalid_override()).then_some(key)
         }
         _ => None,
     }
@@ -1163,6 +1165,22 @@ mod tests {
             assert!(error.contains("`keybindings.comment`"), "{entry}: {error}");
             assert!(error.contains("expected"), "{entry}: {error}");
         }
+    }
+
+    #[test]
+    fn fixed_paging_and_literal_arrow_glyphs_are_not_configurable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for binding in ["ctrl+u", "ctrl+d", "ctrl+U", "↑", "ctrl+↓", "alt+←"] {
+            std::fs::write(&path, format!("[keybindings]\nrefresh = [{binding:?}]\n")).unwrap();
+            let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+            assert!(
+                error.contains("`keybindings.refresh`") && error.contains("expected"),
+                "{binding}: {error}"
+            );
+        }
+        std::fs::write(&path, "[keybindings]\nnext-change = [\"alt+down\"]\n").unwrap();
+        assert!(super::plugin_config_in(dir.path()).is_ok());
     }
 
     #[test]

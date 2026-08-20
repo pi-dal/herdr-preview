@@ -250,7 +250,7 @@ pub fn send_target() -> Result<SendTarget> {
             // A refusal is the whole status line, so it says the clipboard rather than herdr's
             // own wording. The cause is already in the log, with the argv `herdr` kept out of it.
             logln!("agent list failed: {e:#}");
-            bail!("Herdr unavailable — comments kept · y copy")
+            bail!("Herdr unavailable — comments kept")
         }
     };
     // Candidacy is decided once, here: an `agent` field, our workspace, not our own pane.
@@ -258,7 +258,7 @@ pub fn send_target() -> Result<SendTarget> {
     // tracking does not come through here: it asks where each agent works instead.
     let picked = candidates(&agents, ws.as_deref(), me.as_deref());
     match picked.len() {
-        0 => bail!("No agent in this workspace — comments kept · y copy"),
+        0 => bail!("No agent in this workspace — comments kept"),
         // The sole-agent send shows no row, so only the picker pays for the tab-label call.
         1 => Ok(SendTarget::One(picked[0].choice(&HashMap::new()))),
         _ => {

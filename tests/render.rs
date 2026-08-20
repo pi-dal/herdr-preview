@@ -1009,6 +1009,7 @@ fn the_pr_footer_keeps_the_open_action_when_the_state_line_is_long() {
     app.set_tab(Tab::Pr).unwrap();
     app.pr = PrView::Pr(Box::new(PrSnapshot {
         number: 226,
+        url: "https://github.com/owner/repo/pull/226".into(),
         merge: Merge::Conflicting, // a long state line: conflicts · behind · failing · +more
         sync: Sync::Behind(3),
         checks: vec![Check { name: "ci".into(), status: CheckStatus::Failure }],
@@ -1154,6 +1155,26 @@ fn hostile_pr_and_picker_fields_are_sanitized_at_paint_without_changing_raw_iden
         assert!(!out.contains(c), "hostile base-picker character {c:?} reached paint");
     }
     assert_eq!(app.base_picker.as_ref().unwrap().rows[0].name, format!("base-{hostile}"));
+}
+
+#[test]
+fn notice_picker_uses_the_resolved_copy_hint_and_never_advertises_send() {
+    let repo = Repo::init();
+    repo.write("a.rs", "alpha\n");
+    repo.commit_all("init");
+    let mut app = app_on(&repo);
+    let config_dir = tempfile::tempdir().unwrap();
+    std::fs::write(config_dir.path().join("config.toml"), "[keybindings]\ncopy = [\"x\"]\n")
+        .unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(config_dir.path()).unwrap());
+    app.mode = Mode::Picker;
+    app.picker_notice = Some("No agent in this workspace — comments kept".into());
+
+    let painted = render(&app);
+    let footer = footer_line(&painted);
+    assert!(painted.contains("x copy · Esc cancel"), "{painted}");
+    assert!(!painted.contains("Enter send"), "{painted}");
+    assert!(footer.contains("x copy") && !footer.contains("enter send"), "{footer}");
 }
 
 #[test]

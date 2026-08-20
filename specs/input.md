@@ -24,9 +24,9 @@ The keymap is rebindable per action through `[keybindings]` in the plugin config
 - The keys shown are defaults: a bare character, or a `ctrl+`/`alt+` chord (`config.md`).
 - The arrows, `tab`, `esc`, `enter`, and the page keys are structural. They are fixed and never rebind.
 - A key hint in the header or the footer shows its action's first bound key.
-- The comments list acts through the same bindings and closes on `esc` and the `comments` binding.
+- The comments list acts through the same bindings and closes on `esc` and the `comments` binding. Its structural arrows move only when bare; Ctrl/Shift arrows without Alt are inert.
 - The agent picker acts through the `down` / `up` bindings and closes on `esc`.
-- The base picker filters through a text field with the comment editor's controls, moves through the arrows, and closes on `esc`.
+- The base picker filters through a text field with the comment editor's controls, moves through bare arrows, and closes on `esc`. Its modified arrows are inert; `ctrl+n` / `ctrl+p` are its only modified movement keys.
 - Prose and mockups elsewhere show the default keys.
 
 | action                                                   | does                                        | keys                                        | mouse                         |
@@ -48,7 +48,7 @@ The keymap is rebindable per action through `[keybindings]` in the plugin config
 | —                                                        | open a link in rendered markdown            | —                                           | click the link                |
 | `wrap`                                                   | toggle line wrap                            | `w`                                         | —                             |
 | `preview`                                                | toggle the markdown preview                 | `m`                                         | —                             |
-| `navigator-position`                                     | move the navigator clockwise                | `p`                                         | —                             |
+| `navigator-position`                                     | move the navigator clockwise                | `P`                                         | —                             |
 | `navigator-hide`                                         | hide / show the navigator                   | `z`                                         | —                             |
 | `navigator-grow` / `navigator-shrink`                    | grow / shrink the navigator                 | `<` / `>`                                   | drag the divider              |
 | `select`                                                 | select a line range, removed lines included | `v` then move                               | click-drag in the diff        |
@@ -62,6 +62,8 @@ The keymap is rebindable per action through `[keybindings]` in the plugin config
 | `find`                                                   | open in-file find (`find-in-file.md`)       | `ctrl+f`                                    | —                             |
 | `keys`                                                   | toggle the footer's full shortcut list      | `alt+h`, `?`                                | —                             |
 | `send`                                                   | send all comments to the agent              | `alt+s`, `s`                                | —                             |
+| `assign`                                                 | assign the focused local comment to an agent | `a`                                         | —                             |
+| `publish`                                                | publish focused eligible local comment pending | `p`                                       | —                             |
 | `submit-review`                                          | submit this pane's pending GitHub review     | `S`                                         | —                             |
 | `assign-remote`                                          | assign selected GitHub inline finding        | `A`                                         | —                             |
 | `open-remote-thread`                                     | confirm opening selected thread externally   | `O`                                         | —                             |
@@ -88,7 +90,7 @@ A divider drag belongs to the navigator position and split axis at mouse-down. A
 
 Writing a comment is explicit: select, inspect the anchor strip, draft, then review or send. A navigator click while a selection is live preserves that selection and reports `clear selection before opening a file`, so a mouse action never silently discards an anchor. `c` on a content row remains the fast singleton draft. `v`, mouse-down, and drag select content rows. A fold expands instead of selecting. While a selection is live, file, tab, scope, and traversal changes are inert. A dedicated row after the selected endpoint names its range, count, and old/new/mixed side, and keeps `c comment` plus `esc clear` visible. Its `Comment` button is the exact mouse target and never paints over source. The composer title names New or Edit, the elided file location, and the line count. Its footer keeps `enter save`, `shift+enter newline`, and `esc cancel`, and distinguishes saved comments from the draft. Saved cards expose their ordinal, range, current or `STALE` state, and `click/e edit`. `n`/`N` cycles exact cards, including cards sharing a line. `d` opens `enter delete · esc cancel`. A successful send says `Added N comments to <agent>, not submitted`. A successful copy reports that they were copied.
 
-Remote GitHub finding assignment is explicit: on the PR tab, `A` is available only for the selected inline GitHub finding with a direct thread URL. It opens a frozen agent picker and then a separate `Enter assign · Esc cancel` confirmation. Successful delivery bracketed-pastes a task envelope containing the thread URL, author, body, file/location, and returned snippet when available. It never submits agent input and never posts, replies, resolves, approves, requests changes, or otherwise writes to GitHub. A delivered or failed receipt stays in this Preview session only, keyed to the immutable thread URL; a PR refresh may replace remote activity but never changes GitHub thread state. The selected finding's detail also shows the conservative relevant-file comparison cached at the last PR refresh against the frozen assignment-time baseline: `changed` only when a safe regular file can be read both times and differs; inaccessible, malformed, symlink, or oversized paths are `unknown` and require manual review.
+Remote GitHub finding assignment is explicit: on the PR tab, `A` is available only for the selected inline GitHub finding with a direct thread URL. It opens a frozen agent picker whose `Enter continue` advances to a separate `Enter assign · Esc cancel` confirmation. Successful delivery bracketed-pastes a task envelope containing the thread URL, author, body, file/location, and returned snippet when available. It never submits agent input and never posts, replies, resolves, approves, requests changes, or otherwise writes to GitHub. A delivered or failed receipt stays in this Preview session only, keyed to the immutable thread URL; a PR refresh may replace remote activity but never changes GitHub thread state. The selected finding's detail also shows the conservative relevant-file comparison cached at the last PR refresh against the frozen assignment-time baseline: `changed` only when a safe regular file can be read both times and differs; inaccessible, malformed, symlink, or oversized paths are `unknown` and require manual review.
 
 `O` is available only for the same selected direct-URL inline finding. Before it may show an explicit `Enter opens externally · Esc cancel` confirmation, the URL must pass the shared trimmed HTTP(S), nonblank, no-control/no-bidi browser policy; the exact policy is rechecked immediately before the platform launcher receives the validated value. Opening a URL is not a forge mutation; failures remain visible in the status line. It is inert in Files-only, image preview, non-thread, missing-URL, and unsafe-URL states.
 
@@ -146,7 +148,7 @@ band's content aligns in one column. The `?` stays at the right of the `do` row.
 ```
  do    e edit · d delete · n/N jump · s send 2                                ?
  go    u/b/t scope · / search · ctrl+f find · w wrap · l list · y copy · r refresh · 1·2·3 tabs
-       tab files · p position · z hide · q quit
+       tab files · P position · z hide · q quit
  move  j k · ] [ hunk · f F file · PageUp PageDown
 ```
 
@@ -234,7 +236,7 @@ A plain-text field that edits at the caret, not only at the end. The search inpu
 | `←` / `→`                                       | move the caret one character                     |
 | `↑` / `↓`                                       | move the caret one wrapped row, keeping column   |
 | `Home` / `End`, `Ctrl+A` / `Ctrl+E`             | move to the start / end of the logical line      |
-| `Alt+b` / `Alt+f`, `Alt`/`Ctrl` + `←` / `→`     | move by a word                                   |
+| `Alt+b` / `Alt+f`, `Alt` + `←` / `→`             | move by a word                                   |
 | `Backspace` / `Delete`                          | delete before / after the caret                  |
 | `Ctrl+W`                                        | delete the word before the caret                 |
 | `Ctrl+U` / `Ctrl+K`                             | delete to the start / end of the logical line    |
@@ -253,7 +255,7 @@ A plain-text field that edits at the caret, not only at the end. The search inpu
 - A box too short for its wrapped rows scrolls to keep the caret row visible.
 - A caret past an exactly-full row sits on the next row's first cell, where the next character
   lands. Input that ends by exactly filling its last row keeps an empty continuation row for it.
-- `Alt+b`/`Alt+f` always survive as ESC-prefixed sequences. The modified arrows work where the terminal delivers them. The character arrows, `Home`/`End`, and `Ctrl+A`/`Ctrl+E` always work.
+- `Alt+b`/`Alt+f` always survive as ESC-prefixed sequences. Alt-modified arrows work where the terminal delivers them. Ctrl/Shift arrows without Alt are inert. The character arrows, `Home`/`End`, and `Ctrl+A`/`Ctrl+E` always work.
 
 ### Agent picker
 
@@ -264,10 +266,10 @@ A plain-text field that edits at the caret, not only at the end. The search inpu
 | `j` / `k` / `↓` / `↑`   | move the highlight                          |
 | `1` – `9`               | move the highlight to that row              |
 | `enter`                 | send every comment to the highlighted agent |
-| `y`                     | copy when the sheet names no agent or unavailable Herdr |
+| resolved `copy` binding | copy when the sheet names no agent or unavailable Herdr |
 | `esc`                   | cancel, keeping every comment               |
 
-Only the unmodified `enter` sends. `Alt+Enter` and `Shift+Enter` insert a newline in the comment editor, so carrying that chord into the picker sends nothing rather than handing the whole review to the armed agent. The no-target `y` path uses the ordinary consume-on-success clipboard export.
+Only the unmodified `enter` sends. `Alt+Enter` and `Shift+Enter` insert a newline in the comment editor, so carrying that chord into the picker sends nothing rather than handing the whole review to the armed agent. The no-target copy path uses the ordinary consume-on-success clipboard export and shows the resolved copy hint.
 
 - A click moves the highlight to the clicked row. A click on the highlighted row sends. The highlight is armed when the picker opens, so a first click on the armed row sends immediately. Every other gesture is inert, and none reaches the view behind.
 - The digits are literal here, whatever `tab-changes` and its siblings are bound to. A modified digit moves nothing.
@@ -289,12 +291,12 @@ The highlight opens on the current base, else the first row. The highlight is pl
 | key                 | does                                            |
 | ------------------- | ----------------------------------------------- |
 | typed character     | narrow the list, matching anywhere in the name  |
-| `↓` / `↑`           | move the highlight                              |
+| bare `↓` / `↑`      | move the highlight                              |
 | `ctrl+n` / `ctrl+p` | move the highlight                              |
 | `enter`             | pick the highlighted branch                     |
 | `esc`               | cancel                                          |
 
-The filter is a text field with the comment editor's controls, above. `↑` and `↓` move the highlight, so the single-line filter keeps `←` and `→` for its caret. A pasted newline drops, so a branch name copied with its line ending filters as the bare name.
+The filter is a text field with the comment editor's controls, above. Bare `↑` and `↓` move the highlight, so the single-line filter keeps bare `←` and `→` for its caret. All modified arrows, including Alt arrows, are inert; only `ctrl+n` and `ctrl+p` are modified picker movement. A pasted newline drops, so a branch name copied with its line ending filters as the bare name.
 
 - A click moves the highlight. A click on the highlighted row picks.
 - A filter matching no branch shows `no branches match`, and `enter` does nothing.
@@ -321,7 +323,7 @@ The filter is a text field with the comment editor's controls, above. `↑` and 
 
 ### Assign a comment to an agent
 
-`a` targets the focused comment (or selected comments-list card) and opens an agent picker. The picker accepts `↑`/`↓` or `j`/`k`, `1`–`9`, bare `Enter` to deliver, and `Esc` to cancel. Delivery uses bracketed paste into the chosen Herdr agent tab and never submits it. The comment remains in the review and records its latest delivery receipt.
+`a` targets the focused comment (or selected comments-list card) and opens an agent picker. The picker accepts `↑`/`↓` or `j`/`k`, `1`–`9`, bare `Enter` to assign, and `Esc` to cancel. Delivery uses bracketed paste into the chosen Herdr agent tab and never submits it. The comment remains in the review and records its latest delivery receipt.
 
 ### Publish a comment to GitHub pending review
 

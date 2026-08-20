@@ -2821,15 +2821,18 @@ impl App {
             clamp_scroll(self.pr_read_scroll, delta, self.pr_read_max_scroll.get());
     }
 
-    /// Open the pull request in the browser (`specs/pr-tab.md`). A resolved PR always carries a
-    /// `url`, so there is nothing to guard against.
+    /// Open the pull request in the browser (`specs/pr-tab.md`). Forge CLI output is untrusted,
+    /// so the shared browser policy is checked immediately before the platform opener receives it.
     pub fn pr_open(&mut self) {
         let Some(url) = self.pr_snapshot().map(|s| s.url.clone()) else {
             return;
         };
-        match crate::browser::open(&url) {
-            Ok(()) => self.status = format!("opened {} in browser", self.pr_forge.abbr()),
-            Err(e) => self.status = e.to_string(),
+        match crate::browser::openable_url(&url) {
+            Ok(validated) => match crate::browser::open(validated) {
+                Ok(()) => self.status = format!("opened {} in browser", self.pr_forge.abbr()),
+                Err(error) => self.status = error.to_string(),
+            },
+            Err(_) => self.status = "could not open pull request: unsafe URL".into(),
         }
     }
 
@@ -4450,6 +4453,9 @@ impl App {
                 return actions;
             }
             Mode::Picker | Mode::AssignPicker { .. } | Mode::RemoteAssignPicker { .. } => {
+                if self.picker_notice.is_some() {
+                    return vec![(A::Copy, Primary), (A::ClosePicker, Do)];
+                }
                 return vec![(A::PickAgent, Primary), (A::ClosePicker, Do), (A::MovePickerRow, Do)];
             }
             Mode::BasePick => {
@@ -4536,16 +4542,33 @@ impl App {
         // carries only the steps the tab has — the PR has no hunk or file steps (`specs/pr-tab.md`).
         if self.tab == Tab::Pr {
             let mut out = Vec::new();
-            if self.pr_snapshot().is_some() {
-                out.push((A::OpenPr, Primary));
+            if let Some(snapshot) = self.pr_snapshot() {
+                if crate::browser::openable_url(&snapshot.url).is_ok() {
+                    out.push((A::OpenPr, Primary));
+                }
                 if self.pr_selected_comment().is_some_and(|comment| {
                     self.pr_forge == git::Forge::GitHub
                         && comment.kind == forge::CommentKind::Finding
                         && !comment.url.is_empty()
                 }) {
+                    // Assignment retains its direct-URL eligibility. Opening externally has the
+                    // stricter browser policy and must never be advertised when it would reject.
                     out.push((A::AssignRemote, Do));
-                    out.push((A::OpenRemoteThread, Do));
+                    if self
+                        .pr_selected_comment()
+                        .is_some_and(|comment| crate::browser::openable_url(&comment.url).is_ok())
+                    {
+                        out.push((A::OpenRemoteThread, Do));
+                    }
                 }
+            }
+            if !self.store.is_empty() {
+                out.push((A::Send, Send));
+                out.push((A::List, Go));
+                out.push((A::Copy, Go));
+            }
+            if self.github_submit_cached_available() {
+                out.push((A::SubmitReview, Submit));
             }
             out.push((A::Search, Go));
             out.push((A::TogglePane, Go));
@@ -6093,6 +6116,40 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_pr_urls_are_not_advertised_or_opened() {
+        let mut app = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        app.tab = Tab::Pr;
+        for bad in [
+            "   ",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "https://example.test/\x1b[31m",
+            "https://example.test/\u{202e}hidden",
+        ] {
+            let mut pr = open_pr("head");
+            pr.url = bad.into();
+            app.pr = crate::forge::PrView::Pr(Box::new(pr));
+            assert!(
+                !app.footer_bands().iter().any(|(action, _)| *action == FooterAction::OpenPr),
+                "{bad:?} must not advertise o open"
+            );
+
+            // This invokes the same `o`/header-click path. The safe, static error proves the
+            // opener was not reached: unsafe values are rejected before `browser::open`.
+            app.pr_open();
+            assert_eq!(app.status, "could not open pull request: unsafe URL");
+        }
+
+        let mut pr = open_pr("head");
+        pr.url = "https://github.com/o/r/pull/1".into();
+        app.pr = crate::forge::PrView::Pr(Box::new(pr));
+        assert!(
+            app.footer_bands().iter().any(|(action, _)| *action == FooterAction::OpenPr),
+            "safe PR URLs advertise o open"
+        );
+    }
+
+    #[test]
     fn unsafe_remote_urls_never_open_and_are_revalidated_at_launch() {
         let mut app = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
         app.tab = Tab::Pr;
@@ -6137,6 +6194,40 @@ mod tests {
         app.confirm_open_remote_thread();
         assert!(app.status.contains("unsafe direct URL"));
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn unsafe_remote_thread_url_is_not_advertised_in_pr_footer() {
+        let mut app = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        app.tab = Tab::Pr;
+        let mut finding = crate::forge::Comment {
+            kind: crate::forge::CommentKind::Finding,
+            url: "javascript:alert(1)".into(),
+            author: "author".into(),
+            author_is_bot: false,
+            anchor: "file.rs:1".into(),
+            body: String::new(),
+            snippet: None,
+            created_at: String::new(),
+            is_resolved: false,
+            is_outdated: false,
+            reply_count: 0,
+        };
+        let mut pr = open_pr("head");
+        pr.comments = vec![finding.clone()];
+        app.pr = crate::forge::PrView::Pr(Box::new(pr));
+        let footer = app.footer_bands();
+        assert!(footer.contains(&(FooterAction::AssignRemote, Band::Do)));
+        assert!(
+            !footer.contains(&(FooterAction::OpenRemoteThread, Band::Do)),
+            "unsafe URLs are inert and absent from the footer"
+        );
+
+        finding.url = "https://github.com/o/r/pull/1#discussion_r1".into();
+        let mut pr = open_pr("head");
+        pr.comments = vec![finding];
+        app.pr = crate::forge::PrView::Pr(Box::new(pr));
+        assert!(app.footer_bands().contains(&(FooterAction::OpenRemoteThread, Band::Do)));
     }
 
     #[cfg(unix)]
@@ -6265,6 +6356,11 @@ mod tests {
         app.recompute_github_submit_availability();
         assert!(app.github_submit_cached_available());
         assert!(app.footer_bands().contains(&(FooterAction::SubmitReview, Band::Submit)));
+        app.tab = Tab::Pr;
+        assert!(
+            app.footer_bands().contains(&(FooterAction::SubmitReview, Band::Submit)),
+            "PR activity retains the session-owned submit affordance"
+        );
 
         // A new PR identity invalidates only the cached affordance; it does not inspect Git and
         // it does not adopt the owner binding that happens to remain in this pane's session map.
@@ -6326,14 +6422,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
-            "[keybindings]\nsubmit-review = [\"ctrl+u\"]\n",
+            "[keybindings]\nsubmit-review = [\"ctrl+x\"]\n",
         )
         .unwrap();
         let mut app = submit_footer_app();
         app.set_plugin_config(crate::config::plugin_config_in(dir.path()).unwrap());
 
         let footer = render_text(&app, 140, 40);
-        assert!(footer.contains("ctrl+u submit review"), "{footer}");
+        assert!(footer.contains("ctrl+x submit review"), "{footer}");
         assert!(!footer.contains("S submit review"), "{footer}");
     }
 

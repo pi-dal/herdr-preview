@@ -1420,8 +1420,8 @@ fn apply_text_edit(app: &mut App, code: KeyCode, ctrl: bool, alt: bool, word: bo
         Char('u') if ctrl => app.input_kill_to_start(),
         Char('k') if ctrl => app.input_kill_to_end(),
         // Word-jump: `Alt+b`/`Alt+f` (readline; survives as ESC-prefixed, unlike modified
-        // arrows, which many terminals/multiplexers strip) and modified arrows where they are
-        // delivered. These precede the plain-character insert below.
+        // arrows, which many terminals/multiplexers strip) and Alt-modified arrows where they
+        // are delivered. These precede the plain-character insert below.
         Char('b') if alt => app.caret_word_left(),
         Char('f') if alt => app.caret_word_right(),
         Left if word => app.caret_word_left(),
@@ -1463,10 +1463,15 @@ pub fn handle_key_with_clipboard(
     if app.composing() {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let alt_or_shift = key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
-        let word = alt || ctrl; // word-jump on Alt/Ctrl + arrow (terminal-dependent)
+        let word = alt; // word-jump on Alt + arrow (terminal-dependent)
+        let modified_non_alt_arrow =
+            matches!(key.code, Up | Down | Left | Right) && !alt && !key.modifiers.is_empty();
         // The wrapped width of the box, for vertical (wrapped-row) caret movement.
         let cw = ui::composer_content_width(ui::diff_inner_width(area, app));
         match key.code {
+            // Ctrl/Shift arrows are structural only when unmodified. Do not let them become
+            // vertical/caret movement (or Ctrl word-jumps) in the composer.
+            Up | Down | Left | Right if modified_non_alt_arrow => {}
             Esc => app.cancel_comment(),
             // Alt/Shift+Enter (and Ctrl+J) insert a newline; plain Enter submits.
             Enter if alt_or_shift => app.input_push('\n'),
@@ -1486,15 +1491,20 @@ pub fn handle_key_with_clipboard(
     if app.mode == Mode::Search {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let word = alt || ctrl;
+        let modified_non_alt_arrow =
+            matches!(key.code, Up | Down | Left | Right) && !alt && !key.modifiers.is_empty();
         match key.code {
+            // Only the canonical Alt arrow editing path is meaningful in a text field.
+            // Ctrl/Shift arrows without Alt must not become caret movement or word jumps.
+            Up | Down | Left | Right if modified_non_alt_arrow => {}
             Esc => app.close_search(),
             Enter => app.search_open_pick()?,
             Tab => app.search_flip(),
             PageDown => app.scroll_search_preview(PAGE),
             PageUp => app.scroll_search_preview(-PAGE),
             // The single-line query has no rows, so `↑`/`↓` (and `ctrl+n`/`p`) move the pick.
-            Down => app.search_move(1),
-            Up => app.search_move(-1),
+            Down if key.modifiers.is_empty() => app.search_move(1),
+            Up if key.modifiers.is_empty() => app.search_move(-1),
             Char('n') if ctrl => app.search_move(1),
             Char('p') if ctrl => app.search_move(-1),
             code => apply_text_edit(app, code, ctrl, alt, word),
@@ -1508,10 +1518,15 @@ pub fn handle_key_with_clipboard(
     if app.mode == Mode::Find {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let word = alt || ctrl;
+        let modified_non_alt_arrow =
+            matches!(key.code, Up | Down | Left | Right) && !alt && !key.modifiers.is_empty();
         match key.code {
+            // See Search above: modified arrows are inert except for Alt's canonical word move.
+            Up | Down | Left | Right if modified_non_alt_arrow => {}
             Esc => app.close_find(),
-            Enter | Down => app.find_step(1),
-            Up => app.find_step(-1),
+            Enter => app.find_step(1),
+            Down if key.modifiers.is_empty() => app.find_step(1),
+            Up if key.modifiers.is_empty() => app.find_step(-1),
             code => apply_text_edit(app, code, ctrl, alt, word),
         }
         return Ok(());
@@ -1523,6 +1538,10 @@ pub fn handle_key_with_clipboard(
     // folded in here so every context pairs them exactly once. The other fixed keys (`tab`, `esc`,
     // the page keys, `←`/`→`) stay hardcoded per context below (`specs/input.md`).
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // Local modes own their structural arrows. A Shift/Ctrl arrow is neither their listed
+    // unmodified movement key nor a terminal-deliverable rebind, so it stays inert there.
+    let modified_non_alt_arrow =
+        matches!(key.code, Down | Up | Left | Right) && !alt && !key.modifiers.is_empty();
     // Named arrows are decoded separately from printable bindings. Preserve every modifier the
     // terminal reported: `ctrl+alt+↓` is not the default `alt+↓`, though a resolved keymap can
     // explicitly bind the former. Shift has its own named sentinel for the file steps.
@@ -1592,8 +1611,8 @@ pub fn handle_key_with_clipboard(
             (_, Char(c @ '1'..='9')) if bare => {
                 app.picker_goto(c as usize - '1' as usize);
             }
-            (Some(K::Down), _) => app.picker_move(1),
-            (Some(K::Up), _) => app.picker_move(-1),
+            (Some(K::Down), _) if !modified_non_alt_arrow => app.picker_move(1),
+            (Some(K::Up), _) if !modified_non_alt_arrow => app.picker_move(-1),
             _ => {}
         }
         return Ok(());
@@ -1662,10 +1681,13 @@ pub fn handle_key_with_clipboard(
         match key.code {
             Esc => app.close_base_picker(),
             Enter => app.base_picker_pick()?,
-            Down => app.base_picker_move(1),
-            Up => app.base_picker_move(-1),
+            Down if key.modifiers.is_empty() => app.base_picker_move(1),
+            Up if key.modifiers.is_empty() => app.base_picker_move(-1),
             Char('n') if ctrl => app.base_picker_move(1),
             Char('p') if ctrl => app.base_picker_move(-1),
+            // Only bare arrows move the picker or edit its filter. Unlike the composer, the
+            // base picker's contract has no modified-arrow editing controls.
+            Down | Up | Left | Right if !key.modifiers.is_empty() => {}
             code => apply_text_edit(app, code, ctrl, alt, word),
         }
         return Ok(());
@@ -1682,6 +1704,15 @@ pub fn handle_key_with_clipboard(
             (Some(K::TabChanges), _) => app.set_tab(crate::app::Tab::Changes)?,
             (Some(K::TabAllFiles), _) => app.set_tab(crate::app::Tab::AllFiles)?,
             (Some(K::OpenPr), _) => app.pr_open(),
+            // Local review actions remain available while reading PR activity. They only touch
+            // the in-memory comment store or an existing explicit confirmation; PR navigation
+            // itself never mutates the forge.
+            (Some(K::Send), _) => app.send_to_agent(),
+            (Some(K::Copy), _) => {
+                app.export(clipboard);
+            }
+            (Some(K::Comments), _) => app.open_list(),
+            (Some(K::SubmitReview), _) => app.request_submit_review(),
             (Some(K::Search), _) => app.open_search(),
             (Some(K::NavigatorPosition), _) => app.cycle_navigator_position(),
             (Some(K::NavigatorGrow), _) => app.resize_navigator(4),
@@ -1708,8 +1739,8 @@ pub fn handle_key_with_clipboard(
         match (action, key.code) {
             (Some(K::Comments), _) | (_, Esc) => app.close_list(),
             (_, Enter) => app.open_list_item(),
-            (Some(K::Down), _) => app.list_move(1),
-            (Some(K::Up), _) => app.list_move(-1),
+            (Some(K::Down), _) if !modified_non_alt_arrow => app.list_move(1),
+            (Some(K::Up), _) if !modified_non_alt_arrow => app.list_move(-1),
             (Some(K::Send), _) => app.send_to_agent(),
             (Some(K::Assign), _) => app.assign_comment_to_agent(),
             (Some(K::Publish), _) => app.request_publish_comment(),
@@ -2968,7 +2999,7 @@ mod input_dispatch_tests {
     use crate::app::{App, Focus, Mode};
     use crate::diff::{FileDiff, FileState, Row, Span, View};
     use crate::keymap::{Action, Key, Keymap, default_keymap};
-    use crate::model::Scope;
+    use crate::model::{Comment, Scope, Side};
     use crate::ui;
 
     fn rows() -> Vec<Row> {
@@ -3059,7 +3090,202 @@ mod input_dispatch_tests {
     }
 
     #[test]
-    fn named_alt_arrows_require_an_exact_modifier_match_or_explicit_binding() {
+    fn fixed_half_page_keys_still_move_after_override_rejection() {
+        let area = Rect::new(0, 0, 100, 20);
+        let mut app = app_with_rows();
+        app.diff_cursor = 2;
+        assert!(Keymap::resolve(&[(Action::Refresh, vec![Key::ctrl('u')])]).is_err());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            area,
+            default_keymap(),
+        )
+        .unwrap();
+        assert_eq!(app.diff_cursor, 0, "fixed ctrl+u pages upward");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            area,
+            default_keymap(),
+        )
+        .unwrap();
+        assert_eq!(app.diff_cursor, 2, "fixed ctrl+d pages downward");
+    }
+
+    #[test]
+    fn ctrl_and_shift_horizontal_arrows_are_inert_in_search_and_find() {
+        let area = Rect::new(0, 0, 100, 20);
+        let keymap = default_keymap();
+        let modified_horizontal_arrows = [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        ];
+
+        let mut search = app_with_rows();
+        search.open_search();
+        let overlay = search.search.as_mut().expect("search overlay");
+        overlay.query = "alpha beta".into();
+        overlay.caret = 5;
+        for key in modified_horizontal_arrows {
+            handle_key(&mut search, key, area, keymap).unwrap();
+            let overlay = search.search.as_ref().expect("search remains open");
+            assert_eq!(overlay.query, "alpha beta", "{key:?} cannot edit search");
+            assert_eq!(overlay.caret, 5, "{key:?} cannot move search caret");
+        }
+
+        let mut find = app_with_rows();
+        find.mode = Mode::Find;
+        find.input = "alpha beta".into();
+        find.caret = 5;
+        for key in modified_horizontal_arrows {
+            handle_key(&mut find, key, area, keymap).unwrap();
+            assert_eq!(find.input, "alpha beta", "{key:?} cannot edit find");
+            assert_eq!(find.caret, 5, "{key:?} cannot move find caret");
+        }
+    }
+
+    #[test]
+    fn modified_non_alt_arrows_are_inert_in_local_modes() {
+        let area = Rect::new(0, 0, 100, 20);
+        let keymap = default_keymap();
+        let modified_down = KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL);
+
+        let mut picker = app_with_rows();
+        picker.mode = Mode::Picker;
+        picker.picker_rows = vec![
+            crate::herdr::AgentChoice {
+                pane_id: "one".into(),
+                name: "one".into(),
+                state: "idle".into(),
+                tab: String::new(),
+            },
+            crate::herdr::AgentChoice {
+                pane_id: "two".into(),
+                name: "two".into(),
+                state: "idle".into(),
+                tab: String::new(),
+            },
+        ];
+        handle_key(&mut picker, modified_down, area, keymap).unwrap();
+        assert_eq!(picker.picker_cursor, 0, "ctrl+down cannot move a picker");
+
+        let mut find = app_with_rows();
+        find.mode = Mode::Find;
+        find.input = "two".into();
+        handle_key(&mut find, modified_down, area, keymap).unwrap();
+        assert_eq!(find.diff_cursor, 0, "ctrl+down cannot step a find match");
+
+        let mut base = app_with_rows();
+        base.mode = Mode::BasePick;
+        base.base_picker = Some(crate::app::BasePicker {
+            rows: vec![
+                crate::app::BaseChoice { name: "main".into(), starred: false, is_default: true },
+                crate::app::BaseChoice { name: "next".into(), starred: false, is_default: false },
+            ],
+            cursor: 0,
+            query: String::new(),
+            caret: 0,
+        });
+        for modified_arrow in [
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+        ] {
+            base.base_picker.as_mut().unwrap().cursor = 0;
+            base.base_picker.as_mut().unwrap().caret = 0;
+            handle_key(&mut base, modified_arrow, area, keymap).unwrap();
+            assert_eq!(
+                base.base_picker.as_ref().unwrap().cursor,
+                0,
+                "{modified_arrow:?} cannot move base pick"
+            );
+            assert_eq!(
+                base.base_picker.as_ref().unwrap().caret,
+                0,
+                "{modified_arrow:?} cannot edit base pick"
+            );
+        }
+        handle_key(
+            &mut base,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            area,
+            keymap,
+        )
+        .unwrap();
+        assert_eq!(
+            base.base_picker.as_ref().unwrap().cursor,
+            1,
+            "ctrl+n remains documented movement"
+        );
+        handle_key(
+            &mut base,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            area,
+            keymap,
+        )
+        .unwrap();
+        assert_eq!(
+            base.base_picker.as_ref().unwrap().cursor,
+            0,
+            "ctrl+p remains documented movement"
+        );
+    }
+
+    #[test]
+    fn modified_non_alt_arrows_are_inert_in_composer_and_comments_list() {
+        let area = Rect::new(0, 0, 100, 20);
+        let keymap = default_keymap();
+
+        let mut composer = app_with_rows();
+        composer.mode = Mode::Composing { editing: None };
+        composer.input = "first\nsecond".into();
+        composer.caret = 2;
+        for modified_arrow in [
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        ] {
+            handle_key(&mut composer, modified_arrow, area, keymap).unwrap();
+            assert_eq!(composer.caret, 2, "{modified_arrow:?} cannot move the composer caret");
+            assert_eq!(composer.input, "first\nsecond");
+        }
+
+        let mut list = app_with_rows();
+        for text in ["first", "second"] {
+            list.store.add(Comment {
+                file: "sample.rs".into(),
+                side: Side::New,
+                start: 1,
+                end: 1,
+                lines: "+ one".into(),
+                text: text.into(),
+                diff_anchored: true,
+                assignment: None,
+                github: None,
+            });
+        }
+        list.mode = Mode::List;
+        for modified_arrow in [
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+        ] {
+            list.list_cursor = 0;
+            handle_key(&mut list, modified_arrow, area, keymap).unwrap();
+            assert_eq!(list.list_cursor, 0, "{modified_arrow:?} cannot move the comments list");
+        }
+    }
+
+    #[test]
+    fn named_alt_arrows_require_an_exact_modifier_match() {
         let area = Rect::new(0, 0, 100, 20);
         let mut app = app_with_rows();
 
@@ -3082,17 +3308,11 @@ mod input_dispatch_tests {
         .unwrap();
         assert_eq!(app.diff_cursor, 0, "ctrl+alt+down does not inherit alt+down");
 
-        let explicit =
+        assert!(
             Keymap::resolve(&[(Action::NextChange, vec![Key { ctrl: true, alt: true, ch: '↓' }])])
-                .unwrap();
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::CONTROL),
-            area,
-            &explicit,
-        )
-        .unwrap();
-        assert_eq!(app.diff_cursor, 1, "an explicitly resolved ctrl+alt chord still works");
+                .is_err(),
+            "ctrl-arrow glyphs are not deliverable binding values"
+        );
     }
 
     #[test]

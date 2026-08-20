@@ -293,7 +293,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - **Four-way navigator placement.** The navigator can sit on the right, bottom, left, or top of
-  every tab. Press `p` to cycle clockwise, or set `navigator_position` in plugin config. Side and
+  every tab. Press `P` to cycle clockwise, or set `navigator_position` in plugin config. Side and
   stacked layouts remember separate sizes, with `<` / `>` and divider dragging available on both
   axes. (#16)
 - **Independent PR navigator scrolling.** The checks and comments viewport scrolls without moving
@@ -302,7 +302,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - **Navigator resize actions have position-neutral names.** Config uses `navigator-grow` and
   `navigator-shrink`; `list-wider` and `list-narrower` remain accepted aliases.
-- **Breaking: `p` is a new default key.** A custom binding that already uses `p` now collides with
+- **Breaking: `P` is a new default key.** A custom binding that already uses `P` now collides with
   `navigator-position` and must be moved before the config becomes valid again.
 
 ## [0.16.1] — 2026-07-13

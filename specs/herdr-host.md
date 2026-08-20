@@ -123,7 +123,7 @@ A candidate is any other pane in the same herdr workspace carrying an `agent` fi
 
 The pane write wraps the batch in bracketed paste markers, never raw bytes. The write removes every paste terminator inside the batch. The clipboard export carries the batch untouched.
 
-The sheet states count, stale count, selected target, and `Text is added to agent input and is not submitted.` Bare `enter` sends directly through the existing bracketed-paste pane path. Its no-agent and unavailable states keep drafts and retain `y copy`. A successful write clears exactly that frozen batch and says `Added N comments to <agent>, not submitted`. A focus failure after the write remains success. A send that does not land says so in one short sentence and keeps every comment. It never shows herdr's own wording.
+The sheet states count, stale count, selected target, and `Text is added to agent input and is not submitted.` Bare `enter` sends directly through the existing bracketed-paste pane path. Its no-agent and unavailable states keep drafts and show the resolved `copy` binding; they never advertise an inert `enter` send. A successful write clears exactly that frozen batch and says `Added N comments to <agent>, not submitted`. A focus failure after the write remains success. A send that does not land says so in one short sentence and keeps every comment. It never shows herdr's own wording.
 
 ### Agent picker
 

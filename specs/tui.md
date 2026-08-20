@@ -102,7 +102,7 @@ A layout change moves nothing else (`overview.md`), and both remembered shares p
 - No editing, staging, or committing from the UI.
 - No side-by-side split view. The diff is one unified column.
 - No per-tab navigator position. One position applies to every tab.
-- No automatic position or content-sized navigator. Layout changes only through config, `p`, `z`, resize keys, or dragging.
+- No automatic position or content-sized navigator. Layout changes only through config, `P`, `z`, resize keys, or dragging.
 - No configured hidden default. The navigator starts visible, and only `navigator-hide` hides it.
 - No multi-file review stream. Each read pane shows one selected item.
 - No header `Send` button. Send lives on its keys and the footer (`input.md`).

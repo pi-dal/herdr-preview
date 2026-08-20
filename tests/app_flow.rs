@@ -832,13 +832,36 @@ fn the_pr_footer_offers_open_for_any_resolved_pr() {
     );
 
     // A resolved PR with zero comments still offers `o open` — `o` opens the PR URL, not a comment.
-    app.pr = PrView::Pr(Box::new(PrSnapshot { number: 7, ..common::pr_snapshot() }));
+    app.pr = PrView::Pr(Box::new(PrSnapshot {
+        number: 7,
+        url: "https://github.com/owner/repo/pull/7".into(),
+        ..common::pr_snapshot()
+    }));
     assert!(app.pr_selected_comment().is_none(), "zero comments → nothing selected");
     assert_eq!(
         app.footer_bands().first().map(|&(a, _)| a),
         Some(FooterAction::OpenPr),
         "a resolved PR offers open even with no comments"
     );
+}
+
+#[test]
+fn the_pr_footer_keeps_local_review_actions_reachable() {
+    use herdr_reviewr::app::Tab;
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    comment_on(&mut app, '+', "note");
+    app.pr = PrView::Pr(Box::new(PrSnapshot { number: 7, ..common::pr_snapshot() }));
+    app.set_tab(Tab::Pr).unwrap();
+    let footer = app.footer_bands();
+    assert!(footer.iter().any(|&(a, _)| a == FooterAction::Send));
+    assert!(footer.iter().any(|&(a, _)| a == FooterAction::List));
+    assert!(footer.iter().any(|&(a, _)| a == FooterAction::Copy));
+
+    press(&mut app, &Keymap::default(), KeyCode::Char('l'));
+    assert_eq!(app.mode, Mode::List, "comments remains reachable from PR activity");
 }
 
 #[test]
@@ -1638,7 +1661,7 @@ fn footer_swaps_the_hide_key_between_go_and_row_one() {
     );
     assert!(
         !bands.iter().any(|&(a, _)| a == FooterAction::NavigatorPosition),
-        "`p position` drops while hidden"
+        "`P position` drops while hidden"
     );
 
     app.set_tab(herdr_reviewr::app::Tab::Pr).unwrap();
@@ -1647,7 +1670,7 @@ fn footer_swaps_the_hide_key_between_go_and_row_one() {
         !bands.iter().any(|&(a, _)| a == FooterAction::NavigatorHide),
         "`PR` never lists the hide key"
     );
-    assert!(bands.contains(&(FooterAction::NavigatorPosition, Band::Go)), "`p` stays on `PR`");
+    assert!(bands.contains(&(FooterAction::NavigatorPosition, Band::Go)), "`P` stays on `PR`");
 }
 
 #[test]
