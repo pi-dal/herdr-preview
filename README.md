@@ -91,7 +91,6 @@ are mnemonic and are routed through Herdr even if Ghostty never emits a physical
 | Review | `alt+c` · `alt+l` · `alt+s` | comment · comment list · send |
 | Display | `alt+u` · `alt+shift+r` | fold unchanged · refresh |
 | Navigate changes | `alt+up` / `alt+down` | previous / next changed line |
-| Navigate groups | `alt+left` / `alt+right` | previous / next change group |
 | Navigate files | `alt+shift+b` / `alt+shift+n` | previous / next changed file |
 
 Each entry uses Herdr's plugin-action shape:
@@ -147,8 +146,9 @@ key list.
 
 The in-pane mnemonic uses `alt+d` Changes, `alt+f` Files, `alt+r` PR, `alt+c` comment,
 `alt+l` list, `alt+s` send, `alt+shift+r` refresh, and `alt+h` help. `alt+up`/`alt+down` step
-individual changed lines, `alt+left`/`alt+right` step change runs, and `alt+shift+up`/
-`alt+shift+down` step files. `alt+u` hides unchanged context in Changes as expandable folds.
+individual changed lines, `]`/`[` step change runs, and `alt+shift+up`/
+`alt+shift+down` step files. In active text fields, `alt+left`/`alt+right` retain normal
+Option word-wise caret movement. `alt+u` hides unchanged context in Changes as expandable folds.
 These are in-pane shortcuts. The global actions above are the route for Option chords that Herdr
 intercepts before Preview sees terminal input.
 

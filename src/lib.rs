@@ -3148,6 +3148,56 @@ mod input_dispatch_tests {
     }
 
     #[test]
+    fn alt_horizontal_arrows_word_jump_in_each_active_text_field() {
+        let area = Rect::new(0, 0, 100, 20);
+        let keymap = default_keymap();
+        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+        let word_right = KeyEvent::new(KeyCode::Right, KeyModifiers::ALT);
+        let alt_back = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+        let alt_forward = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT);
+
+        let mut composer = app_with_rows();
+        composer.mode = Mode::Composing { editing: None };
+        composer.input = "alpha beta gamma".into();
+        composer.caret = composer.input.chars().count();
+        for (key, expected) in
+            [(word_left, 11), (word_right, 16), (alt_back, 11), (alt_forward, 16)]
+        {
+            handle_key(&mut composer, key, area, keymap).unwrap();
+            assert_eq!(composer.caret, expected, "{key:?} in composer");
+            assert_eq!(composer.input, "alpha beta gamma");
+        }
+
+        let mut search = app_with_rows();
+        search.open_search();
+        let overlay = search.search.as_mut().expect("search overlay");
+        overlay.query = "alpha beta gamma".into();
+        overlay.caret = overlay.query.chars().count();
+        for (key, expected) in
+            [(word_left, 11), (word_right, 16), (alt_back, 11), (alt_forward, 16)]
+        {
+            handle_key(&mut search, key, area, keymap).unwrap();
+            let overlay = search.search.as_ref().expect("search remains open");
+            assert_eq!(overlay.caret, expected, "{key:?} in search");
+            assert_eq!(overlay.query, "alpha beta gamma");
+        }
+
+        let mut find = app_with_rows();
+        find.open_find();
+        let overlay = find.find.as_mut().expect("find overlay");
+        overlay.query = "alpha beta gamma".into();
+        overlay.caret = overlay.query.chars().count();
+        for (key, expected) in
+            [(word_left, 11), (word_right, 16), (alt_back, 11), (alt_forward, 16)]
+        {
+            handle_key(&mut find, key, area, keymap).unwrap();
+            let overlay = find.find.as_ref().expect("find remains open");
+            assert_eq!(overlay.caret, expected, "{key:?} in find");
+            assert_eq!(overlay.query, "alpha beta gamma");
+        }
+    }
+
+    #[test]
     fn modified_non_alt_arrows_are_inert_in_local_modes() {
         let area = Rect::new(0, 0, 100, 20);
         let keymap = default_keymap();

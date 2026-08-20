@@ -747,6 +747,32 @@ fn the_editor_moves_by_char_word_and_line() {
 }
 
 #[test]
+fn option_arrows_are_unbound_for_change_runs_and_move_editor_words() {
+    let keymap = Keymap::default();
+    assert_eq!(keymap.action_for(Key::alt_named('←')), None);
+    assert_eq!(keymap.action_for(Key::alt_named('→')), None);
+
+    let mut app = composing_app();
+    typed(&mut app, "alpha beta");
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+        Rect::new(0, 0, 120, 40),
+        &keymap,
+    )
+    .unwrap();
+    assert_eq!(app.caret, 6, "Option-left moves to the start of beta");
+    handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+        Rect::new(0, 0, 120, 40),
+        &keymap,
+    )
+    .unwrap();
+    assert_eq!(app.caret, 10, "Option-right moves to the end of beta");
+}
+
+#[test]
 fn the_editor_kills_to_line_bounds_and_pastes_multiline() {
     let mut app = composing_app();
     typed(&mut app, "alpha beta");

@@ -117,17 +117,6 @@ title = "Herdr Preview: next file"
 contexts = ["pane", "workspace"]
 command = ["bash", "herdr/pane.sh", "forward", "alt+shift+down"]
 
-[[actions]]
-id = "previous-change-run"
-title = "Herdr Preview: previous change run"
-contexts = ["pane", "workspace"]
-command = ["bash", "herdr/pane.sh", "forward", "alt+left"]
-
-[[actions]]
-id = "next-change-run"
-title = "Herdr Preview: next change run"
-contexts = ["pane", "workspace"]
-command = ["bash", "herdr/pane.sh", "forward", "alt+right"]
 
 # Auto-open Preview for a freshly created worktree, gated by auto_open.
 [[events]]

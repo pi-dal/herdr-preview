@@ -1059,12 +1059,12 @@ fn host_forwarding_keys_match_the_existing_tui_keymap() {
         (Key::alt_named('↓'), Action::NextChange),
         (Key::alt_named('⇧'), Action::PrevFile),
         (Key::alt_named('⇩'), Action::NextFile),
-        (Key::alt_named('←'), Action::PrevHunk),
-        (Key::alt_named('→'), Action::NextHunk),
     ];
     for (key, action) in expected {
         assert_eq!(keymap.action_for(key), Some(action), "{key}");
     }
+    assert_eq!(keymap.action_for(Key::alt_named('←')), None, "Option-left is text input");
+    assert_eq!(keymap.action_for(Key::alt_named('→')), None, "Option-right is text input");
 }
 
 #[test]
@@ -1101,6 +1101,24 @@ fn forward_ignores_upstream_then_opens_preview_without_focus_and_sends_the_key()
     assert!(calls.lines().any(|line| line == "pane send-keys w1:p9 alt+d"), "{calls}");
     assert!(!calls.contains("w1:p6 alt+d"), "an upstream pane must never receive a key: {calls}");
     assert!(!calls.contains("plugin pane focus"), "a tab route preserves agent focus: {calls}");
+}
+
+#[test]
+fn forward_rejects_removed_option_word_navigation_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    let context = serde_json::json!({"focused_pane_cwd": env!("CARGO_MANIFEST_DIR")}).to_string();
+
+    for key in ["alt+left", "alt+right"] {
+        let output = run_forward_with_context(key, dir.path(), &herdr, &context);
+        assert_eq!(output.status.code(), Some(1), "{key}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unknown forward key"),
+            "{key}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(!log.exists(), "rejected word navigation must not invoke Herdr");
 }
 
 #[test]

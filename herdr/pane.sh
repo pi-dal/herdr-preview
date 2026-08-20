@@ -90,7 +90,7 @@ forward_focus=false
 if [ "$mode" = forward ]; then
   forward_key="${2:-}"
   case "$forward_key" in
-  alt+d | alt+f | alt+r | alt+s | alt+shift+r | alt+u | alt+up | alt+down | alt+shift+up | alt+shift+down | alt+left | alt+right) ;;
+  alt+d | alt+f | alt+r | alt+s | alt+shift+r | alt+u | alt+up | alt+down | alt+shift+up | alt+shift+down) ;;
   alt+c | alt+l) forward_focus=true ;;
   *) refuse "unknown forward key '$forward_key'" ;;
   esac

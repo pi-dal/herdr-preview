@@ -32,7 +32,7 @@ The keymap is rebindable per action through `[keybindings]` in the plugin config
 | action                                                   | does                                        | keys                                        | mouse                         |
 | -------------------------------------------------------- | ------------------------------------------- | ------------------------------------------- | ----------------------------- |
 | `down` / `up`                                            | move the cursor in the focused pane         | `j` / `k` / `↓` / `↑`                       | click a row                   |
-| `next-hunk` / `prev-hunk`                                | jump to the next / previous change run      | `alt+right` / `alt+left`, `]` / `[`         | —                             |
+| `next-hunk` / `prev-hunk`                                | jump to the next / previous change run      | `]` / `[`                                   | —                             |
 | `next-change` / `prev-change`                            | jump to the next / previous changed line    | `alt+down` / `alt+up`                       | —                             |
 | `next-file` / `prev-file`                                | jump to the next / previous file            | `alt+shift+down` / `alt+shift+up`, `f` / `F` | —                             |
 | —                                                        | navigate a directory tree                   | `←` / `→` / `enter`                         | click anywhere on a directory row |
@@ -72,7 +72,7 @@ The keymap is rebindable per action through `[keybindings]` in the plugin config
 | `refresh`                                                | refresh now                                 | `alt+shift+r`, `r`                          | —                             |
 | `quit`                                                   | quit                                        | `q`                                         | —                             |
 
-Herdr's global Preview actions send the table's canonical default `alt+` key through the pane API (`herdr-host.md`). The key enters this keymap like an in-pane chord. It does not depend on a terminal delivering a physical Option key, and it creates no second terminal binding. A `[keybindings]` override still controls the key's resulting action.
+Herdr's global Preview actions send the table's canonical default `alt+` key through the pane API (`herdr-host.md`). The key enters this keymap like an in-pane chord. It does not depend on a terminal delivering a physical Option key, and it creates no second terminal binding. `alt+left` and `alt+right` are deliberately not host actions: they remain terminal input for word-wise movement in active text fields. A `[keybindings]` override still controls the key's resulting action.
 
 In Files-only, the `Files` tab, navigator controls, wrapping, markdown preview, find, search when available, and refresh remain active. Directory rows use the same whole-row targets and fixed tree keys as Git Files. Git scopes, Changes and PR tabs, change and hunk traversal, hide unchanged, comment actions, and send or copy are inert and identify Files-only mode.
 
@@ -100,7 +100,7 @@ GitHub pending-review publishing is explicit: `p` opens a confirmation only for 
 
 ### Changeset traversal
 
-`next-hunk` / `prev-hunk` keep their canonical config IDs and step between **change runs**, not hunks in user-facing copy. `next-change` / `prev-change` step each added or removed row and cross directly to the nearest changed row in the adjacent file. They are inert outside Changes source, in previews and notices, and while selecting or composing.
+`next-hunk` / `prev-hunk` keep their canonical config IDs and step between **change runs**, not hunks in user-facing copy. Their in-pane defaults are `]` and `[`; Option-left/right remain word movement while text editing. `next-change` / `prev-change` step each added or removed row and cross directly to the nearest changed row in the adjacent file. They are inert outside Changes source, in previews and notices, and while selecting or composing.
 
 `next-hunk` / `prev-hunk` step the diff cursor between change runs, from either pane. A step lands on the first row of a run of changed rows. A context line or a fold ends a run, so two edits three lines apart are two stops.
 

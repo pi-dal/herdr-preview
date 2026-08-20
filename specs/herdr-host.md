@@ -58,7 +58,7 @@ With valid plugin config:
 
 `peek` is the stable agent interface. It always passes `split`, `right`, and `--no-focus`, regardless of `toggle_placement` and `toggle_direction` (→ HH-PEEK-RIGHT-NONFOCUSING). It attaches beside the invoking pane, or the focused pane when the action has workspace context. It never focuses or closes an existing Preview pane.
 
-The manifest's `changes`, `files`, `review`, `comment`, `comments`, `send`, `refresh`, `hide-unchanged`, `previous-change`, `next-change`, `previous-file`, `next-file`, `previous-change-run`, and `next-change-run` actions call `forward` with the input table's default canonical key. Herdr sends the canonical key through `pane send-keys`. It does not need the terminal to deliver a physical Option key. The identity sweep chooses only a foreground `herdr-preview` process. It never sends to `herdr-reviewr` or a pane title.
+The manifest's `changes`, `files`, `review`, `comment`, `comments`, `send`, `refresh`, `hide-unchanged`, `previous-change`, `next-change`, `previous-file`, and `next-file` actions call `forward` with the input table's default canonical key. Herdr sends the canonical key through `pane send-keys`. It does not need the terminal to deliver a physical Option key. Option-left/right are intentionally not forwarded host actions, so they reach an active Preview text field for word-wise caret movement. The identity sweep chooses only a foreground `herdr-preview` process. It never sends to `herdr-reviewr` or a pane title.
 
 A host key is a user profile decision, not a plugin contract. It must not shadow a Herdr-native
 command. In the supplied macOS profile, `alt+d` stays Herdr's vertical split and
@@ -66,7 +66,7 @@ command. In the supplied macOS profile, `alt+d` stays Herdr's vertical split and
 inside Preview. This keeps one in-pane action keymap while allowing a conflict-free global layer
 (`input.md`).
 
-A forwarding open uses `peek` placement and focus. `changes`, `files`, `review`, `refresh`, `hide-unchanged`, and every traversal action preserve the invoking focus. `comment` and `comments` focus Preview before sending because the next input belongs there. `send` adds no host focus change, then Preview applies its normal send behavior. A focus or send failure refuses before a key reaches a pane.
+A forwarding open uses `peek` placement and focus. `changes`, `files`, `review`, `refresh`, `hide-unchanged`, `previous-change`, `next-change`, `previous-file`, and `next-file` preserve the invoking focus. `comment` and `comments` focus Preview before sending because the next input belongs there. `send` adds no host focus change, then Preview applies its normal send behavior. A focus or send failure refuses before a key reaches a pane.
 
 Every action validates plugin config before inspecting the workspace (`config.md`). An action refuses without workspace context. Refusals land in `herdr plugin log list`.
 
