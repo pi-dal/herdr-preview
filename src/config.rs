@@ -1256,7 +1256,7 @@ mod tests {
         assert_eq!(keybindings["quit"], serde_json::json!(["q"]));
         assert_eq!(keybindings["send"], serde_json::json!(["s", "alt+s"]));
         assert_eq!(keybindings["submit-review"], serde_json::json!(["S"]));
-        assert_eq!(keybindings["next-change"], serde_json::json!(["alt+down"]));
+        assert_eq!(keybindings["next-change"], serde_json::json!(["}"]));
         assert_eq!(keybindings["hide-unchanged"], serde_json::json!(["alt+u"]));
     }
 }

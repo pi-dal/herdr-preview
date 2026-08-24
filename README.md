@@ -90,7 +90,6 @@ are mnemonic and are routed through Herdr even if Ghostty never emits a physical
 | Views | `alt+shift+d` · `alt+f` · `alt+r` | Changes · Files · PR |
 | Review | `alt+c` · `alt+l` · `alt+s` | comment · comment list · send |
 | Display | `alt+u` · `alt+shift+r` | fold unchanged · refresh |
-| Navigate changes | `alt+up` / `alt+down` | previous / next changed line |
 | Navigate files | `alt+shift+b` / `alt+shift+n` | previous / next changed file |
 
 Each entry uses Herdr's plugin-action shape:
@@ -145,12 +144,12 @@ key list.
 ### Alt layout
 
 The in-pane mnemonic uses `alt+d` Changes, `alt+f` Files, `alt+r` PR, `alt+c` comment,
-`alt+l` list, `alt+s` send, `alt+shift+r` refresh, and `alt+h` help. `alt+up`/`alt+down` step
+`alt+l` list, `alt+s` send, `alt+shift+r` refresh, and `alt+h` help. `}`/`{` step
 individual changed lines, `]`/`[` step change runs, and `alt+shift+up`/
-`alt+shift+down` step files. In active text fields, `alt+left`/`alt+right` retain normal
-Option word-wise caret movement. `alt+u` hides unchanged context in Changes as expandable folds.
-These are in-pane shortcuts. The global actions above are the route for Option chords that Herdr
-intercepts before Preview sees terminal input.
+`alt+shift+down` step files. Unshifted `alt+left`/`alt+right` retain normal Option word-wise
+caret movement, while unshifted `alt+up`/`alt+down` are never captured by Preview. `alt+u` hides
+unchanged context in Changes as expandable folds. These are in-pane shortcuts. The global actions
+above are the route for Option chords that Herdr intercepts before Preview sees terminal input.
 
 `alt+` is the config spelling for macOS's **Option** key. Terminals only deliver these shortcuts
 when Option is configured to send Alt/Meta, so retain the existing bare keys or rebind them if

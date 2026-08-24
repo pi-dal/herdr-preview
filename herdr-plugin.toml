@@ -94,18 +94,6 @@ contexts = ["pane", "workspace"]
 command = ["bash", "herdr/pane.sh", "forward", "alt+u"]
 
 [[actions]]
-id = "previous-change"
-title = "Herdr Preview: previous change"
-contexts = ["pane", "workspace"]
-command = ["bash", "herdr/pane.sh", "forward", "alt+up"]
-
-[[actions]]
-id = "next-change"
-title = "Herdr Preview: next change"
-contexts = ["pane", "workspace"]
-command = ["bash", "herdr/pane.sh", "forward", "alt+down"]
-
-[[actions]]
 id = "previous-file"
 title = "Herdr Preview: previous file"
 contexts = ["pane", "workspace"]

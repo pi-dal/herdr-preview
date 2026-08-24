@@ -3335,10 +3335,20 @@ mod input_dispatch_tests {
     }
 
     #[test]
-    fn named_alt_arrows_require_an_exact_modifier_match() {
+    fn released_option_vertical_arrows_are_inert_by_default_but_configurable() {
         let area = Rect::new(0, 0, 100, 20);
         let mut app = app_with_rows();
 
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('}'), KeyModifiers::NONE),
+            area,
+            default_keymap(),
+        )
+        .unwrap();
+        assert_eq!(app.diff_cursor, 1, "the default }} steps individual changed lines");
+
+        app.diff_cursor = 0;
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
@@ -3346,17 +3356,12 @@ mod input_dispatch_tests {
             default_keymap(),
         )
         .unwrap();
-        assert_eq!(app.diff_cursor, 1, "the decoded default alt+down still steps changes");
+        assert_eq!(app.diff_cursor, 0, "default alt+down is released to the terminal");
 
-        app.diff_cursor = 0;
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::CONTROL),
-            area,
-            default_keymap(),
-        )
-        .unwrap();
-        assert_eq!(app.diff_cursor, 0, "ctrl+alt+down does not inherit alt+down");
+        let opt_in = Keymap::resolve(&[(Action::NextChange, vec![Key::alt_named('↓')])]).unwrap();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), area, &opt_in)
+            .unwrap();
+        assert_eq!(app.diff_cursor, 1, "an explicit binding may opt into alt+down");
 
         assert!(
             Keymap::resolve(&[(Action::NextChange, vec![Key { ctrl: true, alt: true, ch: '↓' }])])

@@ -1055,16 +1055,19 @@ fn host_forwarding_keys_match_the_existing_tui_keymap() {
         (Key::alt('s'), Action::Send),
         (Key::alt_shift('r'), Action::Refresh),
         (Key::alt('u'), Action::HideUnchanged),
-        (Key::alt_named('↑'), Action::PrevChange),
-        (Key::alt_named('↓'), Action::NextChange),
         (Key::alt_named('⇧'), Action::PrevFile),
         (Key::alt_named('⇩'), Action::NextFile),
     ];
     for (key, action) in expected {
         assert_eq!(keymap.action_for(key), Some(action), "{key}");
     }
-    assert_eq!(keymap.action_for(Key::alt_named('←')), None, "Option-left is text input");
-    assert_eq!(keymap.action_for(Key::alt_named('→')), None, "Option-right is text input");
+    for arrow in ['↑', '↓', '←', '→'] {
+        assert_eq!(
+            keymap.action_for(Key::alt_named(arrow)),
+            None,
+            "unshifted Option arrows are released to the host and text input"
+        );
+    }
 }
 
 #[test]
@@ -1104,12 +1107,12 @@ fn forward_ignores_upstream_then_opens_preview_without_focus_and_sends_the_key()
 }
 
 #[test]
-fn forward_rejects_removed_option_word_navigation_keys() {
+fn forward_rejects_released_unshifted_option_arrow_keys() {
     let dir = tempfile::tempdir().unwrap();
     let (herdr, log) = fake_herdr(dir.path());
     let context = serde_json::json!({"focused_pane_cwd": env!("CARGO_MANIFEST_DIR")}).to_string();
 
-    for key in ["alt+left", "alt+right"] {
+    for key in ["alt+left", "alt+right", "alt+up", "alt+down"] {
         let output = run_forward_with_context(key, dir.path(), &herdr, &context);
         assert_eq!(output.status.code(), Some(1), "{key}");
         assert!(
@@ -1118,7 +1121,7 @@ fn forward_rejects_removed_option_word_navigation_keys() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    assert!(!log.exists(), "rejected word navigation must not invoke Herdr");
+    assert!(!log.exists(), "released Option-arrow navigation must not invoke Herdr");
 }
 
 #[test]

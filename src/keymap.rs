@@ -133,11 +133,11 @@ impl std::fmt::Display for Key {
 const ACTIONS: [(Action, &str, &[Key]); 42] = [
     (Action::Down, "down", &[Key::plain('j')]),
     (Action::Up, "up", &[Key::plain('k')]),
-    // Keep Option-left/right unbound: terminal text fields own them for word navigation.
+    // Keep unshifted Option-arrows unbound: terminal text fields and the host own them.
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
     (Action::PrevHunk, "prev-hunk", &[Key::plain('[')]),
-    (Action::NextChange, "next-change", &[Key::alt_named('↓')]),
-    (Action::PrevChange, "prev-change", &[Key::alt_named('↑')]),
+    (Action::NextChange, "next-change", &[Key::plain('}')]),
+    (Action::PrevChange, "prev-change", &[Key::plain('{')]),
     (Action::NextFile, "next-file", &[Key::plain('f'), Key::alt_named('⇩')]),
     (Action::PrevFile, "prev-file", &[Key::plain('F'), Key::alt_named('⇧')]),
     (Action::HideUnchanged, "hide-unchanged", &[Key::alt('u')]),
@@ -318,17 +318,15 @@ mod tests {
         assert_eq!(keymap.hint(Action::Publish), Key::plain('p'));
         assert_eq!(keymap.hint(Action::SubmitReview), Key::plain('S'));
         assert_eq!(keymap.hint(Action::TabPr), Key::plain('3'));
-        assert_eq!(keymap.action_for(Key::alt_named('↓')), Some(Action::NextChange));
-        assert_eq!(
-            keymap.action_for(Key::alt_named('←')),
-            None,
-            "Option-left belongs to text fields"
-        );
-        assert_eq!(
-            keymap.action_for(Key::alt_named('→')),
-            None,
-            "Option-right belongs to text fields"
-        );
+        assert_eq!(keymap.action_for(Key::plain('}')), Some(Action::NextChange));
+        assert_eq!(keymap.action_for(Key::plain('{')), Some(Action::PrevChange));
+        for arrow in ['↑', '↓', '←', '→'] {
+            assert_eq!(
+                keymap.action_for(Key::alt_named(arrow)),
+                None,
+                "unshifted Option arrows belong to the host and text fields"
+            );
+        }
         assert_eq!(keymap.action_for(Key::alt('u')), Some(Action::HideUnchanged));
         assert_eq!(Action::by_config_name("list-wider"), Some(Action::NavigatorGrow));
         assert_eq!(Action::by_config_name("list-narrower"), Some(Action::NavigatorShrink));
@@ -398,6 +396,7 @@ mod tests {
             assert!(error.contains("fixed key") && error.contains("`refresh`"), "{error}");
         }
         assert!(Keymap::resolve(&[(Action::NextChange, vec![Key::alt_named('↓')])]).is_ok());
+        assert!(Keymap::resolve(&[(Action::PrevChange, vec![Key::alt_named('↑')])]).is_ok());
     }
 
     #[test]

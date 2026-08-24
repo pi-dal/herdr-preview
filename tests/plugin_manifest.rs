@@ -39,8 +39,8 @@ fn manifest_identifies_the_preview_plugin_and_enumerates_its_stable_actions() {
     );
 
     let actions = manifest["actions"].as_array().unwrap();
-    assert_eq!(actions.len(), 16);
-    let expected: [(&str, &str, &[&str]); 16] = [
+    assert_eq!(actions.len(), 14);
+    let expected: [(&str, &str, &[&str]); 14] = [
         ("toggle", "Herdr Preview: toggle preview", &["toggle"]),
         ("open", "Herdr Preview: open preview", &["open"]),
         ("close", "Herdr Preview: close preview", &["close"]),
@@ -53,8 +53,6 @@ fn manifest_identifies_the_preview_plugin_and_enumerates_its_stable_actions() {
         ("send", "Herdr Preview: send comments", &["forward", "alt+s"]),
         ("refresh", "Herdr Preview: refresh", &["forward", "alt+shift+r"]),
         ("hide-unchanged", "Herdr Preview: hide unchanged", &["forward", "alt+u"]),
-        ("previous-change", "Herdr Preview: previous change", &["forward", "alt+up"]),
-        ("next-change", "Herdr Preview: next change", &["forward", "alt+down"]),
         ("previous-file", "Herdr Preview: previous file", &["forward", "alt+shift+up"]),
         ("next-file", "Herdr Preview: next file", &["forward", "alt+shift+down"]),
     ];
@@ -73,10 +71,10 @@ fn manifest_identifies_the_preview_plugin_and_enumerates_its_stable_actions() {
             assert_eq!(argument.as_str(), Some(*expected));
         }
     }
-    for removed in ["previous-change-run", "next-change-run"] {
+    for removed in ["previous-change-run", "next-change-run", "previous-change", "next-change"] {
         assert!(
             actions.iter().all(|action| action["id"].as_str() != Some(removed)),
-            "host action {removed} must stay absent so Option-left/right reach the active editor"
+            "host action {removed} must stay absent so unshifted Option arrows reach the active editor"
         );
     }
 
